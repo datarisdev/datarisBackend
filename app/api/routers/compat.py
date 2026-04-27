@@ -24,7 +24,14 @@ from app.services.telemetry.parcel_upload import parse_parcel_file
 
 router = APIRouter(prefix="/compat", tags=["Frontend Compatibility"])
 
-ROOT = Path(os.getenv("DATARIS_COMPAT_STORAGE_DIR", "app/storage")).resolve()
+def _default_storage_dir() -> str:
+    # Vercel/serverless only guarantees writable temporary storage under /tmp.
+    if os.getenv("VERCEL"):
+        return "/tmp/dataris_compat_storage"
+    return "app/storage"
+
+
+ROOT = Path(os.getenv("DATARIS_COMPAT_STORAGE_DIR") or _default_storage_dir()).resolve()
 DB_FILE = ROOT / "compat_db.json"
 FILES = ROOT / "compat_files"
 LOCK = RLock()

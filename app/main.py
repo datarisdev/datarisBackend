@@ -36,3 +36,18 @@ app.include_router(compat.router, prefix=settings.API_V1_STR)
 def health():
     return {"status": "ok"}
 
+
+
+@app.get("/")
+def root():
+    return {"status": "ok", "service": settings.PROJECT_NAME}
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon_ico():
+    return {"status": "ok"}
+
+
+@app.get("/favicon.png", include_in_schema=False)
+def favicon_png():
+    return {"status": "ok"}
