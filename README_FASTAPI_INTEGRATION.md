@@ -1,4 +1,4 @@
-# Integración Backend DATARIS ↔ Frontend Vite
+# Integración Backend DATARIS ↔ Frontend Vite.
 
 Se añadió el router:
 
