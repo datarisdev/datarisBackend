@@ -1,14 +1,31 @@
-import tempfile
-from google.cloud import storage
-from datetime import timedelta
+from __future__ import annotations
+
 import os
+import tempfile
+from datetime import timedelta
 
 import numpy as np
 import rasterio
 
-BUCKET_NAME = "dataris-satellite"
-storage_client = storage.Client()
+from app.utils.gcs import get_storage_client
 
+BUCKET_NAME = os.getenv("GCS_SATELLITE_BUCKET_NAME", "dataris-satellite")
+
+
+def _bucket():
+    """Return the satellite bucket lazily.
+
+    This prevents Vercel from crashing while importing app/main.py when Google
+    credentials are not configured. Only routes that actually need GCS will fail
+    with a clear error.
+    """
+    client = get_storage_client()
+    if client is None:
+        raise RuntimeError(
+            "Google Cloud Storage credentials are not configured. "
+            "Set GCS_SERVICE_ACCOUNT_JSON or GOOGLE_APPLICATION_CREDENTIALS in Vercel."
+        )
+    return client.bucket(os.getenv("GCS_SATELLITE_BUCKET_NAME") or BUCKET_NAME)
 
 
 def upload_satellite_tif(
@@ -19,7 +36,7 @@ def upload_satellite_tif(
     index_type: str,
     image_date: str,
 ) -> str:
-    bucket = storage_client.bucket("dataris-satellite")
+    bucket = _bucket()
 
     object_path = (
         f"satellite/{user_id}/"
@@ -29,22 +46,22 @@ def upload_satellite_tif(
     )
 
     fd, tmp_path = tempfile.mkstemp(suffix=".tif")
-    os.close(fd)  # CRITICAL on Windows
+    os.close(fd)
 
     try:
         with rasterio.open(tmp_path, "w", **meta) as dst:
             dst.write(raster, 1)
 
         bucket.blob(object_path).upload_from_filename(tmp_path)
-
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
     return object_path
 
+
 def generate_signed_satellite_url(object_path: str) -> str:
-    bucket = storage_client.bucket("dataris-satellite")
+    bucket = _bucket()
     blob = bucket.blob(object_path)
 
     return blob.generate_signed_url(
@@ -53,31 +70,19 @@ def generate_signed_satellite_url(object_path: str) -> str:
         method="GET",
     )
 
-def delete_satellite_images_for_parcel(
-    *,
-    user_id: str,
-    parcel_id: str,
-):
-    """
-    Deletes all satellite images for a specific parcel.
-    Removes:
-      satellite/{user_id}/{parcel_id}/...
 
-    User folder remains untouched.
-    """
-    bucket = storage_client.bucket(BUCKET_NAME)
+def delete_satellite_images_for_parcel(*, user_id: str, parcel_id: str) -> int:
+    bucket = _bucket()
     prefix = f"satellite/{user_id}/{parcel_id}/"
 
-    blobs = bucket.list_blobs(prefix=prefix)
-
     deleted = 0
-    for blob in blobs:
+    for blob in bucket.list_blobs(prefix=prefix):
         blob.delete()
         deleted += 1
 
     return deleted
 
 
-def delete_satellite_object(object_path: str):
-    bucket = storage_client.bucket(BUCKET_NAME)
+def delete_satellite_object(object_path: str) -> None:
+    bucket = _bucket()
     bucket.blob(object_path).delete()
