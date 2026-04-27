@@ -1,0 +1,86 @@
+name: Deploy Backend to Cloud Run
+
+# Manual only
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Select environment to deploy'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - prod
+          - staging
+      deployment_name:
+        description: 'Optional name to identify this deployment'
+        required: false
+        default: ''
+
+env:
+  PROJECT_ID: dataris-dev
+  REGION: europe-west1
+  REPO: backend
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Determine service & tag
+        run: |
+          BRANCH_NAME="${GITHUB_REF##*/}"
+          ENVIRONMENT="${{ github.event.inputs.environment }}"
+          DEPLOYMENT_NAME="${{ github.event.inputs.deployment_name }}"
+
+          if [[ "$ENVIRONMENT" == "prod" ]]; then
+            SERVICE=backend-prod
+            TAG=prod
+          else
+            SERVICE=backend-staging
+            TAG=staging
+          fi
+
+          # Optional: append deployment name to tag, replacing spaces with hyphens
+          if [[ -n "$DEPLOYMENT_NAME" ]]; then
+            SAFE_NAME="${DEPLOYMENT_NAME// /-}"
+            TAG="${TAG}-${SAFE_NAME}"
+          fi
+
+          echo "SERVICE=$SERVICE" >> $GITHUB_ENV
+          echo "TAG=$TAG" >> $GITHUB_ENV
+          echo "BRANCH=$BRANCH_NAME" >> $GITHUB_ENV
+
+      - name: Build & push Docker image
+        run: |
+          gcloud builds submit \
+            --tag "$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/backend:$TAG" \
+            --project "$PROJECT_ID" \
+            --account admin-dev@dataris-dev.iam.gserviceaccount.com
+
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy "$SERVICE" \
+            --image "$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/backend:$TAG" \
+            --region "$REGION" \
+            --platform managed \
+            --allow-unauthenticated \
+            --add-cloudsql-instances "${{ secrets.CLOUDSQL_INSTANCE }}" \
+            --set-env-vars DATABASE_URL="${{ secrets.DATABASE_URL }}",JWT_SECRET_KEY="${{ secrets.JWT_SECRET_KEY }}",REDIS_URL="${{ secrets.REDIS_URL }}",RUN_MIGRATIONS=false

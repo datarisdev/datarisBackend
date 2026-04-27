@@ -1,0 +1,180 @@
+# =========================================================
+# VARIABLES DE ENTORNO / SECRETOS
+# =========================================================
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.cert
+*.secret
+
+secrets/
+credentials/
+service-account*.json
+*-service-account*.json
+google-services.json
+GoogleService-Info.plist
+
+# =========================================================
+# PYTHON / FASTAPI
+# =========================================================
+__pycache__/
+*.py[cod]
+*$py.class
+
+*.so
+.Python
+
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+pip-wheel-metadata/
+*.egg-info/
+.eggs/
+*.egg
+MANIFEST
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.coverage
+.coverage.*
+htmlcov/
+
+# =========================================================
+# FASTAPI / UVICORN / GUNICORN
+# =========================================================
+uvicorn*.log
+gunicorn*.log
+*.pid
+
+# =========================================================
+# ALEMBIC
+# =========================================================
+# NO ignorar alembic/
+# NO ignorar alembic/versions/
+# Las migraciones sí deben subirse al repositorio.
+
+# Ignorar archivos temporales de Alembic si existieran
+alembic/*.tmp
+alembic/*.bak
+
+# =========================================================
+# BASE DE DATOS / POSTGRES / SQLITE / BACKUPS
+# =========================================================
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+*.backup
+*.sql.gz
+*.tar.gz
+
+pgdata/
+postgres-data/
+database-data/
+db-data/
+
+# Redis local
+dump.rdb
+appendonly.aof
+
+# =========================================================
+# STORAGE / ARCHIVOS SUBIDOS / TEMPORALES
+# =========================================================
+storage/
+app/storage/
+uploads/
+media/
+files/
+tmp/
+temp/
+.cache/
+.local/
+
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+
+# =========================================================
+# LOGS
+# =========================================================
+logs/
+*.log
+debug.log
+error.log
+
+# =========================================================
+# DOCKER
+# =========================================================
+.docker/
+docker-compose.override.yml
+
+# NO ignorar estos normalmente:
+# Dockerfile
+# docker-compose.yml
+
+# =========================================================
+# IDE / EDITORES
+# =========================================================
+.idea/
+
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.example.json
+!.vscode/launch.example.json
+
+*.iml
+*.ipr
+*.iws
+
+# =========================================================
+# SISTEMA OPERATIVO
+# =========================================================
+.DS_Store
+.AppleDouble
+.LSOverride
+
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+
+$RECYCLE.BIN/
+
+# =========================================================
+# NOTEBOOKS / JUPYTER
+# =========================================================
+.ipynb_checkpoints/
+
+# =========================================================
+# ARCHIVOS TEMPORALES DE PRUEBA / AUDITORÍA
+# =========================================================
+tmp_*.py
+tmp_*.js
+tmp_*.cjs
+audit_*.py
+audit_*.js
+audit_*.cjs
+test_*.tmp
+
+# =========================================================
+# REPORTES / EXPORTS GENERADOS
+# =========================================================
+reports/
+exports/
+generated/
