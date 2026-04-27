@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import tempfile
+import unicodedata
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +20,112 @@ from shapely.ops import transform, unary_union
 
 MAX_POINT_GAP_METERS = 120.0
 DEFAULT_SWATH_WIDTH_METERS = 16.0
+
+FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "parcel_name": (
+        "__dataris_parcel_name",
+        "AREA_NAME",
+        "AREA",
+        "NAME",
+        "NOMBRE",
+        "NOMBRE_LOTE",
+        "LOTE",
+        "LOT",
+        "LOT_NAME",
+        "PARCELA",
+        "PARCEL",
+        "CAMPO",
+        "BLOCK",
+        "BLOQUE",
+        "SECTOR",
+        "FINCA",
+        "CODIGO",
+        "CODIGO_LOTE",
+        "ID",
+    ),
+    "line": (
+        "LIN",
+        "LINE",
+        "LINEA",
+        "LÍNEA",
+        "LINE_ID",
+        "ID_LINEA",
+        "IDLINEA",
+        "TRACK",
+        "TRACK_ID",
+        "PASADA",
+        "PASS",
+        "TRAMO",
+        "RUTA",
+        "NUMERO",
+        "NUMBER",
+        "N",
+        "ID",
+    ),
+    "time": (
+        "TIMEGPS",
+        "GPS_TIME",
+        "TIME",
+        "HORA",
+        "TIMESTAMP",
+        "DATE_TIME",
+        "DATETIME",
+        "FECHA_HORA",
+        "FECHAHORA",
+    ),
+    "altitude": (
+        "ALTm",
+        "ALT",
+        "ALT_M",
+        "ALTITUDE",
+        "ALTITUD",
+        "HEIGHT",
+        "ALTURA",
+        "ALTURA_M",
+        "ALTURAM",
+    ),
+    "speed": (
+        "SPkph",
+        "SPEED",
+        "SPEED_KPH",
+        "VELOCIDAD",
+        "VEL",
+        "KMH",
+        "KPH",
+        "VEL_KPH",
+    ),
+    "width": (
+        "SW_WIDTHm",
+        "SWATH_WIDTH",
+        "SW_WIDTH",
+        "WIDTH",
+        "ANCHO",
+        "ANCHO_M",
+        "ANCHOM",
+        "ANCHO_FAJA",
+        "ANCHOFAJA",
+        "FAJA",
+    ),
+    "volume": (
+        "SPR_VOL",
+        "SPRAY_VOL",
+        "VOLUME",
+        "VOLUMEN",
+        "VOL",
+        "LITROS",
+        "LITERS",
+        "LTS",
+    ),
+}
+
+CANONICAL_FIELDS: Dict[str, str] = {
+    "line": "LIN",
+    "time": "TIMEGPS",
+    "altitude": "ALTm",
+    "speed": "SPkph",
+    "width": "SW_WIDTHm",
+    "volume": "SPR_VOL",
+}
 
 
 @dataclass
@@ -82,6 +190,74 @@ def _shp_groups(names: Iterable[str]) -> List[HelicopterLayerGroup]:
     return sorted(groups, key=lambda g: g.id)
 
 
+
+def _norm_key(value: str) -> str:
+    text = unicodedata.normalize("NFD", str(value or ""))
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    return re.sub(r"[^a-zA-Z0-9]", "", text).lower()
+
+
+def _column_lookup(columns: Iterable[str]) -> Dict[str, str]:
+    return {_norm_key(col): col for col in columns}
+
+
+def _find_column(columns: Iterable[str], aliases: Iterable[str]) -> Optional[str]:
+    cols = list(columns)
+    for alias in aliases:
+        for col in cols:
+            if str(col).lower() == str(alias).lower():
+                return col
+    lookup = _column_lookup(cols)
+    for alias in aliases:
+        found = lookup.get(_norm_key(alias))
+        if found:
+            return found
+    return None
+
+
+def _get_any(row: pd.Series, aliases: Iterable[str], default: Any = None) -> Any:
+    col = _find_column(row.index, aliases)
+    if not col:
+        return default
+    value = row.get(col, default)
+    try:
+        if value is None or pd.isna(value):
+            return default
+    except Exception:
+        pass
+    return value
+
+
+def _row_json_props(row: pd.Series) -> Dict[str, Any]:
+    return {k: _jsonable_value(v) for k, v in row.drop(labels=["geometry"], errors="ignore").to_dict().items()}
+
+
+def _add_canonical_fields(gdf: gpd.GeoDataFrame, source_name: str) -> gpd.GeoDataFrame:
+    if gdf.empty:
+        return gdf
+
+    gdf = gdf.copy()
+    original_columns = [str(c) for c in gdf.columns if c != "geometry"]
+    field_map: Dict[str, str] = {}
+
+    for semantic, canonical in CANONICAL_FIELDS.items():
+        source_col = _find_column(original_columns, FIELD_ALIASES[semantic])
+        if source_col:
+            field_map[canonical] = source_col
+            if canonical not in gdf.columns:
+                gdf[canonical] = gdf[source_col]
+
+    if source_name.lower() == "polygon":
+        name_col = _find_column(original_columns, FIELD_ALIASES["parcel_name"])
+        if name_col:
+            field_map["__dataris_parcel_name"] = name_col
+            gdf["__dataris_parcel_name"] = gdf[name_col].astype(str)
+
+    if field_map:
+        gdf["__dataris_field_map"] = json.dumps(field_map, ensure_ascii=False)
+    gdf["__dataris_original_fields"] = ", ".join(original_columns)
+    return gdf
+
 def _safe_extract(zip_file: zipfile.ZipFile, destination: Path) -> None:
     for member in zip_file.infolist():
         name = _normalise_zip_name(member.filename)
@@ -109,6 +285,7 @@ def _read_layer(root: Path, relative_path: str, group_id: str, source_name: str)
         # Los logs de helicóptero suelen venir en lon/lat. Si no hay .prj, asumimos WGS84.
         gdf = gdf.set_crs("EPSG:4326", allow_override=True)
     gdf = gdf[gdf.geometry.notna()].copy()
+    gdf = _add_canonical_fields(gdf, source_name)
     gdf["__group"] = group_id
     gdf["__source"] = source_name
     return gdf
@@ -133,8 +310,15 @@ def _to_wgs(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 
 
 def _jsonable_value(value: Any) -> Any:
-    if pd.isna(value):
+    if value is None:
         return None
+    if isinstance(value, (dict, list, tuple)):
+        return value
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
     if hasattr(value, "item"):
         try:
             return value.item()
@@ -162,7 +346,7 @@ def _feature_collection(gdf: gpd.GeoDataFrame, max_point_features: Optional[int]
     return {"type": "FeatureCollection", "features": features}
 
 
-def _geom_to_wgs(geom: Optional[BaseGeometry], from_crs: Any) -> Optional[Dict[str, Any]]:
+def _geom_to_wgs(geom: Optional[BaseGeometry], from_crs: Any, props: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     if geom is None or geom.is_empty:
         return None
     geom = _polygonal(geom)
@@ -170,7 +354,7 @@ def _geom_to_wgs(geom: Optional[BaseGeometry], from_crs: Any) -> Optional[Dict[s
         return None
     transformer = Transformer.from_crs(from_crs, "EPSG:4326", always_xy=True)
     converted = transform(transformer.transform, geom)
-    return {"type": "Feature", "properties": {}, "geometry": mapping(converted)}
+    return {"type": "Feature", "properties": props or {}, "geometry": mapping(converted)}
 
 
 def _geometry_to_feature(geom: Optional[BaseGeometry], props: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
@@ -410,14 +594,13 @@ def process_helicopter_zip(zip_path: Path, swath_width: float = DEFAULT_SWATH_WI
 
             source_row = parcelas.loc[idx] if idx in parcelas.index else row
             name = (
-                source_row.get("AREA_NAME")
-                or source_row.get("Name")
-                or source_row.get("NOMBRE")
-                or source_row.get("LOTE")
+                _get_any(source_row, FIELD_ALIASES["parcel_name"])
                 or source_row.get("__group")
                 or f"Área {len(parcel_results) + 1}"
             )
-            vol = _num(source_row.get("SPR_VOL"), 0.0)
+            source_props = _row_json_props(source_row)
+            source_props["__dataris_parcel_name"] = str(name)
+            vol = _num(_get_any(source_row, FIELD_ALIASES["volume"]), 0.0)
 
             parcel_results.append(
                 {
@@ -431,10 +614,11 @@ def process_helicopter_zip(zip_path: Path, swath_width: float = DEFAULT_SWATH_WI
                     "avgSpeed": _avg(speeds),
                     "uniqueLines": len(line_keys),
                     "volume": vol,
-                    "coveredGeom": _geom_to_wgs(covered_geom, metric_crs),
-                    "uncoveredGeom": _geom_to_wgs(uncovered_geom, metric_crs),
-                    "overlapGeom": _geom_to_wgs(overlap_geom, metric_crs),
-                    "geometry": _geom_to_wgs(geom, metric_crs),
+                    "sourceProperties": source_props,
+                    "coveredGeom": _geom_to_wgs(covered_geom, metric_crs, {**source_props, "tipo_capa": "Zona aplicada", "hectareas_aplicadas": round(covered_ha, 4), "cobertura_pct": round((covered_ha / area_ha) * 100 if area_ha else 0.0, 2)}),
+                    "uncoveredGeom": _geom_to_wgs(uncovered_geom, metric_crs, {**source_props, "tipo_capa": "Sin cubrir", "hectareas_sin_cubrir": round(max(area_ha - covered_ha, 0.0), 4)}),
+                    "overlapGeom": _geom_to_wgs(overlap_geom, metric_crs, {**source_props, "tipo_capa": "Sobre-aplicado", "hectareas_sobre_aplicadas": round(overlap_ha, 4)}),
+                    "geometry": _geom_to_wgs(geom, metric_crs, source_props),
                 }
             )
 
@@ -447,7 +631,7 @@ def process_helicopter_zip(zip_path: Path, swath_width: float = DEFAULT_SWATH_WI
         alts_all = [_num(v) for v in spron.get("ALTm", pd.Series(dtype=float)).tolist() if _num(v) != 0]
         line_keys_global = {_line_key(r) for _, r in spron.iterrows()}
         line_keys_global.discard(None)
-        total_volume = sum(_num(r.get("SPR_VOL"), 0.0) for _, r in parcelas.iterrows())
+        total_volume = sum(_num(_get_any(r, FIELD_ALIASES["volume"]), 0.0) for _, r in parcelas.iterrows())
 
         return {
             "parcelas": _feature_collection(parcelas),
