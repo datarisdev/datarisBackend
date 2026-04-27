@@ -65,13 +65,17 @@ def verify_password(password: str, hashed: str) -> bool:
     return password_hash(password) == hashed
 
 
-def token_for(user_id: str) -> str:
+def token_for(user_id: str, user: Optional[Dict[str, Any]] = None) -> str:
+    claims: Dict[str, Any] = {
+        "sub": user_id,
+        "type": "compat_user",
+        "exp": datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
+    }
+    if user:
+        claims["email"] = user.get("email")
+        claims["user_metadata"] = user.get("user_metadata") or {}
     return jwt.encode(
-        {
-            "sub": user_id,
-            "type": "compat_user",
-            "exp": datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
-        },
+        claims,
         settings.JWT_SECRET_KEY,
         algorithm=settings.JWT_ALGORITHM,
     )
@@ -91,7 +95,7 @@ def public_user(user: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def session_for(user: Dict[str, Any]) -> Dict[str, Any]:
-    access_token = token_for(user["id"])
+    access_token = token_for(user["id"], user)
     return {
         "access_token": access_token,
         "token_type": "bearer",
@@ -104,8 +108,11 @@ def session_for(user: Dict[str, Any]) -> Dict[str, Any]:
 
 def default_db() -> Dict[str, Any]:
     created = now()
-    admin_id = str(uuid.uuid4())
-    company_id = str(uuid.uuid4())
+    # IDs determinísticos para que Vercel/serverless no rompa sesiones entre invocaciones.
+    # Antes se generaban con uuid4() y una sesión podía quedar apuntando a un usuario
+    # que no existía en otra instancia fría.
+    admin_id = "00000000-0000-4000-8000-000000000001"
+    company_id = "00000000-0000-4000-8000-000000000010"
     modules = [
         {"id": mid, "name": name, "description": desc, "icon": icon, "is_active": True, "created_at": created, "updated_at": created}
         for mid, name, desc, icon in DEFAULT_MODULES
@@ -291,15 +298,80 @@ def table(db: Dict[str, Any], name: str) -> List[Dict[str, Any]]:
 
 
 def bearer_user(authorization: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Valida el Bearer token del cliente compatible.
+
+    En Vercel el almacenamiento temporal puede reiniciarse entre invocaciones.
+    Si el JWT es válido pero el usuario todavía no existe en el JSON temporal de
+    esa instancia, devolvemos un usuario mínimo basado en el token para no romper
+    flujos como análisis de helicóptero o carga de parcelas.
+    """
     if not authorization or not authorization.lower().startswith("bearer "):
         return None
+
     try:
-        payload = jwt.decode(authorization.split(" ", 1)[1], settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
+        payload = jwt.decode(
+            authorization.split(" ", 1)[1],
+            settings.JWT_SECRET_KEY,
+            algorithms=[settings.JWT_ALGORITHM],
+        )
     except JWTError:
         return None
-    db = read_db()
-    return next((u for u in db.get("users", []) if u.get("id") == payload.get("sub")), None)
 
+    user_id = payload.get("sub")
+    if not user_id:
+        return None
+
+    try:
+        db = read_db()
+        found = next((u for u in db.get("users", []) if u.get("id") == user_id), None)
+        if found:
+            return found
+    except Exception:
+        # Si el archivo temporal no existe o no se puede leer, seguimos usando el token.
+        pass
+
+    return {
+        "id": user_id,
+        "email": payload.get("email") or "compat-user@dataris.local",
+        "is_active": True,
+        "created_at": now(),
+        "updated_at": now(),
+        "user_metadata": payload.get("user_metadata") or {},
+    }
+
+
+def compat_guest_uploads_enabled() -> bool:
+    """Permite compatibilidad en Vercel cuando no hay sesión local persistida.
+
+    Por seguridad, puedes desactivarlo poniendo:
+    DATARIS_COMPAT_ALLOW_GUEST_UPLOADS=false
+    """
+    raw = os.getenv("DATARIS_COMPAT_ALLOW_GUEST_UPLOADS")
+    if raw is None:
+        # En Vercel se activa por defecto porque el backend compat usa /tmp y
+        # puede recibir requests desde otra instancia sin el JSON temporal previo.
+        return bool(os.getenv("VERCEL"))
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def default_compat_user() -> Dict[str, Any]:
+    db = read_db()
+    users = db.get("users") or []
+    if users:
+        return users[0]
+    fallback = default_db()["users"][0]
+    db.setdefault("users", []).append(fallback)
+    write_db(db)
+    return fallback
+
+
+def operation_user(authorization: Optional[str]) -> Optional[Dict[str, Any]]:
+    user = bearer_user(authorization)
+    if user:
+        return user
+    if compat_guest_uploads_enabled():
+        return default_compat_user()
+    return None
 
 def add_defaults(table_name: str, row: Dict[str, Any], user_id: Optional[str]) -> Dict[str, Any]:
     row = dict(row or {})
@@ -637,7 +709,7 @@ async def helicopter_analyze(
     swath_width: float = Form(16.0),
     authorization: Optional[str] = Header(default=None),
 ):
-    user = bearer_user(authorization)
+    user = operation_user(authorization)
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
     if not file.filename or not file.filename.lower().endswith(".zip"):
@@ -679,7 +751,7 @@ async def upload_parcel_from_satellite(
     name: str = Form(...),
     authorization: Optional[str] = Header(default=None),
 ):
-    user = bearer_user(authorization)
+    user = operation_user(authorization)
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
     if not name.strip():
