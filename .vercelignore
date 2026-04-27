@@ -1,0 +1,12 @@
+.venv
+venv
+__pycache__/
+*.pyc
+.idea/
+*.zip
+*.tar
+*.tif
+*.tiff
+app/storage/
+storage/
+node_modules/

@@ -19,8 +19,6 @@ from jose import JWTError, jwt
 from pydantic import BaseModel
 
 from app.core.config import settings
-from app.services.telemetry.helicopter_processor import process_helicopter_zip
-from app.services.telemetry.parcel_upload import parse_parcel_file
 
 router = APIRouter(prefix="/compat", tags=["Frontend Compatibility"])
 
@@ -652,6 +650,16 @@ async def helicopter_analyze(
     try:
         with tmp_path.open("wb") as out:
             shutil.copyfileobj(file.file, out)
+        try:
+            from app.services.telemetry.helicopter_processor import process_helicopter_zip
+        except ModuleNotFoundError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "El procesamiento de helicóptero no está disponible en este despliegue. "
+                    f"Falta dependencia: {exc.name}"
+                ),
+            )
         result = process_helicopter_zip(tmp_path, float(swath_width or 16.0))
         return {"data": result, "error": None}
     except ValueError as exc:
@@ -688,6 +696,16 @@ async def upload_parcel_from_satellite(
     try:
         with dest.open("wb") as out:
             shutil.copyfileobj(file.file, out)
+        try:
+            from app.services.telemetry.parcel_upload import parse_parcel_file
+        except ModuleNotFoundError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "La carga de parcelas no está disponible en este despliegue. "
+                    f"Falta dependencia: {exc.name}"
+                ),
+            )
         parsed = parse_parcel_file(dest, clean_original)
         t = now()
         public_url = f"/api/compat/storage/public/parcels/{str(storage_path).replace(os.sep, '/') }"

@@ -7,8 +7,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from xml.etree import ElementTree as ET
 
-import geopandas as gpd
-from shapely.geometry import Polygon
+import shapefile  # pyshp
+from pyproj import CRS, Transformer
+from shapely.geometry import Polygon, mapping, shape as shapely_shape
+from shapely.geometry.base import BaseGeometry
+from shapely.ops import transform, unary_union
 
 
 def _safe_extract(zip_file: zipfile.ZipFile, destination: Path) -> None:
@@ -28,26 +31,99 @@ def _safe_extract(zip_file: zipfile.ZipFile, destination: Path) -> None:
             dst.write(src.read())
 
 
-def _feature_collection(gdf: gpd.GeoDataFrame) -> Dict[str, Any]:
-    if gdf.empty:
-        return {"type": "FeatureCollection", "features": []}
-    if gdf.crs is None:
-        gdf = gdf.set_crs("EPSG:4326", allow_override=True)
-    gdf = gdf.to_crs("EPSG:4326")
-    return json.loads(gdf.to_json())
-
-
-def _area_ha(gdf: gpd.GeoDataFrame) -> float:
-    if gdf.empty:
-        return 0.0
+def _read_prj(shp_path: Path) -> Optional[CRS]:
+    prj_path = shp_path.with_suffix(".prj")
+    if not prj_path.exists():
+        return None
     try:
-        metric = gdf.to_crs(gdf.estimate_utm_crs() or "EPSG:3857")
+        return CRS.from_wkt(prj_path.read_text(encoding="utf-8", errors="ignore"))
     except Exception:
-        metric = gdf.to_crs("EPSG:3857") if gdf.crs else gdf.set_crs("EPSG:4326", allow_override=True).to_crs("EPSG:3857")
-    return float(metric.geometry.area.sum() / 10000.0)
+        return None
 
 
-def _parse_kml_text(text: str) -> gpd.GeoDataFrame:
+def _transformer(src: Optional[CRS], dst: CRS) -> Optional[Transformer]:
+    if src is None:
+        src = CRS.from_epsg(4326)
+    try:
+        if src == dst:
+            return None
+        return Transformer.from_crs(src, dst, always_xy=True)
+    except Exception:
+        return None
+
+
+def _to_crs(geom: BaseGeometry, src: Optional[CRS], dst: CRS) -> BaseGeometry:
+    tr = _transformer(src, dst)
+    if tr is None:
+        return geom
+    return transform(tr.transform, geom)
+
+
+def _utm_crs_from_lonlat(lon: float, lat: float) -> CRS:
+    zone = int((lon + 180) // 6) + 1
+    epsg = 32600 + zone if lat >= 0 else 32700 + zone
+    return CRS.from_epsg(epsg)
+
+
+def _feature_collection(features: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {"type": "FeatureCollection", "features": features}
+
+
+def _area_ha_wgs(features: List[Dict[str, Any]]) -> float:
+    geoms = []
+    for feat in features:
+        try:
+            geom = shapely_shape(feat.get("geometry"))
+            if not geom.is_empty:
+                geoms.append(geom)
+        except Exception:
+            continue
+    if not geoms:
+        return 0.0
+    union = unary_union(geoms)
+    c = union.centroid
+    metric = _utm_crs_from_lonlat(c.x, c.y)
+    metric_geom = _to_crs(union, CRS.from_epsg(4326), metric)
+    return float(metric_geom.area / 10000.0)
+
+
+def _record_props(reader: shapefile.Reader, record: Any) -> Dict[str, Any]:
+    fields = [f[0] for f in reader.fields[1:]]
+    values = list(record)
+    props: Dict[str, Any] = {}
+    for key, value in zip(fields, values):
+        if hasattr(value, "isoformat"):
+            value = value.isoformat()
+        props[str(key)] = value
+    return props
+
+
+def _read_shapefile(shp_path: Path) -> Dict[str, Any]:
+    src_crs = _read_prj(shp_path) or CRS.from_epsg(4326)
+    reader = shapefile.Reader(str(shp_path))
+    features: List[Dict[str, Any]] = []
+    for sr in reader.iterShapeRecords():
+        try:
+            geom = shapely_shape(sr.shape.__geo_interface__)
+        except Exception:
+            continue
+        if geom.is_empty:
+            continue
+        geom_wgs = _to_crs(geom, src_crs, CRS.from_epsg(4326))
+        # Parcelas/lotes deben ser polígonos. Si viene multiparte, se respeta.
+        if geom_wgs.geom_type not in {"Polygon", "MultiPolygon"}:
+            continue
+        features.append({
+            "type": "Feature",
+            "properties": _record_props(reader, sr.record),
+            "geometry": mapping(geom_wgs),
+        })
+    if not features:
+        raise ValueError("El shapefile no contiene polígonos válidos")
+    return {"geometry": _feature_collection(features), "area": round(_area_ha_wgs(features), 4)}
+
+
+def _parse_kml_text(text: str) -> Dict[str, Any]:
     root = ET.fromstring(text)
     features: List[Dict[str, Any]] = []
     for placemark in root.findall(".//{*}Placemark"):
@@ -72,56 +148,45 @@ def _parse_kml_text(text: str) -> gpd.GeoDataFrame:
                 continue
             if coords[0] != coords[-1]:
                 coords.append(coords[0])
-            features.append({"name": name, "geometry": Polygon(coords)})
+            geom = Polygon(coords)
+            if geom.is_valid and not geom.is_empty:
+                features.append({
+                    "type": "Feature",
+                    "properties": {"name": name, "Name": name},
+                    "geometry": mapping(geom),
+                })
     if not features:
         raise ValueError("El KML/KMZ no contiene polígonos válidos")
-    return gpd.GeoDataFrame(features, geometry="geometry", crs="EPSG:4326")
+    return {"geometry": _feature_collection(features), "area": round(_area_ha_wgs(features), 4)}
 
 
-def _read_shapefile_zip(zip_path: Path) -> gpd.GeoDataFrame:
-    with tempfile.TemporaryDirectory(prefix="dataris-parcel-") as tmp_name:
-        tmp = Path(tmp_name)
-        with zipfile.ZipFile(zip_path) as zf:
-            _safe_extract(zf, tmp)
-        shp_files = [p for p in tmp.rglob("*.shp") if not p.name.lower().endswith(("spron.shp", "sproff.shp"))]
-        if not shp_files:
-            raise ValueError("El ZIP no contiene archivo .shp válido")
-        # Prioridad a capas Polygon/lote/parcela si existen.
-        shp_files.sort(key=lambda p: (0 if any(k in p.name.lower() for k in ["polygon", "parcela", "lote", "parcel"]) else 1, str(p)))
-        errors: List[str] = []
-        for shp in shp_files:
-            try:
-                gdf = gpd.read_file(shp)
-                if gdf.crs is None:
-                    gdf = gdf.set_crs("EPSG:4326", allow_override=True)
-                gdf = gdf[gdf.geometry.notna() & gdf.geometry.geom_type.isin(["Polygon", "MultiPolygon"])].copy()
-                if not gdf.empty:
-                    return gdf
-            except Exception as exc:
-                errors.append(f"{shp.name}: {exc}")
-        raise ValueError("No se encontraron polígonos válidos en el shapefile. " + "; ".join(errors[:2]))
+def parse_parcel_file(path: Path, original_name: str) -> Dict[str, Any]:
+    suffix = original_name.lower().split(".")[-1]
 
+    if suffix == "zip":
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            with zipfile.ZipFile(path) as zf:
+                _safe_extract(zf, tmp)
+            shp_files = [p for p in tmp.rglob("*.shp") if not p.name.startswith(".")]
+            if not shp_files:
+                raise ValueError("El ZIP no contiene archivos .shp")
+            # Prioriza shapefiles que parezcan polígonos/lotes.
+            shp_files.sort(key=lambda p: (0 if any(k in p.stem.lower() for k in ["polygon", "poligono", "parcel", "parcela", "lote", "area"]) else 1, str(p)))
+            return _read_shapefile(shp_files[0])
 
-def parse_parcel_file(file_path: Path, original_name: Optional[str] = None) -> Dict[str, Any]:
-    name = (original_name or file_path.name).lower()
-    is_zip = name.endswith(".zip") or name.endswith(".kmz")
+    if suffix == "shp":
+        return _read_shapefile(path)
 
-    if name.endswith(".kml"):
-        gdf = _parse_kml_text(file_path.read_text(encoding="utf-8", errors="ignore"))
-    elif is_zip:
-        with zipfile.ZipFile(file_path) as zf:
+    if suffix == "kml":
+        return _parse_kml_text(path.read_text(encoding="utf-8", errors="ignore"))
+
+    if suffix == "kmz":
+        with zipfile.ZipFile(path) as zf:
             kml_names = [n for n in zf.namelist() if n.lower().endswith(".kml")]
-            if kml_names:
-                text = zf.read(kml_names[0]).decode("utf-8", errors="ignore")
-                gdf = _parse_kml_text(text)
-            else:
-                gdf = _read_shapefile_zip(file_path)
-    else:
-        gdf = gpd.read_file(file_path)
-        if gdf.crs is None:
-            gdf = gdf.set_crs("EPSG:4326", allow_override=True)
-        gdf = gdf[gdf.geometry.notna() & gdf.geometry.geom_type.isin(["Polygon", "MultiPolygon"])].copy()
+            if not kml_names:
+                raise ValueError("El KMZ no contiene KML")
+            with zf.open(kml_names[0]) as fh:
+                return _parse_kml_text(fh.read().decode("utf-8", errors="ignore"))
 
-    if gdf.empty:
-        raise ValueError("El archivo no contiene geometrías de lote/parcela válidas")
-    return {"geometry": _feature_collection(gdf), "area": _area_ha(gdf)}
+    raise ValueError("Formato no soportado. Usa .zip, .shp, .kml o .kmz")
