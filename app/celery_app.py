@@ -30,6 +30,7 @@ celery_app.conf.beat_schedule = {
     },
 }
 
+# Import tasks here so Celery registers them
 import app.api.task
 #import app.api.task_weather 
 #celery -A app.celery_app.celery_app worker --loglevel=info --pool=solo
