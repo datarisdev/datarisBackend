@@ -1,0 +1,15 @@
+.env
+.env.*
+.venv
+venv
+__pycache__
+*.pyc
+.git
+.idea
+.vscode
+app/storage
+storage
+uploads
+tmp
+logs
+*.log
