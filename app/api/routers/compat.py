@@ -14,22 +14,18 @@ from threading import RLock
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, File, Form, Header, HTTPException, UploadFile
+from starlette.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from jose import JWTError, jwt
 from pydantic import BaseModel
 
 from app.core.config import settings
+from app.services.telemetry.helicopter_processor import process_helicopter_zip
+from app.services.telemetry.parcel_upload import parse_parcel_file
 
 router = APIRouter(prefix="/compat", tags=["Frontend Compatibility"])
 
-def _default_storage_dir() -> str:
-    # Vercel/serverless only guarantees writable temporary storage under /tmp.
-    if os.getenv("VERCEL"):
-        return "/tmp/dataris_compat_storage"
-    return "app/storage"
-
-
-ROOT = Path(os.getenv("DATARIS_COMPAT_STORAGE_DIR") or _default_storage_dir()).resolve()
+ROOT = Path(os.getenv("DATARIS_COMPAT_STORAGE_DIR", "app/storage")).resolve()
 DB_FILE = ROOT / "compat_db.json"
 FILES = ROOT / "compat_files"
 LOCK = RLock()
@@ -65,17 +61,13 @@ def verify_password(password: str, hashed: str) -> bool:
     return password_hash(password) == hashed
 
 
-def token_for(user_id: str, user: Optional[Dict[str, Any]] = None) -> str:
-    claims: Dict[str, Any] = {
-        "sub": user_id,
-        "type": "compat_user",
-        "exp": datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
-    }
-    if user:
-        claims["email"] = user.get("email")
-        claims["user_metadata"] = user.get("user_metadata") or {}
+def token_for(user_id: str) -> str:
     return jwt.encode(
-        claims,
+        {
+            "sub": user_id,
+            "type": "compat_user",
+            "exp": datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
+        },
         settings.JWT_SECRET_KEY,
         algorithm=settings.JWT_ALGORITHM,
     )
@@ -95,7 +87,7 @@ def public_user(user: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def session_for(user: Dict[str, Any]) -> Dict[str, Any]:
-    access_token = token_for(user["id"], user)
+    access_token = token_for(user["id"])
     return {
         "access_token": access_token,
         "token_type": "bearer",
@@ -108,11 +100,8 @@ def session_for(user: Dict[str, Any]) -> Dict[str, Any]:
 
 def default_db() -> Dict[str, Any]:
     created = now()
-    # IDs determinísticos para que Vercel/serverless no rompa sesiones entre invocaciones.
-    # Antes se generaban con uuid4() y una sesión podía quedar apuntando a un usuario
-    # que no existía en otra instancia fría.
-    admin_id = "00000000-0000-4000-8000-000000000001"
-    company_id = "00000000-0000-4000-8000-000000000010"
+    admin_id = str(uuid.uuid4())
+    company_id = str(uuid.uuid4())
     modules = [
         {"id": mid, "name": name, "description": desc, "icon": icon, "is_active": True, "created_at": created, "updated_at": created}
         for mid, name, desc, icon in DEFAULT_MODULES
@@ -298,80 +287,15 @@ def table(db: Dict[str, Any], name: str) -> List[Dict[str, Any]]:
 
 
 def bearer_user(authorization: Optional[str]) -> Optional[Dict[str, Any]]:
-    """Valida el Bearer token del cliente compatible.
-
-    En Vercel el almacenamiento temporal puede reiniciarse entre invocaciones.
-    Si el JWT es válido pero el usuario todavía no existe en el JSON temporal de
-    esa instancia, devolvemos un usuario mínimo basado en el token para no romper
-    flujos como análisis de helicóptero o carga de parcelas.
-    """
     if not authorization or not authorization.lower().startswith("bearer "):
         return None
-
     try:
-        payload = jwt.decode(
-            authorization.split(" ", 1)[1],
-            settings.JWT_SECRET_KEY,
-            algorithms=[settings.JWT_ALGORITHM],
-        )
+        payload = jwt.decode(authorization.split(" ", 1)[1], settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
     except JWTError:
         return None
-
-    user_id = payload.get("sub")
-    if not user_id:
-        return None
-
-    try:
-        db = read_db()
-        found = next((u for u in db.get("users", []) if u.get("id") == user_id), None)
-        if found:
-            return found
-    except Exception:
-        # Si el archivo temporal no existe o no se puede leer, seguimos usando el token.
-        pass
-
-    return {
-        "id": user_id,
-        "email": payload.get("email") or "compat-user@dataris.local",
-        "is_active": True,
-        "created_at": now(),
-        "updated_at": now(),
-        "user_metadata": payload.get("user_metadata") or {},
-    }
-
-
-def compat_guest_uploads_enabled() -> bool:
-    """Permite compatibilidad en Vercel cuando no hay sesión local persistida.
-
-    Por seguridad, puedes desactivarlo poniendo:
-    DATARIS_COMPAT_ALLOW_GUEST_UPLOADS=false
-    """
-    raw = os.getenv("DATARIS_COMPAT_ALLOW_GUEST_UPLOADS")
-    if raw is None:
-        # En Vercel se activa por defecto porque el backend compat usa /tmp y
-        # puede recibir requests desde otra instancia sin el JSON temporal previo.
-        return bool(os.getenv("VERCEL"))
-    return raw.strip().lower() not in {"0", "false", "no", "off"}
-
-
-def default_compat_user() -> Dict[str, Any]:
     db = read_db()
-    users = db.get("users") or []
-    if users:
-        return users[0]
-    fallback = default_db()["users"][0]
-    db.setdefault("users", []).append(fallback)
-    write_db(db)
-    return fallback
+    return next((u for u in db.get("users", []) if u.get("id") == payload.get("sub")), None)
 
-
-def operation_user(authorization: Optional[str]) -> Optional[Dict[str, Any]]:
-    user = bearer_user(authorization)
-    if user:
-        return user
-    if compat_guest_uploads_enabled():
-        return default_compat_user()
-    return None
 
 def add_defaults(table_name: str, row: Dict[str, Any], user_id: Optional[str]) -> Dict[str, Any]:
     row = dict(row or {})
@@ -709,7 +633,7 @@ async def helicopter_analyze(
     swath_width: float = Form(16.0),
     authorization: Optional[str] = Header(default=None),
 ):
-    user = operation_user(authorization)
+    user = bearer_user(authorization)
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
     if not file.filename or not file.filename.lower().endswith(".zip"):
@@ -721,18 +645,8 @@ async def helicopter_analyze(
     tmp_path = tmp_dir / f"{uuid.uuid4()}-{clean_name}"
     try:
         with tmp_path.open("wb") as out:
-            shutil.copyfileobj(file.file, out)
-        try:
-            from app.services.telemetry.helicopter_processor import process_helicopter_zip
-        except ModuleNotFoundError as exc:
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "El procesamiento de helicóptero no está disponible en este despliegue. "
-                    f"Falta dependencia: {exc.name}"
-                ),
-            )
-        result = process_helicopter_zip(tmp_path, float(swath_width or 16.0))
+            shutil.copyfileobj(file.file, out, length=1024 * 1024)
+        result = await run_in_threadpool(process_helicopter_zip, tmp_path, float(swath_width or 16.0))
         return {"data": result, "error": None}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -751,7 +665,7 @@ async def upload_parcel_from_satellite(
     name: str = Form(...),
     authorization: Optional[str] = Header(default=None),
 ):
-    user = operation_user(authorization)
+    user = bearer_user(authorization)
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
     if not name.strip():
@@ -768,16 +682,6 @@ async def upload_parcel_from_satellite(
     try:
         with dest.open("wb") as out:
             shutil.copyfileobj(file.file, out)
-        try:
-            from app.services.telemetry.parcel_upload import parse_parcel_file
-        except ModuleNotFoundError as exc:
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "La carga de parcelas no está disponible en este despliegue. "
-                    f"Falta dependencia: {exc.name}"
-                ),
-            )
         parsed = parse_parcel_file(dest, clean_original)
         t = now()
         public_url = f"/api/compat/storage/public/parcels/{str(storage_path).replace(os.sep, '/') }"

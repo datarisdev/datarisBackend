@@ -2,378 +2,530 @@ from __future__ import annotations
 
 import json
 import math
-import re
+import os
 import tempfile
-import unicodedata
+import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+from numbers import Integral
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-import shapefile  # pyshp
-from pyproj import CRS, Transformer
-from shapely.geometry import LineString, MultiPolygon, Point, Polygon, mapping, shape as shapely_shape
+import geopandas as gpd
+import pandas as pd
+from pyproj import Transformer
+from shapely.geometry import LineString, MultiPolygon, Polygon, mapping, shape
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import transform, unary_union
+from shapely.prepared import prep
+from shapely.strtree import STRtree
+
 
 MAX_POINT_GAP_METERS = 120.0
 DEFAULT_SWATH_WIDTH_METERS = 16.0
 
-FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
-    "parcel_name": (
-        "__dataris_parcel_name", "AREA_NAME", "AREA", "NAME", "NOMBRE", "NOMBRE_LOTE",
-        "LOTE", "LOT", "LOT_NAME", "PARCELA", "PARCEL", "CAMPO", "BLOCK", "BLOQUE",
-        "SECTOR", "FINCA", "CODIGO", "CODIGO_LOTE", "ID",
-    ),
-    "line": ("LIN", "LINE", "LINEA", "LÍNEA", "LINE_ID", "ID_LINEA", "IDLINEA", "TRACK", "TRACK_ID", "PASADA", "PASS", "TRAMO", "RUTA", "NUMERO", "NUMBER", "N", "ID"),
-    "time": ("TIMEGPS", "GPS_TIME", "TIME", "HORA", "TIMESTAMP", "DATE_TIME", "DATETIME", "FECHA_HORA", "FECHAHORA"),
-    "altitude": ("ALTm", "ALT", "ALT_M", "ALTITUDE", "ALTITUD", "ALTURA", "HEIGHT", "HEIGHT_M", "ELEV", "ELEVATION"),
-    "speed": ("SPkph", "SPEED", "SPEED_KPH", "VEL", "VELOCIDAD", "VEL_KMH", "KMH", "KPH"),
-    "swath_width": ("SW_WIDTHm", "SWATH", "WIDTH", "ANCHO", "ANCHO_M", "FAJA", "FAJA_M", "BOOM_WIDTH"),
-    "volume": ("SPR_VOL", "VOLUME", "VOL", "VOLUMEN", "LITROS", "L_HA", "LTS", "DOSIS"),
-}
+# Solo afecta la geometría que se envía al navegador/BD, no los cálculos.
+# Reduce muchísimo el tamaño del GeoJSON y mantiene las métricas exactas.
+OUTPUT_SIMPLIFY_TOLERANCE_METERS = float(os.getenv("HELICOPTER_OUTPUT_SIMPLIFY_TOLERANCE_METERS", "0.25"))
+MAX_SPRON_POINT_FEATURES = int(os.getenv("HELICOPTER_MAX_SPRON_POINTS", "1500"))
+MAX_SPROFF_POINT_FEATURES = int(os.getenv("HELICOPTER_MAX_SPROFF_POINTS", "750"))
 
 
 @dataclass
-class LayerGroup:
+class HelicopterLayerGroup:
     id: str
-    polygon_shp: Path
-    spron_shp: Path
-    sproff_shp: Optional[Path]
+    base_path: str
+    polygon_shp: str
+    spron_shp: str
+    sproff_shp: str
 
 
-def _norm_key(text: Any) -> str:
-    raw = unicodedata.normalize("NFKD", str(text or ""))
-    raw = "".join(ch for ch in raw if not unicodedata.combining(ch))
-    return re.sub(r"[^a-zA-Z0-9]", "", raw).lower()
+@dataclass
+class LinePolyInfo:
+    poly: BaseGeometry
+    track: BaseGeometry
+    group: str
+    lin: float
+    line_key: str
 
 
-def _column_map(props: Dict[str, Any]) -> Dict[str, str]:
-    return {_norm_key(k): k for k in props.keys()}
+def _normalise_zip_name(name: str) -> str:
+    return name.replace("\\", "/").lstrip("/")
 
 
-def _get_any(props: Dict[str, Any], aliases: Iterable[str], default: Any = None) -> Any:
-    cmap = _column_map(props)
-    for alias in aliases:
-        key = cmap.get(_norm_key(alias))
-        if key is not None:
-            val = props.get(key)
-            if val is not None and val != "":
-                return val
-    return default
+def _shp_groups(names: Iterable[str]) -> List[HelicopterLayerGroup]:
+    buckets: Dict[str, Dict[str, str]] = {}
+    ids: Dict[str, str] = {}
+    for raw in names:
+        name = _normalise_zip_name(raw)
+        lower = name.lower()
+        if not lower.endswith(".shp"):
+            continue
+        layer = None
+        if lower.endswith("polygon.shp"):
+            layer = "polygon_shp"
+            suffix = "polygon.shp"
+        elif lower.endswith("spron.shp"):
+            layer = "spron_shp"
+            suffix = "spron.shp"
+        elif lower.endswith("sproff.shp"):
+            layer = "sproff_shp"
+            suffix = "sproff.shp"
+        if not layer:
+            continue
+        base = name[: -len(suffix)]
+        group_id = Path(base.rstrip("/")).name or base.rstrip("/") or "default"
+        buckets.setdefault(base, {})[layer] = name
+        ids[base] = group_id
 
-
-def _num(value: Any, default: float = 0.0) -> float:
-    try:
-        if value is None or value == "":
-            return default
-        if isinstance(value, str):
-            value = value.replace(",", ".")
-        n = float(value)
-        if math.isnan(n) or math.isinf(n):
-            return default
-        return n
-    except Exception:
-        return default
-
-
-def _jsonable(v: Any) -> Any:
-    if hasattr(v, "item"):
-        try:
-            return v.item()
-        except Exception:
-            pass
-    if hasattr(v, "isoformat"):
-        return v.isoformat()
-    return v
+    groups: List[HelicopterLayerGroup] = []
+    for base, item in buckets.items():
+        if {"polygon_shp", "spron_shp", "sproff_shp"}.issubset(item):
+            groups.append(
+                HelicopterLayerGroup(
+                    id=ids.get(base) or "default",
+                    base_path=base,
+                    polygon_shp=item["polygon_shp"],
+                    spron_shp=item["spron_shp"],
+                    sproff_shp=item["sproff_shp"],
+                )
+            )
+    return sorted(groups, key=lambda g: g.id)
 
 
 def _safe_extract(zip_file: zipfile.ZipFile, destination: Path) -> None:
-    root = destination.resolve()
     for member in zip_file.infolist():
-        name = member.filename.replace("\\", "/").lstrip("/")
+        name = _normalise_zip_name(member.filename)
         if not name or name.startswith("../") or "/../" in name:
             continue
         target = (destination / name).resolve()
-        if not str(target).startswith(str(root)):
+        if not str(target).startswith(str(destination.resolve())):
             continue
         if member.is_dir():
             target.mkdir(parents=True, exist_ok=True)
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
         with zip_file.open(member) as src, target.open("wb") as dst:
-            dst.write(src.read())
+            shutil_copy_buffer = 1024 * 1024
+            while True:
+                chunk = src.read(shutil_copy_buffer)
+                if not chunk:
+                    break
+                dst.write(chunk)
 
 
-def _read_prj(shp_path: Path) -> Optional[CRS]:
-    prj = shp_path.with_suffix(".prj")
-    if not prj.exists():
-        return None
+def _read_layer(root: Path, relative_path: str, group_id: str, source_name: str) -> gpd.GeoDataFrame:
+    path = root / _normalise_zip_name(relative_path)
+    if not path.exists():
+        raise ValueError(f"No se encontró {relative_path}")
+    gdf = gpd.read_file(path)
+    if gdf.empty:
+        return gdf
+    if gdf.crs is None:
+        # Los logs de helicóptero suelen venir en lon/lat. Si no hay .prj, asumimos WGS84.
+        gdf = gdf.set_crs("EPSG:4326", allow_override=True)
+    gdf = gdf[gdf.geometry.notna()].copy()
+    gdf["__group"] = group_id
+    gdf["__source"] = source_name
+    return gdf
+
+
+def _metric_crs(gdf: gpd.GeoDataFrame) -> Any:
     try:
-        return CRS.from_wkt(prj.read_text(encoding="utf-8", errors="ignore"))
+        estimated = gdf.estimate_utm_crs()
+        if estimated:
+            return estimated
     except Exception:
+        pass
+    return "EPSG:3857"
+
+
+def _to_wgs(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    if gdf.empty:
+        return gdf
+    if gdf.crs is None:
+        return gdf.set_crs("EPSG:4326", allow_override=True)
+    return gdf.to_crs("EPSG:4326")
+
+
+def _jsonable_value(value: Any) -> Any:
+    if pd.isna(value):
         return None
-
-
-def _transformer(src: Optional[CRS], dst: CRS) -> Optional[Transformer]:
-    src = src or CRS.from_epsg(4326)
-    try:
-        if src == dst:
-            return None
-        return Transformer.from_crs(src, dst, always_xy=True)
-    except Exception:
-        return None
-
-
-def _to_crs(geom: BaseGeometry, src: Optional[CRS], dst: CRS) -> BaseGeometry:
-    tr = _transformer(src, dst)
-    if tr is None:
-        return geom
-    return transform(tr.transform, geom)
-
-
-def _utm_crs(lon: float, lat: float) -> CRS:
-    zone = int((lon + 180) // 6) + 1
-    return CRS.from_epsg((32600 if lat >= 0 else 32700) + zone)
-
-
-def _reader_props(reader: shapefile.Reader, record: Any) -> Dict[str, Any]:
-    fields = [f[0] for f in reader.fields[1:]]
-    out: Dict[str, Any] = {}
-    for k, v in zip(fields, list(record)):
-        out[str(k)] = _jsonable(v)
-    return out
-
-
-def _read_features(shp_path: Path, group_id: str, layer_type: str) -> List[Dict[str, Any]]:
-    src_crs = _read_prj(shp_path) or CRS.from_epsg(4326)
-    reader = shapefile.Reader(str(shp_path))
-    features: List[Dict[str, Any]] = []
-    for idx, sr in enumerate(reader.iterShapeRecords()):
+    if hasattr(value, "item"):
         try:
-            geom_src = shapely_shape(sr.shape.__geo_interface__)
+            return value.item()
         except Exception:
+            pass
+    if isinstance(value, (pd.Timestamp,)):
+        return value.isoformat()
+    return value
+
+
+def _feature_collection(
+    gdf: gpd.GeoDataFrame,
+    max_point_features: Optional[int] = None,
+    simplify_tolerance_m: float = 0.0,
+) -> Dict[str, Any]:
+    """Convierte a GeoJSON con muestreo de puntos y simplificación visual opcional.
+
+    La simplificación se aplica únicamente a geometrías de salida para mapa/historial.
+    Los cálculos de hectáreas, cobertura y traslape se hacen antes con geometría completa.
+    """
+    if gdf.empty:
+        return {"type": "FeatureCollection", "features": []}
+
+    gdf_src = gdf.copy()
+
+    # Evita mandar decenas de miles de puntos al frontend. Las trayectorias reales van en
+    # sprOnTracks/sprOffTracks, que son mucho más livianas para renderizar.
+    if max_point_features and len(gdf_src) > max_point_features:
+        stride = max(1, math.ceil(len(gdf_src) / max_point_features))
+        gdf_src = gdf_src.iloc[::stride].copy()
+
+    if simplify_tolerance_m and simplify_tolerance_m > 0:
+        try:
+            if gdf_src.crs is not None and str(gdf_src.crs).upper() != "EPSG:4326":
+                non_points = ~gdf_src.geometry.geom_type.isin(["Point", "MultiPoint"])
+                if non_points.any():
+                    gdf_src.loc[non_points, "geometry"] = gdf_src.loc[non_points, "geometry"].simplify(
+                        simplify_tolerance_m,
+                        preserve_topology=True,
+                    )
+        except Exception:
+            pass
+
+    gdf_wgs = _to_wgs(gdf_src)
+    features: List[Dict[str, Any]] = []
+    for feature in gdf_wgs.iterfeatures(na="null", drop_id=True):
+        geom = feature.get("geometry")
+        if not geom:
             continue
-        if geom_src.is_empty:
-            continue
-        geom_wgs = _to_crs(geom_src, src_crs, CRS.from_epsg(4326))
-        props = _reader_props(reader, sr.record)
-        props["__group"] = group_id
-        props["__layer_type"] = layer_type
-        props["__source_file"] = str(shp_path.name)
-        props["__row_index"] = idx
-        features.append({"geometry": geom_wgs, "properties": props})
-    return features
+        props = {k: _jsonable_value(v) for k, v in (feature.get("properties") or {}).items()}
+        features.append({"type": "Feature", "properties": props, "geometry": geom})
+    return {"type": "FeatureCollection", "features": features}
 
 
-def _find_groups(tmp: Path) -> List[LayerGroup]:
-    shp_files = [p for p in tmp.rglob("*.shp") if not p.name.startswith(".")]
-    if not shp_files:
-        raise ValueError("El ZIP no contiene shapefiles .shp")
-
-    by_dir: Dict[Path, Dict[str, Path]] = {}
-    for p in shp_files:
-        key = p.parent
-        name = _norm_key(p.stem)
-        item = by_dir.setdefault(key, {})
-        if "spron" in name or ("spr" in name and "on" in name):
-            item["spron"] = p
-        elif "sproff" in name or ("spr" in name and "off" in name):
-            item["sproff"] = p
-        elif "polygon" in name or "poligono" in name or "parcel" in name or "parcela" in name or "lote" in name:
-            item["polygon"] = p
-
-    groups: List[LayerGroup] = []
-    for d, item in by_dir.items():
-        if item.get("polygon") and item.get("spron"):
-            gid = d.name if d != tmp else "default"
-            groups.append(LayerGroup(gid, item["polygon"], item["spron"], item.get("sproff")))
-
-    if not groups:
-        # Fallback global: toma el primer polygon y el primer SprOn encontrados.
-        poly = next((p for p in shp_files if any(k in _norm_key(p.stem) for k in ["polygon", "poligono", "parcela", "parcel", "lote"])), None)
-        spron = next((p for p in shp_files if "spron" in _norm_key(p.stem) or ("spr" in _norm_key(p.stem) and "on" in _norm_key(p.stem))), None)
-        sproff = next((p for p in shp_files if "sproff" in _norm_key(p.stem) or ("spr" in _norm_key(p.stem) and "off" in _norm_key(p.stem))), None)
-        if poly and spron:
-            groups.append(LayerGroup("default", poly, spron, sproff))
-
-    if not groups:
-        raise ValueError("No se encontraron capas Polygon y SprOn en el ZIP")
-    return groups
-
-
-def _polygonal(geom: Optional[BaseGeometry]) -> Optional[BaseGeometry]:
+def _geom_to_wgs(geom: Optional[BaseGeometry], from_crs: Any) -> Optional[Dict[str, Any]]:
     if geom is None or geom.is_empty:
         return None
-    if geom.geom_type in {"Polygon", "MultiPolygon"}:
-        return geom
-    polys = [g for g in getattr(geom, "geoms", []) if g.geom_type in {"Polygon", "MultiPolygon"}]
-    if polys:
-        return unary_union(polys)
-    return None
+    geom = _polygonal(geom)
+    if geom is None or geom.is_empty:
+        return None
+
+    # Optimización de salida: conserva cálculos exactos y solo simplifica el dibujo.
+    if OUTPUT_SIMPLIFY_TOLERANCE_METERS > 0:
+        try:
+            geom = geom.simplify(OUTPUT_SIMPLIFY_TOLERANCE_METERS, preserve_topology=True)
+        except Exception:
+            pass
+
+    transformer = Transformer.from_crs(from_crs, "EPSG:4326", always_xy=True)
+    converted = transform(transformer.transform, geom)
+    return {"type": "Feature", "properties": {}, "geometry": mapping(converted)}
 
 
-def _avg(values: List[float]) -> float:
-    values = [v for v in values if v]
-    return sum(values) / len(values) if values else 0.0
-
-
-def _line_key(props: Dict[str, Any]) -> str:
-    val = _get_any(props, FIELD_ALIASES["line"], "default")
-    return f"{props.get('__group', 'default')}:{val}"
-
-
-def _time_key(props: Dict[str, Any]) -> str:
-    return str(_get_any(props, FIELD_ALIASES["time"], props.get("__row_index", "")))
-
-
-def _feature(geom: Optional[BaseGeometry], props: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+def _geometry_to_feature(geom: Optional[BaseGeometry], props: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     if geom is None or geom.is_empty:
         return None
     return {"type": "Feature", "properties": props or {}, "geometry": mapping(geom)}
 
 
-def _feature_collection_from_geoms(items: Iterable[Tuple[Optional[BaseGeometry], Dict[str, Any]]], limit: Optional[int] = None) -> Dict[str, Any]:
-    features = []
-    for geom, props in items:
-        feat = _feature(geom, props)
-        if feat:
-            features.append(feat)
-            if limit and len(features) >= limit:
-                break
-    return {"type": "FeatureCollection", "features": features}
+def _polygonal(geom: Optional[BaseGeometry]) -> Optional[BaseGeometry]:
+    if geom is None or geom.is_empty:
+        return None
+    if isinstance(geom, (Polygon, MultiPolygon)):
+        return geom
+    if geom.geom_type == "GeometryCollection":
+        polys: List[Polygon] = []
+        for item in geom.geoms:
+            p = _polygonal(item)
+            if isinstance(p, Polygon):
+                polys.append(p)
+            elif isinstance(p, MultiPolygon):
+                polys.extend(list(p.geoms))
+        if not polys:
+            return None
+        return unary_union(polys)
+    return None
 
 
-def _build_tracks(points_metric: List[Dict[str, Any]], swath_width: float, parcel_union: Optional[BaseGeometry]) -> Tuple[List[Dict[str, Any]], List[Tuple[LineString, Dict[str, Any]]]]:
-    grouped: Dict[str, List[Dict[str, Any]]] = {}
-    for feat in points_metric:
-        if not isinstance(feat["geometry"], Point):
+def _num(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or pd.isna(value):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _line_key(row: pd.Series) -> Optional[str]:
+    lin = row.get("LIN")
+    if lin is None or pd.isna(lin):
+        return None
+    return f"{row.get('__group', 'default')}:{lin}"
+
+
+def _split_coords(coords: List[Tuple[float, float]], max_gap: float = MAX_POINT_GAP_METERS) -> List[List[Tuple[float, float]]]:
+    if len(coords) < 2:
+        return []
+    segments: List[List[Tuple[float, float]]] = []
+    current = [coords[0]]
+    for prev, nxt in zip(coords[:-1], coords[1:]):
+        gap = math.hypot(nxt[0] - prev[0], nxt[1] - prev[1])
+        if gap > max_gap:
+            if len(current) >= 2:
+                segments.append(current)
+            current = [nxt]
+        else:
+            current.append(nxt)
+    if len(current) >= 2:
+        segments.append(current)
+    return segments
+
+
+def _build_line_polygons(spr_metric: gpd.GeoDataFrame, swath_width: float) -> Tuple[List[LinePolyInfo], gpd.GeoDataFrame]:
+    if spr_metric.empty:
+        return [], gpd.GeoDataFrame(columns=["geometry"], geometry="geometry", crs=spr_metric.crs)
+
+    sort_cols = [c for c in ["__group", "LIN", "TIMEGPS"] if c in spr_metric.columns]
+    sorted_gdf = spr_metric.sort_values(sort_cols).copy() if sort_cols else spr_metric.copy()
+
+    buckets: Dict[str, Dict[str, Any]] = {}
+    for _, row in sorted_gdf.iterrows():
+        geom = row.geometry
+        if geom is None or geom.is_empty or geom.geom_type != "Point":
             continue
-        grouped.setdefault(_line_key(feat["properties"]), []).append(feat)
+        key = _line_key(row) or f"{row.get('__group', 'default')}:0"
+        bucket = buckets.setdefault(
+            key,
+            {"group": row.get("__group", "default"), "lin": _num(row.get("LIN"), 0.0), "coords": [], "widths": []},
+        )
+        bucket["coords"].append((geom.x, geom.y))
+        w = _num(row.get("SW_WIDTHm"), 0.0)
+        if w > 0:
+            bucket["widths"].append(w)
 
-    line_infos: List[Dict[str, Any]] = []
-    tracks: List[Tuple[LineString, Dict[str, Any]]] = []
+    line_infos: List[LinePolyInfo] = []
+    track_records: List[Dict[str, Any]] = []
+    for key, bucket in buckets.items():
+        coords = bucket["coords"]
+        if len(coords) < 2:
+            continue
+        segments = _split_coords(coords)
+        width = sum(bucket["widths"]) / len(bucket["widths"]) if bucket["widths"] else (swath_width or DEFAULT_SWATH_WIDTH_METERS)
+        for idx, seg in enumerate(segments):
+            if len(seg) < 2:
+                continue
+            line = LineString(seg)
+            if line.length <= 0:
+                continue
+            poly = line.buffer(width / 2.0, cap_style=2, join_style=2)
+            info_key = f"{key}:{idx}"
+            line_infos.append(
+                LinePolyInfo(poly=poly, track=line, group=str(bucket["group"]), lin=float(bucket["lin"]), line_key=info_key)
+            )
+            track_records.append({"LIN": bucket["lin"], "__group": bucket["group"], "lineKey": info_key, "geometry": line})
 
-    for key, rows in grouped.items():
-        rows.sort(key=lambda r: (_time_key(r["properties"]), r["properties"].get("__row_index", 0)))
-        segment: List[Dict[str, Any]] = []
-        seg_index = 0
-
-        def flush() -> None:
-            nonlocal seg_index, segment
-            if len(segment) < 2:
-                segment = []
-                return
-            coords = [(p["geometry"].x, p["geometry"].y) for p in segment]
-            line = LineString(coords)
-            props = dict(segment[0]["properties"])
-            props.update({
-                "__dataris_track_key": key,
-                "__dataris_segment": seg_index,
-                "__dataris_point_count": len(segment),
-                "tipo_capa": "Trayectoria SprOn",
-            })
-            sw = _num(_get_any(props, FIELD_ALIASES["swath_width"]), swath_width) or swath_width
-            poly = line.buffer(sw / 2.0, cap_style=2, join_style=2)
-            clipped = _polygonal(poly.intersection(parcel_union)) if parcel_union else _polygonal(poly)
-            line_infos.append({
-                "line": line,
-                "polygon": clipped,
-                "props": props,
-                "altitude": _num(_get_any(props, FIELD_ALIASES["altitude"])),
-                "speed": _num(_get_any(props, FIELD_ALIASES["speed"])),
-            })
-            tracks.append((line, props))
-            seg_index += 1
-            segment = []
-
-        prev = None
-        for row in rows:
-            pt = row["geometry"]
-            if prev is not None and pt.distance(prev) > MAX_POINT_GAP_METERS:
-                flush()
-            segment.append(row)
-            prev = pt
-        flush()
-
+    tracks = gpd.GeoDataFrame(track_records, geometry="geometry", crs=spr_metric.crs) if track_records else gpd.GeoDataFrame(columns=["geometry"], geometry="geometry", crs=spr_metric.crs)
     return line_infos, tracks
 
 
-def _overlap_union(polys: List[BaseGeometry]) -> Optional[BaseGeometry]:
-    overlaps: List[BaseGeometry] = []
-    for i, a in enumerate(polys):
-        if a is None or a.is_empty:
+def _clip_line_polys(line_infos: List[LinePolyInfo], parcel_union: Optional[BaseGeometry]) -> List[LinePolyInfo]:
+    if not parcel_union or parcel_union.is_empty:
+        return line_infos
+    clipped: List[LinePolyInfo] = []
+    for info in line_infos:
+        if info.poly.is_empty or not info.poly.bounds:
             continue
-        for b in polys[i + 1:]:
-            if b is None or b.is_empty:
+        try:
+            inter = info.poly.intersection(parcel_union)
+        except Exception:
+            inter = info.poly
+        inter = _polygonal(inter)
+        if inter is not None and not inter.is_empty:
+            clipped.append(LinePolyInfo(poly=inter, track=info.track, group=info.group, lin=info.lin, line_key=info.line_key))
+    return clipped
+
+
+def _coverage_union(line_infos: List[LinePolyInfo]) -> Optional[BaseGeometry]:
+    polys = [_polygonal(info.poly) for info in line_infos if info.poly is not None and not info.poly.is_empty]
+    polys = [p for p in polys if p is not None and not p.is_empty]
+    if not polys:
+        return None
+    return _polygonal(unary_union(polys))
+
+
+def _query_tree_indices(
+    tree: STRtree,
+    geom_id_to_idx: Dict[int, int],
+    geom: BaseGeometry,
+) -> Iterable[int]:
+    """Compatibilidad Shapely 1.x/2.x: query devuelve geometrías o índices."""
+    for candidate in tree.query(geom):
+        if isinstance(candidate, Integral):
+            yield int(candidate)
+        else:
+            idx = geom_id_to_idx.get(id(candidate))
+            if idx is not None:
+                yield idx
+
+
+def _point_stats_by_parcel(spron_metric: gpd.GeoDataFrame, parcelas_metric: gpd.GeoDataFrame) -> Dict[Any, Dict[str, Any]]:
+    """Calcula altitud, velocidad y líneas por parcela con spatial join una sola vez.
+
+    Antes se hacía un within() contra todos los puntos por cada parcela. En archivos
+    grandes eso escala muy mal. El spatial join usa índice espacial y reduce mucho
+    el tiempo sin cambiar el resultado.
+    """
+    if spron_metric.empty or parcelas_metric.empty:
+        return {}
+
+    cols = ["geometry"]
+    for c in ["ALTm", "SPkph", "LIN", "__group", "__line_key"]:
+        if c in spron_metric.columns:
+            cols.append(c)
+
+    points = spron_metric[cols].copy()
+    parcels = parcelas_metric[["geometry"]].copy()
+
+    try:
+        joined = gpd.sjoin(points, parcels, how="inner", predicate="within")
+    except Exception:
+        # Fallback seguro si no hay índice espacial disponible.
+        stats: Dict[Any, Dict[str, Any]] = {}
+        prepared = [(idx, prep(_polygonal(row.geometry) or row.geometry)) for idx, row in parcelas_metric.iterrows()]
+        for point_idx, row in points.iterrows():
+            geom = row.geometry
+            if geom is None or geom.is_empty:
                 continue
-            if not a.bounds or not b.bounds:
-                continue
-            inter = a.intersection(b)
-            if not inter.is_empty:
-                p = _polygonal(inter)
-                if p:
-                    overlaps.append(p)
-    return _polygonal(unary_union(overlaps)) if overlaps else None
+            for parcel_idx, prepared_geom in prepared:
+                try:
+                    if prepared_geom.contains(geom):
+                        bucket = stats.setdefault(parcel_idx, {"altitudes": [], "speeds": [], "lineKeys": set()})
+                        alt = _num(row.get("ALTm"), 0.0)
+                        spd = _num(row.get("SPkph"), 0.0)
+                        if alt != 0:
+                            bucket["altitudes"].append(alt)
+                        if spd != 0:
+                            bucket["speeds"].append(spd)
+                        key = row.get("__line_key") or _line_key(row)
+                        if key:
+                            bucket["lineKeys"].add(key)
+                        break
+                except Exception:
+                    continue
+        return stats
+
+    stats: Dict[Any, Dict[str, Any]] = {}
+    if joined.empty:
+        return stats
+
+    for parcel_idx, group in joined.groupby("index_right", sort=False):
+        altitudes = [_num(v) for v in group.get("ALTm", pd.Series(dtype=float)).tolist() if _num(v) != 0]
+        speeds = [_num(v) for v in group.get("SPkph", pd.Series(dtype=float)).tolist() if _num(v) != 0]
+        if "__line_key" in group.columns:
+            line_keys = {v for v in group["__line_key"].dropna().tolist() if v}
+        else:
+            line_keys = {_line_key(r) for _, r in group.iterrows()}
+            line_keys.discard(None)
+        stats[parcel_idx] = {"altitudes": altitudes, "speeds": speeds, "lineKeys": line_keys}
+    return stats
 
 
-def process_helicopter_zip(zip_path: Path | str, swath_width: float = DEFAULT_SWATH_WIDTH_METERS) -> Dict[str, Any]:
-    zip_path = Path(zip_path)
-    swath_width = float(swath_width or DEFAULT_SWATH_WIDTH_METERS)
+def _overlap_union(line_infos: List[LinePolyInfo]) -> Optional[BaseGeometry]:
+    grouped: Dict[str, List[LinePolyInfo]] = {}
+    for info in line_infos:
+        grouped.setdefault(info.group, []).append(info)
 
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
+    overlaps: List[BaseGeometry] = []
+    for lines in grouped.values():
+        lines.sort(key=lambda x: (x.lin, x.line_key))
+        for i, a in enumerate(lines):
+            for b in lines[i + 1 :]:
+                diff = b.lin - a.lin
+                if diff > 1:
+                    break
+                if diff < 1:
+                    continue
+                if not a.poly.bounds or not b.poly.bounds:
+                    continue
+                ax1, ay1, ax2, ay2 = a.poly.bounds
+                bx1, by1, bx2, by2 = b.poly.bounds
+                if ax1 > bx2 or ax2 < bx1 or ay1 > by2 or ay2 < by1:
+                    continue
+                try:
+                    inter = _polygonal(a.poly.intersection(b.poly))
+                    if inter is not None and not inter.is_empty:
+                        overlaps.append(inter)
+                except Exception:
+                    continue
+    if not overlaps:
+        return None
+    return _polygonal(unary_union(overlaps))
+
+
+def _avg(values: List[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def process_helicopter_zip(zip_path: Path, swath_width: float = DEFAULT_SWATH_WIDTH_METERS) -> Dict[str, Any]:
+    if swath_width <= 0:
+        swath_width = DEFAULT_SWATH_WIDTH_METERS
+
+    with tempfile.TemporaryDirectory(prefix="dataris-heli-") as tmp_name:
+        tmp = Path(tmp_name)
         with zipfile.ZipFile(zip_path) as zf:
+            groups = _shp_groups(zf.namelist())
+            if not groups:
+                raise ValueError("El ZIP debe contener grupos completos Polygon.shp, SprOn.shp y SprOff.shp")
             _safe_extract(zf, tmp)
 
-        groups = _find_groups(tmp)
-        parcels_wgs: List[Dict[str, Any]] = []
-        spron_wgs: List[Dict[str, Any]] = []
-        sproff_wgs: List[Dict[str, Any]] = []
-
+        parcelas_parts: List[gpd.GeoDataFrame] = []
+        spron_parts: List[gpd.GeoDataFrame] = []
+        sproff_parts: List[gpd.GeoDataFrame] = []
         for group in groups:
-            parcels_wgs.extend(_read_features(group.polygon_shp, group.id, "Polygon"))
-            spron_wgs.extend(_read_features(group.spron_shp, group.id, "SprOn"))
-            if group.sproff_shp:
-                sproff_wgs.extend(_read_features(group.sproff_shp, group.id, "SprOff"))
+            parcelas_parts.append(_read_layer(tmp, group.polygon_shp, group.id, "Polygon"))
+            spron_parts.append(_read_layer(tmp, group.spron_shp, group.id, "SprOn"))
+            sproff_parts.append(_read_layer(tmp, group.sproff_shp, group.id, "SprOff"))
 
-        parcels_wgs = [f for f in parcels_wgs if f["geometry"].geom_type in {"Polygon", "MultiPolygon"}]
-        if not parcels_wgs:
+        parcelas = pd.concat(parcelas_parts, ignore_index=True) if parcelas_parts else gpd.GeoDataFrame()
+        spron = pd.concat(spron_parts, ignore_index=True) if spron_parts else gpd.GeoDataFrame()
+        sproff = pd.concat(sproff_parts, ignore_index=True) if sproff_parts else gpd.GeoDataFrame()
+
+        parcelas = gpd.GeoDataFrame(parcelas, geometry="geometry", crs=parcelas_parts[0].crs if parcelas_parts else "EPSG:4326")
+        spron = gpd.GeoDataFrame(spron, geometry="geometry", crs=spron_parts[0].crs if spron_parts else parcelas.crs)
+        sproff = gpd.GeoDataFrame(sproff, geometry="geometry", crs=sproff_parts[0].crs if sproff_parts else parcelas.crs)
+
+        parcelas = parcelas[parcelas.geometry.geom_type.isin(["Polygon", "MultiPolygon"])].copy()
+        if parcelas.empty:
             raise ValueError("No se encontraron polígonos de parcela válidos en la capa Polygon")
-        if not spron_wgs:
+        if spron.empty:
             raise ValueError("No se encontraron puntos SprOn válidos")
 
-        parcel_union_wgs = unary_union([f["geometry"] for f in parcels_wgs])
-        c = parcel_union_wgs.centroid
-        metric_crs = _utm_crs(c.x, c.y)
+        metric_crs = _metric_crs(parcelas)
+        parcelas_metric = parcelas.to_crs(metric_crs)
+        spron_metric = spron.to_crs(metric_crs)
+        sproff_metric = sproff.to_crs(metric_crs) if not sproff.empty else sproff
 
-        def to_metric(feats: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-            out = []
-            for f in feats:
-                out.append({"geometry": _to_crs(f["geometry"], CRS.from_epsg(4326), metric_crs), "properties": dict(f["properties"])})
-            return out
+        if not spron_metric.empty:
+            spron_metric["__line_key"] = spron_metric.apply(_line_key, axis=1)
+        if not sproff_metric.empty:
+            sproff_metric["__line_key"] = sproff_metric.apply(_line_key, axis=1)
 
-        def to_wgs_geom(geom: Optional[BaseGeometry]) -> Optional[BaseGeometry]:
-            if geom is None:
-                return None
-            return _to_crs(geom, metric_crs, CRS.from_epsg(4326))
+        parcel_union = _polygonal(unary_union(list(parcelas_metric.geometry)))
+        line_infos_raw, spron_tracks_metric = _build_line_polygons(spron_metric, swath_width)
+        line_infos = _clip_line_polys(line_infos_raw, parcel_union)
+        coverage = _coverage_union(line_infos)
+        overlap = _overlap_union(line_infos)
 
-        parcels_metric = to_metric(parcels_wgs)
-        spron_metric = to_metric(spron_wgs)
-        sproff_metric = to_metric(sproff_wgs)
-        parcel_union = _polygonal(unary_union([f["geometry"] for f in parcels_metric]))
+        _, sproff_tracks_metric = _build_line_polygons(sproff_metric, swath_width) if not sproff_metric.empty else ([], gpd.GeoDataFrame(columns=["geometry"], geometry="geometry", crs=metric_crs))
 
-        line_infos, spron_tracks = _build_tracks(spron_metric, swath_width, parcel_union)
-        _, sproff_tracks = _build_tracks(sproff_metric, swath_width, parcel_union) if sproff_metric else ([], [])
-
-        line_polys = [li["polygon"] for li in line_infos if li.get("polygon") is not None and not li["polygon"].is_empty]
-        coverage = _polygonal(unary_union(line_polys)) if line_polys else None
-        overlap = _overlap_union(line_polys)
+        point_stats = _point_stats_by_parcel(spron_metric, parcelas_metric)
 
         parcel_results: List[Dict[str, Any]] = []
-        for idx, row in enumerate(parcels_metric):
-            geom = _polygonal(row["geometry"])
-            if geom is None:
+        for idx, row in parcelas_metric.iterrows():
+            geom = _polygonal(row.geometry)
+            if geom is None or geom.is_empty:
                 continue
             area_ha = geom.area / 10000.0
             covered_geom = _polygonal(geom.intersection(coverage)) if coverage else None
@@ -382,51 +534,64 @@ def process_helicopter_zip(zip_path: Path | str, swath_width: float = DEFAULT_SW
             overlap_geom = _polygonal(geom.intersection(overlap)) if overlap else None
             overlap_ha = overlap_geom.area / 10000.0 if overlap_geom else 0.0
 
-            inside = [p for p in spron_metric if isinstance(p["geometry"], Point) and p["geometry"].within(geom)]
-            altitudes = [_num(_get_any(p["properties"], FIELD_ALIASES["altitude"])) for p in inside]
-            speeds = [_num(_get_any(p["properties"], FIELD_ALIASES["speed"])) for p in inside]
-            line_keys = {_line_key(p["properties"]) for p in inside}
+            stats = point_stats.get(idx, {})
+            altitudes = stats.get("altitudes", [])
+            speeds = stats.get("speeds", [])
+            line_keys = stats.get("lineKeys", set())
 
-            source_props = dict(parcels_wgs[idx]["properties"]) if idx < len(parcels_wgs) else dict(row["properties"])
-            name = _get_any(source_props, FIELD_ALIASES["parcel_name"]) or source_props.get("__group") or f"Área {idx + 1}"
-            source_props["__dataris_parcel_name"] = str(name)
-            vol = _num(_get_any(source_props, FIELD_ALIASES["volume"]), 0.0)
+            source_row = parcelas.loc[idx] if idx in parcelas.index else row
+            name = (
+                source_row.get("AREA_NAME")
+                or source_row.get("Name")
+                or source_row.get("NOMBRE")
+                or source_row.get("LOTE")
+                or source_row.get("__group")
+                or f"Área {len(parcel_results) + 1}"
+            )
+            vol = _num(source_row.get("SPR_VOL"), 0.0)
 
-            parcel_results.append({
-                "name": str(name),
-                "totalHa": area_ha,
-                "coveredHa": covered_ha,
-                "coveredPct": (covered_ha / area_ha) * 100 if area_ha else 0.0,
-                "uncoveredHa": max(area_ha - covered_ha, 0.0),
-                "overlapHa": overlap_ha,
-                "avgAltitude": _avg(altitudes),
-                "avgSpeed": _avg(speeds),
-                "uniqueLines": len(line_keys),
-                "volume": vol,
-                "sourceProperties": source_props,
-                "coveredGeom": _feature(to_wgs_geom(covered_geom), {**source_props, "tipo_capa": "Zona aplicada", "hectareas_aplicadas": round(covered_ha, 4), "cobertura_pct": round((covered_ha / area_ha) * 100 if area_ha else 0.0, 2)}),
-                "uncoveredGeom": _feature(to_wgs_geom(uncovered_geom), {**source_props, "tipo_capa": "Sin cubrir", "hectareas_sin_cubrir": round(max(area_ha - covered_ha, 0.0), 4)}),
-                "overlapGeom": _feature(to_wgs_geom(overlap_geom), {**source_props, "tipo_capa": "Sobre-aplicado", "hectareas_sobre_aplicadas": round(overlap_ha, 4)}),
-                "geometry": _feature(to_wgs_geom(geom), source_props),
-            })
+            parcel_results.append(
+                {
+                    "name": str(name),
+                    "totalHa": area_ha,
+                    "coveredHa": covered_ha,
+                    "coveredPct": (covered_ha / area_ha) * 100 if area_ha else 0.0,
+                    "uncoveredHa": max(area_ha - covered_ha, 0.0),
+                    "overlapHa": overlap_ha,
+                    "avgAltitude": _avg(altitudes),
+                    "avgSpeed": _avg(speeds),
+                    "uniqueLines": len(line_keys),
+                    "volume": vol,
+                    "coveredGeom": _geom_to_wgs(covered_geom, metric_crs),
+                    "uncoveredGeom": _geom_to_wgs(uncovered_geom, metric_crs),
+                    "overlapGeom": _geom_to_wgs(overlap_geom, metric_crs),
+                    "geometry": _geom_to_wgs(geom, metric_crs),
+                }
+            )
 
         total_ha = sum(p["totalHa"] for p in parcel_results)
         total_covered_ha = sum(p["coveredHa"] for p in parcel_results)
         total_uncovered_ha = max(total_ha - total_covered_ha, 0.0)
         overlap_ha = overlap.area / 10000.0 if overlap else 0.0
-        speeds_all = [_num(_get_any(f["properties"], FIELD_ALIASES["speed"])) for f in spron_metric]
-        alts_all = [_num(_get_any(f["properties"], FIELD_ALIASES["altitude"])) for f in spron_metric]
-        line_keys_global = {_line_key(f["properties"]) for f in spron_metric}
-        total_volume = sum(_num(_get_any(f["properties"], FIELD_ALIASES["volume"]), 0.0) for f in parcels_wgs)
+
+        speeds_all = [_num(v) for v in spron.get("SPkph", pd.Series(dtype=float)).tolist() if _num(v) != 0]
+        alts_all = [_num(v) for v in spron.get("ALTm", pd.Series(dtype=float)).tolist() if _num(v) != 0]
+        if "__line_key" in spron_metric.columns:
+            line_keys_global = {v for v in spron_metric["__line_key"].dropna().tolist() if v}
+        else:
+            line_keys_global = {_line_key(r) for _, r in spron.iterrows()}
+            line_keys_global.discard(None)
+        total_volume = float(parcelas.get("SPR_VOL", pd.Series(dtype=float)).apply(lambda v: _num(v, 0.0)).sum()) if "SPR_VOL" in parcelas.columns else 0.0
 
         return {
-            "parcelas": _feature_collection_from_geoms([(f["geometry"], f["properties"]) for f in parcels_wgs]),
-            "sprOn": _feature_collection_from_geoms([(f["geometry"], f["properties"]) for f in spron_wgs], limit=4000),
-            "sprOff": _feature_collection_from_geoms([(f["geometry"], f["properties"]) for f in sproff_wgs], limit=2000),
-            "sprOnTracks": _feature_collection_from_geoms([(to_wgs_geom(g), {**p, "tipo_capa": "Trayectoria SprOn"}) for g, p in spron_tracks]),
-            "sprOffTracks": _feature_collection_from_geoms([(to_wgs_geom(g), {**p, "tipo_capa": "Trayectoria SprOff"}) for g, p in sproff_tracks]),
-            "sprOnUnion": _feature(to_wgs_geom(coverage), {"tipo_capa": "Zona aplicada"}),
-            "overlapGeom": _feature(to_wgs_geom(overlap), {"tipo_capa": "Sobre-aplicado"}),
+            "parcelas": _feature_collection(parcelas_metric, simplify_tolerance_m=OUTPUT_SIMPLIFY_TOLERANCE_METERS),
+            # Guardamos puntos limitados para no inflar demasiado compat_db.json; las líneas correctas van en sprOnTracks/sprOffTracks.
+            "sprOn": _feature_collection(spron_metric, max_point_features=MAX_SPRON_POINT_FEATURES),
+            "sprOff": _feature_collection(sproff_metric, max_point_features=MAX_SPROFF_POINT_FEATURES),
+            "sprOnTracks": _feature_collection(spron_tracks_metric, simplify_tolerance_m=OUTPUT_SIMPLIFY_TOLERANCE_METERS),
+            "sprOffTracks": _feature_collection(sproff_tracks_metric, simplify_tolerance_m=OUTPUT_SIMPLIFY_TOLERANCE_METERS),
+            "sprOnUnion": _geom_to_wgs(coverage, metric_crs),
+            "overlapGeom": _geom_to_wgs(overlap, metric_crs),
             "overlapHa": overlap_ha,
             "parcelResults": parcel_results,
             "totalHa": total_ha,
@@ -438,6 +603,6 @@ def process_helicopter_zip(zip_path: Path | str, swath_width: float = DEFAULT_SW
             "totalLines": len(line_keys_global),
             "totalVolume": total_volume,
             "efficiency": (total_covered_ha / total_ha) * 100 if total_ha else 0.0,
-            "speedRange": [min([v for v in speeds_all if v] or [0]), max([v for v in speeds_all if v] or [0])],
-            "altitudeRange": [min([v for v in alts_all if v] or [0]), max([v for v in alts_all if v] or [0])],
+            "speedRange": [min(speeds_all), max(speeds_all)] if speeds_all else [0, 0],
+            "altitudeRange": [min(alts_all), max(alts_all)] if alts_all else [0, 0],
         }
