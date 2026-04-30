@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import math
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -643,9 +644,18 @@ def _extract_output_text(response_json: Dict[str, Any]) -> str:
 
 
 async def _call_openai(compact: Dict[str, Any], question: Optional[str]) -> Dict[str, Any]:
-    api_key = getattr(settings, "OPENAI_API_KEY", None)
+    api_key = (
+        getattr(settings, "OPENAI_API_KEY", None)
+        or os.getenv("OPENAI_API_KEY")
+        or os.getenv("OPENAI_API_TOKEN")
+        or os.getenv("CHATGPT_API_KEY")
+    )
     if not api_key:
-        return _fallback_report(compact, question, None)
+        return _fallback_report(
+            compact,
+            question,
+            "OPENAI_API_KEY no está configurada en el backend. El resultado mostrado es diagnóstico local determinístico, no una respuesta de OpenAI.",
+        )
 
     model = getattr(settings, "OPENAI_AERIAL_COPILOT_MODEL", "gpt-4.1-mini")
     max_output_tokens = int(getattr(settings, "OPENAI_AERIAL_COPILOT_MAX_OUTPUT_TOKENS", 1400) or 1400)
