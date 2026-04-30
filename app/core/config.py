@@ -34,6 +34,14 @@ class Settings(BaseSettings):
 
     DATARIS_COMPAT_STORAGE_DIR: str | None = None
 
+    # OpenAI Copiloto de Aplicación Aérea.
+    # OPENAI_API_KEY debe configurarse en producción; si no existe, el backend devuelve
+    # un diagnóstico determinístico local para que la UI siga funcionando.
+    OPENAI_API_KEY: str | None = None
+    OPENAI_AERIAL_COPILOT_MODEL: str = "gpt-4.1-mini"
+    OPENAI_AERIAL_COPILOT_MAX_OUTPUT_TOKENS: int = 1400
+    OPENAI_AERIAL_COPILOT_TIMEOUT_SECONDS: int = 25
+
     model_config = {
         "env_file": ".env",
         "extra": "ignore",

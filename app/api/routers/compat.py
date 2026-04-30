@@ -21,6 +21,7 @@ from pydantic import BaseModel
 
 from app.core.config import settings
 from app.services.telemetry.helicopter_processor import process_helicopter_zip
+from app.services.telemetry.aerial_copilot import process_aerial_copilot
 from app.services.telemetry.parcel_upload import parse_parcel_file
 
 router = APIRouter(prefix="/compat", tags=["Frontend Compatibility"])
@@ -657,6 +658,21 @@ async def helicopter_analyze(
             tmp_path.unlink(missing_ok=True)
         except Exception:
             pass
+
+
+@router.post("/helicopter/copilot")
+async def helicopter_copilot(
+    payload: Dict[str, Any] = Body(default_factory=dict),
+    authorization: Optional[str] = Header(default=None),
+):
+    user = bearer_user(authorization)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        result = await process_aerial_copilot(payload or {})
+        return {"data": result, "error": None}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Error generando copiloto de aplicación aérea: {exc}")
 
 
 @router.post("/parcels/upload")
