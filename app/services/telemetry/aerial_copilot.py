@@ -205,6 +205,209 @@ def _critical_parcels(compact: Dict[str, Any]) -> List[Dict[str, Any]]:
     return rows[:8]
 
 
+
+def _median(values: List[float]) -> float:
+    clean = sorted(v for v in values if v > 0 and math.isfinite(v))
+    if not clean:
+        return 0.0
+    middle = len(clean) // 2
+    if len(clean) % 2:
+        return clean[middle]
+    return (clean[middle - 1] + clean[middle]) / 2.0
+
+
+def _advanced_diagnostics(compact: Dict[str, Any], worst: List[Dict[str, Any]]) -> Dict[str, Any]:
+    gm = compact["globalMetrics"]
+    parcels = compact.get("parcelsByRisk", [])
+    total_ha = _num(gm.get("totalHa"))
+    uncovered = _num(gm.get("uncoveredHa"))
+    overlap = _num(gm.get("overlapHa"))
+    coverage = _num(gm.get("coveragePct"))
+    risk_ha = uncovered + overlap
+    speed_min, speed_max = _range(gm.get("speedRangeKph"))
+    alt_min, alt_max = _range(gm.get("altitudeRangeM"))
+    avg_speed = _num(gm.get("avgSpeedKph"))
+    avg_alt = _num(gm.get("avgAltitudeM"))
+
+    ranked_risk = []
+    for parcel in parcels:
+        parcel_risk = _num(parcel.get("uncoveredHa")) + _num(parcel.get("overlapHa"))
+        if parcel_risk > 0:
+            ranked_risk.append((parcel.get("name") or "Parcela", parcel_risk))
+    ranked_risk.sort(key=lambda item: item[1], reverse=True)
+    top_one_share = _pct(ranked_risk[0][1], risk_ha) if ranked_risk and risk_ha else 0.0
+    top_three_share = _pct(sum(v for _, v in ranked_risk[:3]), risk_ha) if risk_ha else 0.0
+
+    speed_volatility = _pct(speed_max - speed_min, avg_speed) if avg_speed else 0.0
+    altitude_volatility = _pct(alt_max - alt_min, avg_alt) if avg_alt else 0.0
+
+    densities = []
+    for parcel in parcels:
+        area = _num(parcel.get("totalHa"))
+        lines = _num(parcel.get("uniqueLines"))
+        if area > 0 and lines > 0:
+            densities.append(lines / area)
+    density_median = _median(densities)
+    density_min = min(densities) if densities else 0.0
+    density_max = max(densities) if densities else 0.0
+    density_spread = _pct(density_max - density_min, density_median) if density_median else 0.0
+
+    if coverage >= 94 and _pct(uncovered, total_ha) <= 6:
+        closure = "Media-alta: se puede cerrar si campo valida las zonas azules y el criterio agronómico acepta la subcobertura residual."
+    elif coverage >= 90:
+        closure = "Media: no conviene cerrar sin revisar las parcelas con mayor concentración de riesgo."
+    else:
+        closure = "Baja: la cobertura global exige revisión técnica antes de cerrar la operación."
+
+    concentration = (
+        f"El riesgo operativo se concentra en {ranked_risk[0][0]} ({top_one_share:.1f}% del riesgo ha) "
+        f"y las primeras 3 parcelas acumulan {top_three_share:.1f}%."
+        if ranked_risk
+        else "No hay concentración relevante de riesgo por parcela."
+    )
+
+    speed_stability = (
+        f"Variación alta de velocidad: {speed_min:.0f}-{speed_max:.0f} km/h ({speed_volatility:.1f}% del promedio). Cruza estos tramos contra zonas sin cubrir."
+        if speed_volatility > 45
+        else f"Velocidad relativamente estable: rango equivalente a {speed_volatility:.1f}% del promedio."
+    )
+    altitude_stability = (
+        f"Variación alta de altitud: {alt_min:.0f}-{alt_max:.0f} m ({altitude_volatility:.1f}% del promedio). Puede afectar deriva, ancho efectivo y uniformidad."
+        if altitude_volatility > 180
+        else f"Altitud sin señal crítica por índice relativo: variación {altitude_volatility:.1f}% del promedio."
+    )
+    pattern_uniformity = (
+        f"La densidad de líneas por hectárea varía {density_spread:.1f}% entre parcelas; esto puede explicar diferencias de cobertura que no se ven solo con el promedio global."
+        if density_spread > 25
+        else f"La densidad de líneas por hectárea se mantiene razonablemente uniforme ({density_spread:.1f}% de dispersión)."
+    )
+
+    overlap_to_gap = (overlap / uncovered) if uncovered else 0.0
+    if overlap_to_gap > 0.45:
+        decision_risk = f"Hay {overlap_to_gap:.2f} ha sobre-aplicadas por cada ha sin cubrir: el problema parece más de alineación/solape que de falta de vuelo."
+    elif uncovered > 0:
+        decision_risk = f"Hay {overlap_to_gap:.2f} ha sobre-aplicadas por cada ha sin cubrir: prioriza completar huecos antes que repetir áreas ya aplicadas."
+    else:
+        decision_risk = "No hay huecos reportados; la decisión debe enfocarse en validar solapes y calidad de datos."
+
+    return {
+        "closureConfidence": closure,
+        "concentrationMessage": concentration,
+        "speedStability": speed_stability,
+        "altitudeStability": altitude_stability,
+        "patternUniformity": pattern_uniformity,
+        "decisionRisk": decision_risk,
+        "_metrics": {
+            "riskHa": round(risk_ha, 2),
+            "topOneRiskSharePct": round(top_one_share, 1),
+            "topThreeRiskSharePct": round(top_three_share, 1),
+            "speedVolatilityPct": round(speed_volatility, 1),
+            "altitudeVolatilityPct": round(altitude_volatility, 1),
+            "lineDensitySpreadPct": round(density_spread, 1),
+            "overlapToGapRatio": round(overlap_to_gap, 2),
+        },
+    }
+
+
+def _hidden_insights(compact: Dict[str, Any], worst: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    gm = compact["globalMetrics"]
+    diagnostics = _advanced_diagnostics(compact, worst)
+    metrics = diagnostics.get("_metrics", {})
+    total_ha = _num(gm.get("totalHa"))
+    uncovered = _num(gm.get("uncoveredHa"))
+    overlap = _num(gm.get("overlapHa"))
+    coverage = _num(gm.get("coveragePct"))
+    insights: List[Dict[str, Any]] = []
+
+    top_zone = worst[0] if worst else None
+    if top_zone:
+        insights.append({
+            "title": "Riesgo concentrado, no distribuido",
+            "severity": "alta" if metrics.get("topOneRiskSharePct", 0) >= 35 else "media",
+            "metric": f"{metrics.get('topOneRiskSharePct', 0):.1f}% del riesgo en la principal parcela crítica",
+            "insight": (
+                f"No parece necesario revisar todo el bloque con la misma intensidad. La prioridad real está en "
+                f"{top_zone.get('parcelName')} por {top_zone.get('issue')}."
+            ),
+            "action": "Usar el copiloto para marcar esa parcela en el mapa y enviar al equipo únicamente los polígonos críticos.",
+        })
+
+    speed_vol = _num(metrics.get("speedVolatilityPct"))
+    if speed_vol > 0:
+        insights.append({
+            "title": "Volatilidad de velocidad como proxy de uniformidad",
+            "severity": "alta" if speed_vol > 55 else "media" if speed_vol > 35 else "baja",
+            "metric": f"Rango de velocidad equivalente al {speed_vol:.1f}% del promedio",
+            "insight": (
+                "Aunque la velocidad media se vea aceptable, el rango puede esconder tramos con dosis efectiva distinta, "
+                "especialmente si el caudal no compensó los cambios."
+            ),
+            "action": "Cruzar tramos de menor/mayor velocidad con capas Sin cubrir y Sobre-aplicado antes de cerrar la operación.",
+        })
+
+    alt_vol = _num(metrics.get("altitudeVolatilityPct"))
+    if alt_vol > 0:
+        insights.append({
+            "title": "Altitud variable puede cambiar el ancho efectivo",
+            "severity": "alta" if alt_vol > 220 else "media" if alt_vol > 150 else "baja",
+            "metric": f"Variación relativa de altitud {alt_vol:.1f}%",
+            "insight": (
+                "El promedio de altitud no muestra toda la historia: picos altos o bajos pueden provocar deriva, "
+                "franjas débiles o exceso en bordes."
+            ),
+            "action": "Revisar si los picos de altitud coinciden con cabeceras, giros o cambios de relieve.",
+        })
+
+    density_spread = _num(metrics.get("lineDensitySpreadPct"))
+    if density_spread > 0:
+        insights.append({
+            "title": "Densidad de líneas por hectárea",
+            "severity": "media" if density_spread > 25 else "baja",
+            "metric": f"Dispersión estimada {density_spread:.1f}%",
+            "insight": (
+                "Dos parcelas pueden tener buena cobertura global, pero distinta densidad de pasadas por hectárea. "
+                "Esa diferencia ayuda a explicar por qué una parcela queda con más huecos."
+            ),
+            "action": "Comparar líneas/ha de la parcela con peor cobertura contra la parcela con mejor cobertura para ajustar separación de pasadas.",
+        })
+
+    ratio = _num(metrics.get("overlapToGapRatio"))
+    if uncovered > 0:
+        insights.append({
+            "title": "Balance entre huecos y solape",
+            "severity": "media" if ratio > 0.25 else "baja",
+            "metric": f"{ratio:.2f} ha sobre-aplicadas por cada ha sin cubrir",
+            "insight": (
+                "Este indicador separa dos problemas distintos: si sube el solape, el patrón necesita alineación; "
+                "si domina el hueco, falta completar zonas específicas."
+            ),
+            "action": "No repetir el vuelo completo: planificar re-aplicación parcial de huecos y ajustar patrón para reducir solape en la próxima operación.",
+        })
+
+    if _num(gm.get("totalVolume")) <= 0:
+        insights.append({
+            "title": "Falta el dato que convierte operación en costo",
+            "severity": "media",
+            "metric": "Volumen aplicado no disponible",
+            "insight": (
+                "El análisis puede priorizar hectáreas, pero todavía no puede calcular dosis real, desperdicio de producto "
+                "ni costo exacto de sobre-aplicación."
+            ),
+            "action": "Integrar caudal/volumen y costo por producto para que el copiloto estime ahorro, desperdicio y costo de re-aplicación.",
+        })
+
+    if not insights:
+        insights.append({
+            "title": "Operación sin señales ocultas críticas",
+            "severity": "baja",
+            "metric": f"Cobertura {coverage:.1f}% sobre {total_ha:.2f} ha",
+            "insight": "Los indicadores derivados no muestran anomalías fuertes más allá de la revisión normal de bordes.",
+            "action": "Cerrar con revisión visual estándar y guardar este vuelo como referencia histórica.",
+        })
+
+    return insights[:6]
+
+
 def _fallback_report(compact: Dict[str, Any], question: Optional[str] = None, ai_warning: Optional[str] = None) -> Dict[str, Any]:
     gm = compact["globalMetrics"]
     parcels = compact.get("parcelsByRisk", [])
@@ -225,6 +428,9 @@ def _fallback_report(compact: Dict[str, Any], question: Optional[str] = None, ai
     speed_min, speed_max = _range(gm.get("speedRangeKph"))
     alt_min, alt_max = _range(gm.get("altitudeRangeM"))
     worst = _critical_parcels(compact)
+    diagnostics = _advanced_diagnostics(compact, worst)
+    hidden_insights = _hidden_insights(compact, worst)
+    diagnostic_metrics = diagnostics.get("_metrics", {})
 
     evidence = [
         f"Cobertura global {coverage:.1f}% sobre {total_ha:.2f} ha.",
@@ -232,6 +438,8 @@ def _fallback_report(compact: Dict[str, Any], question: Optional[str] = None, ai
         f"Sobre-aplicación {overlap:.2f} ha ({_pct(overlap, total_ha):.1f}%).",
         f"Velocidad {gm.get('avgSpeedKph', 0):.1f} km/h con rango {speed_min:.0f}-{speed_max:.0f} km/h.",
         f"Altitud {gm.get('avgAltitudeM', 0):.1f} m con rango {alt_min:.0f}-{alt_max:.0f} m.",
+        f"Índice de volatilidad de velocidad {diagnostic_metrics.get('speedVolatilityPct', 0):.1f}% y altitud {diagnostic_metrics.get('altitudeVolatilityPct', 0):.1f}%.",
+        f"Dispersión de líneas por hectárea {diagnostic_metrics.get('lineDensitySpreadPct', 0):.1f}%.",
     ]
 
     causes = []
@@ -257,7 +465,14 @@ def _fallback_report(compact: Dict[str, Any], question: Optional[str] = None, ai
     answer = None
     if question:
         q = question.strip().lower()
-        if "peor" in q or "crítica" in q or "critica" in q or "prioridad" in q:
+        if "no se ve" in q or "simple vista" in q or "oculto" in q or "oculta" in q:
+            first_insight = hidden_insights[0] if hidden_insights else None
+            answer = (
+                f"Lo más importante que no se ve a simple vista es: {first_insight['title']}. "
+                f"{first_insight['insight']} Acción: {first_insight['action']}"
+                if first_insight else "No detecté señales ocultas críticas con los KPIs recibidos."
+            )
+        elif "peor" in q or "crítica" in q or "critica" in q or "prioridad" in q:
             first = worst[0] if worst else None
             answer = f"La prioridad principal es {first['parcelName']} por {first['issue']}." if first else "No hay parcelas críticas destacables con los datos disponibles."
         elif "reaplicar" in q or "re aplicación" in q or "reaplicación" in q:
@@ -289,6 +504,8 @@ def _fallback_report(compact: Dict[str, Any], question: Optional[str] = None, ai
             {"title": "Velocidad y altitud", "severity": "media" if (speed_max - speed_min > 40 or alt_max - alt_min > 25) else "baja", "detail": f"{evidence[3]} {evidence[4]}"},
         ],
         "probableCauses": causes[:5],
+        "hiddenInsights": hidden_insights,
+        "operationalDiagnostics": {k: v for k, v in diagnostics.items() if not k.startswith("_")},
         "actionPlan": [
             {"step": 1, "title": "Validar mapa", "detail": "Activar capa Sin cubrir y revisar continuidad de bordes y cabeceras.", "owner": "Operaciones"},
             {"step": 2, "title": "Reaplicar solo lo necesario", "detail": f"Planificar reaplicación parcial sobre {uncovered:.2f} ha en lugar de repetir {total_ha:.2f} ha.", "owner": "Piloto / Campo"},
@@ -350,6 +567,34 @@ _RESPONSE_SCHEMA: Dict[str, Any] = {
             },
         },
         "probableCauses": {"type": "array", "items": {"type": "string"}},
+        "hiddenInsights": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "title": {"type": "string"},
+                    "severity": {"type": "string"},
+                    "metric": {"type": "string"},
+                    "insight": {"type": "string"},
+                    "action": {"type": "string"},
+                },
+                "required": ["title", "severity", "metric", "insight", "action"],
+            },
+        },
+        "operationalDiagnostics": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "closureConfidence": {"type": "string"},
+                "concentrationMessage": {"type": "string"},
+                "speedStability": {"type": "string"},
+                "altitudeStability": {"type": "string"},
+                "patternUniformity": {"type": "string"},
+                "decisionRisk": {"type": "string"},
+            },
+            "required": ["closureConfidence", "concentrationMessage", "speedStability", "altitudeStability", "patternUniformity", "decisionRisk"],
+        },
         "actionPlan": {
             "type": "array",
             "items": {
@@ -380,7 +625,8 @@ _RESPONSE_SCHEMA: Dict[str, Any] = {
     },
     "required": [
         "qualityScore", "verdict", "recommendedAction", "executiveSummary", "answer", "criticalZones",
-        "technicalFindings", "probableCauses", "actionPlan", "businessImpact", "dataQualityWarnings", "evidence",
+        "technicalFindings", "probableCauses", "hiddenInsights", "operationalDiagnostics", "actionPlan",
+        "businessImpact", "dataQualityWarnings", "evidence",
     ],
 }
 
@@ -410,15 +656,18 @@ async def _call_openai(compact: Dict[str, Any], question: Optional[str]) -> Dict
         "Debes ser preciso, útil para gerencia y operaciones, y no inventar datos. "
         "Usa únicamente el JSON recibido. No digas que viste geometrías si solo recibiste banderas. "
         "Prioriza acciones concretas: cerrar, inspeccionar, reaplicar parcialmente o revisar operación. "
-        "Responde en español profesional."
+        "Incluye hallazgos no evidentes derivados de proporciones, concentración del riesgo, dispersión y estabilidad; "
+        "deben ser accionables y no obvios a simple vista. Responde en español profesional y conciso."
     )
     user_payload = {
-        "question": (question or "Genera diagnóstico completo del vuelo, recomendaciones, riesgos y valor de negocio.")[:700],
+        "question": (question or "Genera diagnóstico completo del vuelo, señales no visibles, recomendaciones, riesgos y valor de negocio.")[:700],
         "flight": compact,
         "rules": [
             "No pidas repetir todo si basta una reaplicación parcial según hectáreas sin cubrir.",
             "Incluye evidencia numérica exacta de KPIs recibidos.",
             "Marca advertencias cuando falte volumen, dosis o costo.",
+            "hiddenInsights debe contener señales que no se ven a simple vista: concentración del riesgo, volatilidad de velocidad/altitud, densidad de líneas o balance hueco/solape.",
+            "operationalDiagnostics debe ser útil para supervisores y gerencia en frases cortas.",
             "criticalZones debe usar nombres reales de parcelas del JSON.",
         ],
     }
