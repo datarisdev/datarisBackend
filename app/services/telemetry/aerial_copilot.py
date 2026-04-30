@@ -643,6 +643,134 @@ def _extract_output_text(response_json: Dict[str, Any]) -> str:
     return "\n".join(chunks).strip()
 
 
+def _ai_enrichment_schema() -> Dict[str, Any]:
+    """Schema pequeño para que OpenAI enriquezca el diagnóstico sin generar un JSON enorme.
+
+    La mayor parte de cálculos duros se mantiene determinística en Dataris. OpenAI solo redacta
+    conclusiones, señales ocultas y plan de acción. Esto baja tokens y evita respuestas truncadas.
+    """
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "recommendedAction": {"type": "string"},
+            "executiveSummary": {"type": "string"},
+            "answer": {"type": ["string", "null"]},
+            "probableCauses": {"type": "array", "items": {"type": "string"}},
+            "hiddenInsights": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "title": {"type": "string"},
+                        "severity": {"type": "string"},
+                        "metric": {"type": "string"},
+                        "insight": {"type": "string"},
+                        "action": {"type": "string"},
+                    },
+                    "required": ["title", "severity", "metric", "insight", "action"],
+                },
+            },
+            "operationalDiagnostics": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "closureConfidence": {"type": "string"},
+                    "concentrationMessage": {"type": "string"},
+                    "speedStability": {"type": "string"},
+                    "altitudeStability": {"type": "string"},
+                    "patternUniformity": {"type": "string"},
+                    "decisionRisk": {"type": "string"},
+                },
+                "required": [
+                    "closureConfidence", "concentrationMessage", "speedStability",
+                    "altitudeStability", "patternUniformity", "decisionRisk",
+                ],
+            },
+            "actionPlan": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "step": {"type": "integer"},
+                        "title": {"type": "string"},
+                        "detail": {"type": "string"},
+                        "owner": {"type": "string"},
+                    },
+                    "required": ["step", "title", "detail", "owner"],
+                },
+            },
+            "managementNote": {"type": "string"},
+        },
+        "required": [
+            "recommendedAction", "executiveSummary", "answer", "probableCauses", "hiddenInsights",
+            "operationalDiagnostics", "actionPlan", "managementNote",
+        ],
+    }
+
+
+def _openai_context(compact: Dict[str, Any], question: Optional[str], base: Dict[str, Any]) -> Dict[str, Any]:
+    """Construye un contexto compacto para OpenAI sin geometrías pesadas."""
+    return {
+        "question": (question or "Genera diagnóstico ejecutivo del vuelo, señales ocultas y plan de acción.")[:700],
+        "flight": compact,
+        "deterministicBaseline": {
+            "qualityScore": base.get("qualityScore"),
+            "verdict": base.get("verdict"),
+            "recommendedAction": base.get("recommendedAction"),
+            "criticalZones": base.get("criticalZones", [])[:6],
+            "technicalFindings": base.get("technicalFindings", [])[:4],
+            "operationalDiagnostics": base.get("operationalDiagnostics", {}),
+            "dataQualityWarnings": base.get("dataQualityWarnings", []),
+            "businessImpact": base.get("businessImpact", {}),
+            "tokenOptimization": base.get("tokenOptimization", {}),
+        },
+        "instructions": [
+            "No recalcules geometrías; interpreta los KPIs recibidos.",
+            "No inventes volumen, dosis, clima ni costo si no aparecen en el JSON.",
+            "Haz hallazgos no obvios: concentración del riesgo, estabilidad, densidad de líneas, balance hueco/solape y decisión de cierre.",
+            "Sé breve: máximo 4 causas, máximo 4 señales ocultas y máximo 3 acciones.",
+            "Usa nombres reales de parcelas y evidencia numérica exacta.",
+            "Si la pregunta del usuario es específica, answer debe responder esa pregunta; si no, answer puede ser null.",
+        ],
+    }
+
+
+def _merge_openai_enrichment(base: Dict[str, Any], ai: Dict[str, Any], model: str, compact: Dict[str, Any]) -> Dict[str, Any]:
+    """Combina cálculos locales confiables con redacción/criterio de OpenAI."""
+    merged = dict(base)
+    for key in (
+        "recommendedAction",
+        "executiveSummary",
+        "answer",
+        "probableCauses",
+        "hiddenInsights",
+        "operationalDiagnostics",
+        "actionPlan",
+    ):
+        value = ai.get(key)
+        if value not in (None, "", [], {}):
+            merged[key] = value
+
+    note = ai.get("managementNote")
+    if note:
+        evidence = list(merged.get("evidence") or [])
+        evidence.append(f"Nota IA: {str(note)[:350]}")
+        merged["evidence"] = evidence[:10]
+
+    merged["source"] = "openai"
+    merged["model"] = model
+    merged["aiWarning"] = None
+    merged["tokenOptimization"] = {
+        "rawGeometrySentToOpenAI": False,
+        "parcelRowsSent": len(compact.get("parcelsByRisk", [])),
+        "strategy": "Se enviaron únicamente KPIs, ranking por parcela, diagnóstico local y banderas geométricas; las geometrías completas se quedan en Dataris.",
+    }
+    return merged
+
+
 async def _call_openai(compact: Dict[str, Any], question: Optional[str]) -> Dict[str, Any]:
     api_key = (
         getattr(settings, "OPENAI_API_KEY", None)
@@ -650,6 +778,9 @@ async def _call_openai(compact: Dict[str, Any], question: Optional[str]) -> Dict
         or os.getenv("OPENAI_API_TOKEN")
         or os.getenv("CHATGPT_API_KEY")
     )
+
+    base_report = _fallback_report(compact, question, None)
+
     if not api_key:
         return _fallback_report(
             compact,
@@ -658,29 +789,20 @@ async def _call_openai(compact: Dict[str, Any], question: Optional[str]) -> Dict
         )
 
     model = getattr(settings, "OPENAI_AERIAL_COPILOT_MODEL", "gpt-4.1-mini")
-    max_output_tokens = int(getattr(settings, "OPENAI_AERIAL_COPILOT_MAX_OUTPUT_TOKENS", 1400) or 1400)
+    configured_tokens = int(getattr(settings, "OPENAI_AERIAL_COPILOT_MAX_OUTPUT_TOKENS", 1800) or 1800)
+    # El schema anterior era demasiado grande y podía truncarse con 1400 tokens.
+    # Este schema es menor, pero se deja un piso prudente para evitar JSON incompleto.
+    max_output_tokens = max(1800, configured_tokens)
     timeout_seconds = float(getattr(settings, "OPENAI_AERIAL_COPILOT_TIMEOUT_SECONDS", 25) or 25)
 
     system = (
-        "Eres el Copiloto de Aplicación Aérea de Dataris. Analizas vuelos de riego/fumigación con helicóptero. "
-        "Debes ser preciso, útil para gerencia y operaciones, y no inventar datos. "
-        "Usa únicamente el JSON recibido. No digas que viste geometrías si solo recibiste banderas. "
-        "Prioriza acciones concretas: cerrar, inspeccionar, reaplicar parcialmente o revisar operación. "
-        "Incluye hallazgos no evidentes derivados de proporciones, concentración del riesgo, dispersión y estabilidad; "
-        "deben ser accionables y no obvios a simple vista. Responde en español profesional y conciso."
+        "Eres el Copiloto IA de Aplicación Aérea de Dataris. Analizas vuelos de riego/fumigación con helicóptero. "
+        "Dataris ya calculó geometrías y KPIs; tú debes enriquecer el diagnóstico con criterio operativo, gerencial y agronómico. "
+        "No inventes datos. No digas que viste geometrías si solo recibiste banderas. "
+        "Sé preciso, accionable, profesional y conciso. Responde en español. "
+        "Devuelve solo el JSON del schema solicitado."
     )
-    user_payload = {
-        "question": (question or "Genera diagnóstico completo del vuelo, señales no visibles, recomendaciones, riesgos y valor de negocio.")[:700],
-        "flight": compact,
-        "rules": [
-            "No pidas repetir todo si basta una reaplicación parcial según hectáreas sin cubrir.",
-            "Incluye evidencia numérica exacta de KPIs recibidos.",
-            "Marca advertencias cuando falte volumen, dosis o costo.",
-            "hiddenInsights debe contener señales que no se ven a simple vista: concentración del riesgo, volatilidad de velocidad/altitud, densidad de líneas o balance hueco/solape.",
-            "operationalDiagnostics debe ser útil para supervisores y gerencia en frases cortas.",
-            "criticalZones debe usar nombres reales de parcelas del JSON.",
-        ],
-    }
+    user_payload = _openai_context(compact, question, base_report)
 
     body = {
         "model": model,
@@ -693,14 +815,16 @@ async def _call_openai(compact: Dict[str, Any], question: Optional[str]) -> Dict
         "text": {
             "format": {
                 "type": "json_schema",
-                "name": "aerial_copilot_report",
-                "schema": _RESPONSE_SCHEMA,
+                "name": "aerial_copilot_enrichment",
+                "schema": _ai_enrichment_schema(),
                 "strict": True,
             }
         },
     }
 
-    try:
+    async def _post_and_parse(token_budget: int) -> Dict[str, Any]:
+        request_body = dict(body)
+        request_body["max_output_tokens"] = token_budget
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
             response = await client.post(
                 "https://api.openai.com/v1/responses",
@@ -708,23 +832,32 @@ async def _call_openai(compact: Dict[str, Any], question: Optional[str]) -> Dict
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
                 },
-                json=body,
+                json=request_body,
             )
         if response.status_code >= 400:
-            return _fallback_report(compact, question, f"OpenAI respondió {response.status_code}: {response.text[:300]}")
-        output_text = _extract_output_text(response.json())
-        parsed = json.loads(output_text)
-        parsed["source"] = "openai"
-        parsed["model"] = model
-        parsed["tokenOptimization"] = {
-            "rawGeometrySentToOpenAI": False,
-            "parcelRowsSent": len(compact.get("parcelsByRisk", [])),
-            "strategy": "Se enviaron únicamente KPIs, ranking por parcela y banderas geométricas; las geometrías completas se quedan en Dataris.",
-        }
-        parsed["aiWarning"] = None
-        return parsed
+            raise RuntimeError(f"OpenAI respondió {response.status_code}: {response.text[:500]}")
+        response_json = response.json()
+        if response_json.get("status") == "incomplete":
+            details = response_json.get("incomplete_details") or {}
+            reason = details.get("reason") or "respuesta incompleta"
+            raise ValueError(f"OpenAI devolvió respuesta incompleta: {reason}")
+        output_text = _extract_output_text(response_json)
+        if not output_text:
+            raise ValueError("OpenAI no devolvió texto estructurado para analizar.")
+        return json.loads(output_text)
+
+    try:
+        try:
+            parsed = await _post_and_parse(max_output_tokens)
+        except (json.JSONDecodeError, ValueError) as first_error:
+            # Un retry controlado: solo ocurre cuando la respuesta quedó incompleta/truncada.
+            retry_tokens = min(max(max_output_tokens * 2, 2600), 3600)
+            if retry_tokens <= max_output_tokens:
+                raise first_error
+            parsed = await _post_and_parse(retry_tokens)
+        return _merge_openai_enrichment(base_report, parsed, model, compact)
     except Exception as exc:
-        return _fallback_report(compact, question, f"No se pudo consultar OpenAI: {exc}")
+        return _fallback_report(compact, question, f"No se pudo consultar OpenAI correctamente: {exc}")
 
 
 async def process_aerial_copilot(payload: Dict[str, Any]) -> Dict[str, Any]:
