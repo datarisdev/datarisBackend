@@ -34,6 +34,16 @@ class Settings(BaseSettings):
 
     DATARIS_COMPAT_STORAGE_DIR: str | None = None
 
+    # Graniot API integration. Keep the API key only in backend env vars.
+    GRANIOT_BASE_URL: str = "https://app.graniot.com"
+    GRANIOT_API_KEY: str | None = None
+    # The public ReDoc spec does not declare a security scheme; make it configurable.
+    # Common valid values are: X-API-Key, Api-Key, Authorization.
+    GRANIOT_AUTH_HEADER: str = "X-API-Key"
+    GRANIOT_AUTH_SCHEME: str = "Bearer"
+    GRANIOT_CLIENT_ID: str | None = None
+    GRANIOT_TIMEOUT_SECONDS: int = 60
+
     # OpenAI Copiloto de Aplicación Aérea.
     # OPENAI_API_KEY debe configurarse en producción; si no existe, el backend devuelve
     # un diagnóstico determinístico local para que la UI siga funcionando.
