@@ -39,10 +39,22 @@ class Settings(BaseSettings):
     GRANIOT_API_KEY: str | None = None
     # The public ReDoc spec does not declare a security scheme; make it configurable.
     # Common valid values are: X-API-Key, Api-Key, Authorization.
-    GRANIOT_AUTH_HEADER: str = "X-API-Key"
-    GRANIOT_AUTH_SCHEME: str = "Bearer"
+    GRANIOT_AUTH_HEADER: str = "Authorization"
+    GRANIOT_AUTH_SCHEME: str = "Api-Key"
     GRANIOT_CLIENT_ID: str | None = None
+    # Optional: set this when Graniot requires every parcel to belong to a specific farm.
+    # If empty, the backend will try to use the first farm returned by /api/farms/.
+    GRANIOT_DEFAULT_FARM_ID: str | None = None
+    GRANIOT_DEFAULT_FARM_NAME: str = "Dataris"
+    GRANIOT_DEFAULT_FARM_TYPE: str = "PRO"
     GRANIOT_TIMEOUT_SECONDS: int = 60
+
+    # Graniot debug logging. Values are redacted before writing logs.
+    # Disable in production once the integration is stable.
+    GRANIOT_DEBUG_LOGS_ENABLED: bool = True
+    GRANIOT_DEBUG_LOG_TO_FILE: bool = True
+    GRANIOT_DEBUG_LOG_FILE: str | None = None
+    GRANIOT_DEBUG_MAX_BODY_CHARS: int = 30000
 
     # OpenAI Copiloto de Aplicación Aérea.
     # OPENAI_API_KEY debe configurarse en producción; si no existe, el backend devuelve
