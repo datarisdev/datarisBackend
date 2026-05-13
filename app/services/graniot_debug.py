@@ -161,7 +161,9 @@ def log_event(event: Dict[str, Any]) -> None:
     }
 
     line = json.dumps(enriched, ensure_ascii=False, default=str)
-    logger.info("GRANIOT_DEBUG %s", line)
+    # Write detailed payloads to file when enabled, but do not flood uvicorn
+    # stdout at INFO level during map rendering.
+    logger.debug("GRANIOT_DEBUG %s", line)
 
     if bool(getattr(settings, "GRANIOT_DEBUG_LOG_TO_FILE", True)):
         try:

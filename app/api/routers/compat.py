@@ -36,6 +36,7 @@ TABLES = [
     "company_modules", "user_modules", "parcels", "satellite_images",
     "field_notes", "parcel_crops", "aerial_analyses", "analysis_sessions",
     "analysis_data_points", "laborapp_registros", "laborapp_empleados_foto",
+    "extension_requests", "digiforms_accounts",
 ]
 
 DEFAULT_MODULES = [
@@ -47,6 +48,15 @@ DEFAULT_MODULES = [
     ("aplicaciones-aereas", "Aplicaciones Aéreas", "Control de aplicaciones", "Plane"),
     ("tareas", "Tareas", "Tablero Kanban", "Kanban"),
     ("personal", "Personal de Campo", "Control biométrico y georreferenciado", "Users"),
+]
+
+EXTENSION_MODULES = [
+    (
+        "digiforms",
+        "DigiformsApp",
+        "Formularios digitales de campo, captura offline, GPS, fotos y reportes desde DigiformsApp.",
+        "FileText",
+    ),
 ]
 
 
@@ -243,41 +253,24 @@ def ensure_storage() -> None:
                 })
                 changed = True
 
-    # If this backend is upgraded over an existing local compat_db.json, make sure
-    # the new Personal de Campo module is also enabled for the default/admin company
-    # and for the current users.
-    for company in tables.get("companies", []):
-        company_id = company.get("id")
-        if not company_id:
-            continue
-        for mid, *_ in DEFAULT_MODULES:
-            if not any(cm.get("company_id") == company_id and cm.get("module_id") == mid for cm in tables.get("company_modules", [])):
-                tables.setdefault("company_modules", []).append({
-                    "id": str(uuid.uuid4()),
-                    "company_id": company_id,
-                    "module_id": mid,
-                    "is_enabled": True,
-                    "created_at": t,
-                    "updated_at": t,
-                })
-                changed = True
+    existing_modules = {m.get("id") for m in tables.get("platform_modules", [])}
+    for mid, name, desc, icon in EXTENSION_MODULES:
+        if mid not in existing_modules:
+            tables.setdefault("platform_modules", []).append({
+                "id": mid,
+                "name": name,
+                "description": desc,
+                "icon": icon,
+                "is_active": True,
+                "created_at": t,
+                "updated_at": t,
+            })
+            changed = True
 
-    for user in db.get("users", []):
-        user_id = user.get("id")
-        if not user_id:
-            continue
-        for mid, *_ in DEFAULT_MODULES:
-            if not any(um.get("user_id") == user_id and um.get("module_id") == mid for um in tables.get("user_modules", [])):
-                tables.setdefault("user_modules", []).append({
-                    "id": str(uuid.uuid4()),
-                    "user_id": user_id,
-                    "admin_user_id": None,
-                    "module_id": mid,
-                    "is_active": True,
-                    "created_at": t,
-                    "updated_at": t,
-                })
-                changed = True
+    # Do not auto-enable modules for every company or user during upgrades.
+    # Module visibility must come only from the assignments made in Admin > Empresas
+    # and Admin > Usuarios. The default admin/company already receive all defaults in
+    # default_db(), but existing companies keep exactly the modules configured by the admin.
 
     if changed:
         write_db(db)
@@ -315,6 +308,9 @@ def add_defaults(table_name: str, row: Dict[str, Any], user_id: Optional[str]) -
         row.setdefault("is_active", True)
     if table_name == "company_modules":
         row.setdefault("is_enabled", True)
+    if table_name == "user_modules":
+        row.setdefault("is_enabled", True)
+        row.setdefault("is_active", True)
     if table_name == "admin_users":
         row.setdefault("admin_role", "company_admin")
         row.setdefault("is_active", True)
@@ -369,6 +365,19 @@ def enrich(db: Dict[str, Any], table_name: str, row: Dict[str, Any]) -> Dict[str
         if profile:
             r.setdefault("first_name", profile.get("first_name"))
             r.setdefault("last_name", profile.get("last_name"))
+    if table_name == "extension_requests":
+        module = next((m for m in tables.get("platform_modules", []) if m.get("id") == r.get("extension_id")), None)
+        company = next((c for c in tables.get("companies", []) if c.get("id") == r.get("company_id")), None)
+        requester = next((u for u in db.get("users", []) if u.get("id") == r.get("requested_by_user_id")), None)
+        profile = next((p for p in tables.get("profiles", []) if p.get("user_id") == r.get("requested_by_user_id") or p.get("id") == r.get("requested_by_user_id")), None)
+        r.setdefault("extension_name", (module or {}).get("name") or r.get("extension_id"))
+        r.setdefault("company_name", (company or {}).get("name") or r.get("company_name_snapshot"))
+        if requester:
+            r.setdefault("requester_email", requester.get("email"))
+        if profile:
+            name = f"{profile.get('first_name') or ''} {profile.get('last_name') or ''}".strip()
+            if name:
+                r.setdefault("requester_name", name)
     return r
 
 

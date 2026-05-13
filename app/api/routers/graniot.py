@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 import re
+import base64
 from io import BytesIO
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -12,7 +13,11 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Response
 from shapely.geometry import box as shapely_box, mapping, shape as shapely_shape
 from shapely.ops import transform, unary_union
 from shapely import wkt as shapely_wkt
-from PIL import Image, ImageChops, ImageDraw
+try:
+    from shapely.validation import make_valid as shapely_make_valid
+except Exception:  # pragma: no cover - fallback for older Shapely builds
+    shapely_make_valid = None
+from PIL import Image, ImageDraw
 
 from app.api.routers.compat import LOCK, bearer_user, now, read_db, table, write_db
 from app.core.config import settings
@@ -336,15 +341,23 @@ def _access_key_from_wms_template(template: Optional[str]) -> Optional[str]:
 
 def _wms_data_matches_requested(data: Dict[str, Any], *, access_key: Optional[str], graniot_parcel_id: Optional[str]) -> bool:
     wanted_key = _normalized_token(access_key)
+    wanted_parcel_key = _normalized_token(_parcel_key_from_signed_wms_access_key(access_key))
     wanted_id = _normalized_token(graniot_parcel_id)
+
     keys = [
         data.get("graniot_access_key"),
         data.get("graniot_wms_access_key"),
         data.get("graniot_parcel_key"),
         _access_key_from_wms_template(data.get("graniot_wms_url")),
+        _parcel_key_from_signed_wms_access_key(data.get("graniot_access_key")),
+        _parcel_key_from_signed_wms_access_key(data.get("graniot_wms_access_key")),
+        _parcel_key_from_signed_wms_access_key(_access_key_from_wms_template(data.get("graniot_wms_url"))),
     ]
     ids = [data.get("graniot_parcel_id")]
+
     if wanted_key and any(_normalized_token(value) == wanted_key for value in keys):
+        return True
+    if wanted_parcel_key and any(_normalized_token(value) == wanted_parcel_key for value in keys):
         return True
     if wanted_id and any(_normalized_token(value) == wanted_id for value in ids):
         return True
@@ -369,7 +382,7 @@ def _wms_template_from_local(
         for item in subparcels:
             if not isinstance(item, dict):
                 continue
-            template = item.get("graniot_wms_url") or item.get("wms_url") or item.get("image_url")
+            template = item.get("graniot_wms_url") or item.get("graniot_image_url") or item.get("wms_url") or item.get("image_url")
             if isinstance(template, str) and template.strip() and not fallback_subparcel_template:
                 fallback_subparcel_template = template.strip()
             data = {
@@ -417,6 +430,42 @@ def _normalized_token(value: Any) -> str:
     return str(value or "").strip().lower()
 
 
+def _decode_signed_wms_access_key_payload(value: Any) -> Optional[Dict[str, Any]]:
+    """Decode the public payload part of Graniot signed WMS access keys.
+
+    Graniot access keys used by /api/wms/ look like:
+    base64url({"parcel_key":"..."}):timestamp:signature
+
+    We never validate or expose the signature here; this is only used to match
+    the signed token that arrives from the frontend with the correct parcel row
+    inside local graniot_raw/subparcel payloads. Without this match, Dataris can
+    accidentally reuse the first stored image_url/template for every subparcel.
+    """
+    try:
+        text = str(value or "").strip()
+        if not text or ":" not in text or _is_uuid_like(text):
+            return None
+        first_part = text.split(":", 1)[0].strip()
+        if not first_part:
+            return None
+        first_part += "=" * (-len(first_part) % 4)
+        decoded = base64.urlsafe_b64decode(first_part.encode("utf-8"))
+        payload = json.loads(decoded.decode("utf-8"))
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def _parcel_key_from_signed_wms_access_key(value: Any) -> Optional[str]:
+    payload = _decode_signed_wms_access_key_payload(value)
+    if not isinstance(payload, dict):
+        return None
+    parcel_key = payload.get("parcel_key") or payload.get("key") or payload.get("parcel")
+    if parcel_key in (None, ""):
+        return None
+    return str(parcel_key).strip()
+
+
 def _is_uuid_like(value: Any) -> bool:
     clean = str(value or "").strip()
     return bool(re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", clean))
@@ -427,6 +476,31 @@ def _signed_wms_access_key(value: Any) -> Optional[str]:
     if key and not _is_uuid_like(key):
         return key
     return None
+
+def _signed_access_key_value(value: Any) -> Optional[str]:
+    """Return a usable /api/wms/ access_key.
+
+    Graniot rejects UUID parcel keys in /api/wms/. The signed WMS key is the
+    long token normally found in image_url/wms_url or passed by the frontend.
+    """
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    if not text or _is_uuid_like(text):
+        return None
+    return text
+
+
+def _choose_wms_access_key(*values: Any) -> str:
+    for value in values:
+        signed = _signed_access_key_value(value)
+        if signed:
+            return signed
+    for value in values:
+        if value not in (None, ""):
+            return str(value).strip()
+    return ""
+
 
 def _merge_signed_wms_and_image_templates(wms_url: Any, image_url: Any) -> Optional[str]:
     """Build one reusable WMS template from Graniot properties.
@@ -539,17 +613,27 @@ def _extract_wms_data_from_parcel_object(item: Dict[str, Any]) -> Dict[str, Any]
 def _parcel_object_matches(item: Dict[str, Any], *, access_key: Optional[str] = None, parcel_id: Optional[str] = None) -> bool:
     props = item.get("properties") if isinstance(item.get("properties"), dict) else {}
     wanted_key = _normalized_token(access_key)
+    wanted_parcel_key = _normalized_token(_parcel_key_from_signed_wms_access_key(access_key))
     wanted_id = _normalized_token(parcel_id)
 
+    signed_keys = [
+        _signed_wms_access_key(props.get("wms_url") or item.get("wms_url")),
+        _signed_wms_access_key(props.get("image_url") or item.get("image_url")),
+    ]
+    signed_payload_keys = [_parcel_key_from_signed_wms_access_key(value) for value in signed_keys]
     keys = [
         item.get("access_key"),
         item.get("key"),
         props.get("access_key"),
         props.get("key"),
+        *signed_keys,
+        *signed_payload_keys,
     ]
     ids = [item.get("id"), props.get("id"), item.get("parcel_id"), props.get("parcel_id")]
 
     if wanted_key and any(_normalized_token(value) == wanted_key for value in keys):
+        return True
+    if wanted_parcel_key and any(_normalized_token(value) == wanted_parcel_key for value in keys):
         return True
     if wanted_id and any(_normalized_token(value) == wanted_id for value in ids):
         return True
@@ -752,13 +836,20 @@ def _store_recovered_wms_data(local: Optional[Dict[str, Any]], data: Optional[Di
 
 
 def _layer_identifier_candidates(layer: str) -> List[str]:
-    """Try WMS layer aliases used by Graniot in different endpoints/UI labels."""
+    """Return a small, safe set of Graniot WMS layer identifiers.
+
+    Prefer the exact name requested by the frontend/catalog. Do not blindly
+    convert underscores to hyphens: Graniot has valid names such as
+    ACTUAL_EVAPOTRANSPIRATION and ANOMALY_MEAN_NDVI where that conversion makes
+    a valid layer become invalid. Only explicit aliases are tried.
+    """
     raw = str(layer or "").strip()
     if not raw:
         return []
 
     compact = raw.upper().replace(" ", "_").replace("-", "_")
     aliases: Dict[str, List[str]] = {
+        "MOISTURE_INDEX": ["MOISTURE-INDEX", "MOISTURE_INDEX"],
         "NATURAL_COLOUR_SKY": [
             "NATURAL_COLOUR_SKY",
             "NATURAL_COLOR_SKYWATCH_RGB",
@@ -786,18 +877,16 @@ def _layer_identifier_candidates(layer: str) -> List[str]:
             "NATURAL-COLOUR",
             "NATURAL_COLOR_SKYWATCH_RGB",
         ],
+        "NATURAL_COLOUR_PLANET": ["NATURAL-COLOUR-PLANET", "NATURAL_COLOUR_PLANET"],
+        "NATURAL_COLOR_PLANET": ["NATURAL-COLOUR-PLANET", "NATURAL_COLOR_PLANET"],
+        "NATURAL_COLOUR_PLANET4": ["NATURAL-COLOUR-PLANET4", "NATURAL_COLOUR_PLANET4"],
+        "NATURAL_COLOR_PLANET4": ["NATURAL-COLOUR-PLANET4", "NATURAL_COLOR_PLANET4"],
     }
 
     candidates: List[str] = [raw]
     candidates.extend(aliases.get(compact, []))
-    candidates.extend([
-        raw.replace("_", "-"),
-        raw.replace("-", "_"),
-        raw.upper(),
-    ])
+    candidates.append(raw.upper())
 
-    # Keep request volume reasonable. The WMS proxy will combine each layer with
-    # several URL shapes, so only send a small set of meaningful layer names.
     deduped: List[str] = []
     seen = set()
     for item in candidates:
@@ -806,7 +895,7 @@ def _layer_identifier_candidates(layer: str) -> List[str]:
         if value and key not in seen:
             deduped.append(value)
             seen.add(key)
-        if len(deduped) >= 5:
+        if len(deduped) >= 4:
             break
     return deduped
 
@@ -917,43 +1006,43 @@ def _build_wms_param_variants(
 ) -> List[Dict[str, Any]]:
     """Build Graniot WMS attempts from safest to most permissive.
 
-    The OpenAPI spec supplied by Graniot documents `/api/wms/` as a custom
-    endpoint, not a standard OGC GetMap endpoint. It requires `access_key` and
-    `layers`, and optionally accepts `width`, `height`, `time`, `bands`,
-    `content`, `evalscript_url` and `response_format`.
-
-    The previous implementation tried WMS/OGC-style parameters first
-    (`SERVICE`, `REQUEST`, `BBOX`, `LAYERS`, `FORMAT`, `MAXCC`, `WARNINGS`). In
-    this environment Graniot returns 500/502 for those extra parameters, so the
-    browser received JSON instead of a PNG. Keep the official minimal request as
-    the first variants and use legacy/template variants only as fallbacks.
+    The uploaded OpenAPI documents `/api/wms/` as an access_key based endpoint
+    with only `access_key`, `layers`, `time`, `width`, `height`, `bands`,
+    `content`, `evalscript_url` and `response_format`. Therefore the first
+    request is the official sized PNG. Legacy Geometry/BBOX/template variants
+    remain as fallbacks for older Graniot deployments, but they no longer win
+    before the official endpoint because a stale template BBOX can return an
+    incomplete or shifted raster.
     """
     layer_value = str(layer or "").strip()
     template_access_key = template_params.get("access_key") or template_params.get("ACCESS_KEY")
-    # Prefer the signed WMS token from Graniot's image_url. The UUID-like
-    # parcel key stored in Dataris is valid for metadata matching, but /api/wms/
-    # rejects it with "Invalid access key.".
-    access_key_value = str(template_access_key or access_key or "").strip()
+    # IMPORTANT: when the frontend is rendering split Graniot subparcels it
+    # passes the signed access_key for the exact tile being drawn. Do not let a
+    # stale/first template access_key override it, otherwise every overlay is
+    # requested with the same token and Graniot returns "Invalid access key.".
+    # If the request key is only a UUID parcel key, then fall back to the signed
+    # key extracted from the Graniot template.
+    access_key_value = _choose_wms_access_key(access_key, template_access_key)
 
     variants: List[Dict[str, Any]] = []
 
     geometry = template_params.get("Geometry") or template_params.get("geometry")
     bbox_from_template = template_params.get("BBOX") or template_params.get("bbox")
 
-    if template_params and (geometry or bbox_from_template):
-        # 1) Prefer the exact Graniot image_url template because it carries the
-        # same Geometry/BBOX used by Graniot's UI. This keeps the raster aligned
-        # with the parcel and avoids requesting a broader image.
-        exact_template = dict(template_params)
-        exact_template["access_key"] = access_key_value
-        exact_template["layers"] = layer_value
-        exact_template.setdefault("response_format", "image/png")
-        if time:
-            exact_template["time"] = time
-        variants.append(exact_template)
+    # 1) Official Graniot request with explicit image size. This is the closest
+    # to the Graniot OpenAPI and generally returns the complete parcel raster.
+    official_sized = {
+        "access_key": access_key_value,
+        "layers": layer_value,
+        "response_format": "image/png",
+        "width": width,
+        "height": height,
+    }
+    if time:
+        official_sized["time"] = time
+    variants.append(official_sized)
 
-    # 2) Official Graniot WMS request, exactly as documented. This remains as a
-    # fallback for deployments that reject legacy GetMap-style params.
+    # 2) Official minimal request for deployments that choose size server-side.
     official_minimal = {
         "access_key": access_key_value,
         "layers": layer_value,
@@ -963,10 +1052,12 @@ def _build_wms_param_variants(
         official_minimal["time"] = time
     variants.append(official_minimal)
 
-    # 3) Same documented request with explicit image size.
-    official_sized = dict(official_minimal)
-    official_sized.update({"width": width, "height": height})
-    variants.append(official_sized)
+    # 3) Documented request plus BBOX. Some deployments accept it and it makes
+    # the raster coordinate system exactly match the Leaflet overlay bounds.
+    if bbox_latlon:
+        official_bbox = dict(official_sized)
+        official_bbox["BBOX"] = bbox_latlon
+        variants.append(official_bbox)
 
     if template_params:
         # 4) Sanitized version of Graniot's image_url. Preserve only parameters
@@ -990,13 +1081,29 @@ def _build_wms_param_variants(
             "access_key": access_key_value,
             "layers": layer_value,
             "response_format": "image/png",
+            "width": width,
+            "height": height,
         })
         if time:
             sanitized_template["time"] = time
         variants.append(sanitized_template)
 
-    # 5) Legacy Graniot-style fallback with Geometry/BBOX, used only if the
-    # documented endpoint variants failed.
+    if template_params and (geometry or bbox_from_template):
+        # 5) Exact Graniot image_url template fallback. It carries legacy
+        # Geometry/BBOX parameters used by the web app, but can be stale for rows
+        # resynchronized from Dataris, so keep it after the official variants.
+        exact_template = dict(template_params)
+        exact_template["access_key"] = access_key_value
+        exact_template["layers"] = layer_value
+        exact_template.setdefault("response_format", "image/png")
+        exact_template.setdefault("width", width)
+        exact_template.setdefault("height", height)
+        if time:
+            exact_template["time"] = time
+        variants.append(exact_template)
+
+    # 6) Legacy Graniot-style fallback with Geometry/BBOX. Prefer the requested
+    # BBOX over template BBOX so image coordinates match the overlay.
     graniot_style = {
         "access_key": access_key_value,
         "layers": layer_value,
@@ -1008,49 +1115,52 @@ def _build_wms_param_variants(
         graniot_style["Geometry"] = geometry
     if time:
         graniot_style["time"] = time
-    if bbox_from_template:
-        graniot_style["BBOX"] = bbox_from_template
-    elif bbox_latlon:
+    if bbox_latlon:
         graniot_style["BBOX"] = bbox_latlon
+    elif bbox_from_template:
+        graniot_style["BBOX"] = bbox_from_template
     variants.append(graniot_style)
 
-    # 6) Standard WMS fallbacks for any Graniot environment that still accepts
-    # GetMap-style calls.
-    if bbox_latlon:
-        standard_130 = {
-            "access_key": access_key_value,
-            "SERVICE": "WMS",
-            "REQUEST": "GetMap",
-            "VERSION": "1.3.0",
-            "CRS": "EPSG:4326",
-            "BBOX": bbox_latlon,
-            "LAYERS": layer_value,
-            "FORMAT": "image/png",
-            "TRANSPARENT": "TRUE",
-            "WIDTH": width,
-            "HEIGHT": height,
-        }
-        if time:
-            standard_130["TIME"] = time
-        variants.append(standard_130)
+    # 7) Standard OGC WMS fallbacks are disabled by default because Graniot's
+    # /api/wms/ endpoint expects lowercase `layers` and returns
+    # {"layers": ["This field is required."]} when receiving `LAYERS`. Keep this
+    # behind a flag only for private/legacy deployments that explicitly need it.
+    if bool(getattr(settings, "GRANIOT_WMS_TRY_STANDARD_FALLBACK", False)):
+        if bbox_latlon:
+            standard_130 = {
+                "access_key": access_key_value,
+                "SERVICE": "WMS",
+                "REQUEST": "GetMap",
+                "VERSION": "1.3.0",
+                "CRS": "EPSG:4326",
+                "BBOX": bbox_latlon,
+                "LAYERS": layer_value,
+                "FORMAT": "image/png",
+                "TRANSPARENT": "TRUE",
+                "WIDTH": width,
+                "HEIGHT": height,
+            }
+            if time:
+                standard_130["TIME"] = time
+            variants.append(standard_130)
 
-    if bbox_lonlat:
-        standard_111 = {
-            "access_key": access_key_value,
-            "SERVICE": "WMS",
-            "REQUEST": "GetMap",
-            "VERSION": "1.1.1",
-            "SRS": "EPSG:4326",
-            "BBOX": bbox_lonlat,
-            "LAYERS": layer_value,
-            "FORMAT": "image/png",
-            "TRANSPARENT": "TRUE",
-            "WIDTH": width,
-            "HEIGHT": height,
-        }
-        if time:
-            standard_111["TIME"] = time
-        variants.append(standard_111)
+        if bbox_lonlat:
+            standard_111 = {
+                "access_key": access_key_value,
+                "SERVICE": "WMS",
+                "REQUEST": "GetMap",
+                "VERSION": "1.1.1",
+                "SRS": "EPSG:4326",
+                "BBOX": bbox_lonlat,
+                "LAYERS": layer_value,
+                "FORMAT": "image/png",
+                "TRANSPARENT": "TRUE",
+                "WIDTH": width,
+                "HEIGHT": height,
+            }
+            if time:
+                standard_111["TIME"] = time
+            variants.append(standard_111)
 
     return variants
 
@@ -1080,19 +1190,71 @@ def _iter_polygon_parts(geom: Any) -> List[Any]:
     return []
 
 
+def _geometry_bounds_look_latlon_swapped(geom: Any) -> bool:
+    """Detect GeoJSON/WKT where coordinates arrived as [lat, lon].
+
+    Dataris/Leaflet expects geometries internally as lon/lat (GeoJSON). Some
+    Graniot templates serialize WKT as lat/lon. When X looks like latitude and Y
+    looks like longitude we swap axes before clipping.
+    """
+    try:
+        minx, miny, maxx, maxy = geom.bounds
+        x_looks_like_lat = -90 <= minx <= 90 and -90 <= maxx <= 90
+        y_looks_like_lon = abs(miny) > 90 or abs(maxy) > 90
+        return bool(x_looks_like_lat and y_looks_like_lon)
+    except Exception:
+        return False
+
+
+def _normalize_geometry_axes(geom: Any) -> Any:
+    if _geometry_bounds_look_latlon_swapped(geom):
+        try:
+            return transform(lambda x, y, z=None: (y, x) if z is None else (y, x, z), geom)
+        except Exception:
+            return geom
+    return geom
+
+
 def _fix_polygonal_geometry(geom: Any) -> Optional[Any]:
     if not geom or getattr(geom, "is_empty", True):
         return None
+
+    geom = _normalize_geometry_axes(geom)
+
+    try:
+        if shapely_make_valid is not None and not geom.is_valid:
+            geom = shapely_make_valid(geom)
+    except Exception:
+        pass
+
     try:
         if not geom.is_valid:
             geom = geom.buffer(0)
     except Exception:
         pass
+
     parts = _iter_polygon_parts(geom)
     if not parts:
         return None
+
     try:
-        return unary_union(parts)
+        fixed_parts = []
+        for part in parts:
+            candidate = part
+            try:
+                if shapely_make_valid is not None and not candidate.is_valid:
+                    candidate = shapely_make_valid(candidate)
+            except Exception:
+                pass
+            try:
+                if not candidate.is_valid:
+                    candidate = candidate.buffer(0)
+            except Exception:
+                pass
+            fixed_parts.extend(_iter_polygon_parts(candidate))
+        if not fixed_parts:
+            return None
+        return unary_union(fixed_parts)
     except Exception:
         return parts[0] if len(parts) == 1 else None
 
@@ -1120,7 +1282,6 @@ def _geometry_from_geojson_value(value: Any) -> Optional[Any]:
     except Exception:
         return None
 
-
 def _geometry_from_wkt_template(value: Any) -> Optional[Any]:
     if not isinstance(value, str) or not value.strip():
         return None
@@ -1130,31 +1291,93 @@ def _geometry_from_wkt_template(value: Any) -> Optional[Any]:
     except Exception:
         return None
 
-    try:
-        minx, miny, maxx, maxy = geom.bounds
-        # Graniot's image_url currently serializes Geometry as LAT LON WKT, e.g.
-        # POLYGON ((14.33 -91.41, ...)). Shapely reads the first coordinate as X,
-        # so swap axes when X looks like latitude and Y looks like longitude.
-        x_looks_like_lat = -90 <= minx <= 90 and -90 <= maxx <= 90
-        y_looks_like_lon = abs(miny) > 90 or abs(maxy) > 90
-        if x_looks_like_lat and y_looks_like_lon:
-            geom = transform(lambda x, y, z=None: (y, x) if z is None else (y, x, z), geom)
-    except Exception:
-        pass
-
     return _fix_polygonal_geometry(geom)
 
 
-def _clip_geometry_from_payload(local: Optional[Dict[str, Any]], template_params: Dict[str, Any], recovered_wms_data: Optional[Dict[str, Any]]) -> tuple[Optional[Any], str]:
+def _subparcel_matches_request(item: Dict[str, Any], *, access_key: Optional[str], graniot_parcel_id: Optional[str]) -> bool:
+    data = {
+        "graniot_access_key": item.get("graniot_access_key") or item.get("access_key"),
+        "graniot_wms_access_key": item.get("graniot_wms_access_key"),
+        "graniot_parcel_key": item.get("graniot_parcel_key") or item.get("key"),
+        "graniot_parcel_id": item.get("graniot_parcel_id") or item.get("id"),
+        "graniot_wms_url": item.get("graniot_wms_url") or item.get("wms_url") or item.get("image_url"),
+    }
+    if _wms_data_matches_requested(data, access_key=access_key, graniot_parcel_id=graniot_parcel_id):
+        return True
+    image_url = item.get("graniot_image_url") or item.get("image_url")
+    if image_url:
+        data["graniot_wms_url"] = image_url
+        return _wms_data_matches_requested(data, access_key=access_key, graniot_parcel_id=graniot_parcel_id)
+    return False
+
+
+def _geometry_from_subparcel_item(item: Dict[str, Any]) -> Optional[Any]:
+    for candidate in (
+        item.get("geometry"),
+        item.get("geom"),
+        item.get("graniot_geometry"),
+        item.get("raw", {}).get("geometry") if isinstance(item.get("raw"), dict) else None,
+    ):
+        geom = _geometry_from_geojson_value(candidate)
+        if geom is not None:
+            return geom
+
+    raw = item.get("raw")
+    if isinstance(raw, dict):
+        data = _extract_wms_data_from_parcel_object(raw)
+        geom = _geometry_from_geojson_value(data.get("graniot_geometry"))
+        if geom is not None:
+            return geom
+    return None
+
+
+def _clip_geometry_from_payload(
+    local: Optional[Dict[str, Any]],
+    template_params: Dict[str, Any],
+    recovered_wms_data: Optional[Dict[str, Any]],
+    *,
+    access_key: Optional[str] = None,
+    graniot_parcel_id: Optional[str] = None,
+) -> tuple[Optional[Any], str]:
     """Return the geometry used to clip the WMS image.
 
-    The mask must follow the polygon that the user sees in Dataris. Earlier
-    versions preferred Graniot's Geometry template; that can be a broader
-    raster footprint and it made the layer bleed outside the local dashed
-    polygon. Prefer the local GeoJSON and only use Graniot's WKT/geometry as a
-    fallback when the local parcel has no valid geometry.
+    The mask must follow the exact lot/sub-lot being requested. Prefer the
+    matching Graniot subparcel geometry when the frontend asks for a specific
+    signed access_key, then fall back to recovered Graniot metadata and finally
+    to the local Dataris geometry. All inputs are repaired with Shapely and axes
+    are normalized to lon/lat before raster masking.
     """
     if local:
+        subparcels = local.get("graniot_parcels")
+        if isinstance(subparcels, list):
+            fallback_subparcel_geom: Optional[Any] = None
+            for item in subparcels:
+                if not isinstance(item, dict):
+                    continue
+                geom = _geometry_from_subparcel_item(item)
+                if geom is not None and fallback_subparcel_geom is None:
+                    fallback_subparcel_geom = geom
+                if geom is not None and _subparcel_matches_request(item, access_key=access_key, graniot_parcel_id=graniot_parcel_id):
+                    return geom, "local.graniot_parcels.match.geometry"
+            if fallback_subparcel_geom is not None and not (access_key or graniot_parcel_id):
+                return fallback_subparcel_geom, "local.graniot_parcels.first.geometry"
+
+    if recovered_wms_data:
+        geom = _geometry_from_geojson_value(recovered_wms_data.get("graniot_geometry"))
+        if geom is not None:
+            return geom, "recovered.graniot_geometry"
+
+    if local:
+        raw_data = _wms_data_from_payload(
+            local.get("graniot_raw"),
+            access_key=access_key or local.get("graniot_wms_access_key") or local.get("graniot_access_key") or local.get("graniot_parcel_key"),
+            parcel_id=graniot_parcel_id or local.get("graniot_parcel_id"),
+        )
+        if raw_data:
+            geom = _geometry_from_geojson_value(raw_data.get("graniot_geometry"))
+            if geom is not None:
+                return geom, "local.graniot_raw.match.geometry"
+
         for source_name, candidate in (
             ("local.geometry", local.get("geometry")),
             ("local.graniot_geometry", local.get("graniot_geometry")),
@@ -1163,30 +1386,12 @@ def _clip_geometry_from_payload(local: Optional[Dict[str, Any]], template_params
             if geom is not None:
                 return geom, source_name
 
-        raw_data = _wms_data_from_payload(
-            local.get("graniot_raw"),
-            access_key=local.get("graniot_parcel_key"),
-            parcel_id=local.get("graniot_parcel_id"),
-        )
-        if raw_data:
-            geom = _geometry_from_geojson_value(raw_data.get("graniot_geometry"))
-            if geom is not None:
-                return geom, "local.graniot_raw.geometry"
-
-    for source_name, candidate in (
-        ("recovered.graniot_geometry", recovered_wms_data.get("graniot_geometry") if recovered_wms_data else None),
-    ):
-        geom = _geometry_from_geojson_value(candidate)
-        if geom is not None:
-            return geom, source_name
-
     template_geometry = template_params.get("Geometry") or template_params.get("geometry")
     geom = _geometry_from_wkt_template(template_geometry)
     if geom is not None:
         return geom, "template.Geometry"
 
     return None, "none"
-
 
 def _clip_bounds_from_context(template: Optional[str], bbox_values: Optional[Dict[str, float]], local: Optional[Dict[str, Any]]) -> Optional[Dict[str, float]]:
     bounds = _bounds_from_wms_template(template)
@@ -1210,9 +1415,10 @@ def _clip_bounds_from_context(template: Optional[str], bbox_values: Optional[Dic
 def _bounds_from_wms_params(params: Dict[str, Any]) -> Optional[Dict[str, float]]:
     """Parse the exact BBOX sent to the successful WMS request.
 
-    The mask must use the same coordinate extent as the returned image. Using
-    the template BBOX while the request used another BBOX shifts the mask and
-    causes apparent holes/bleeding.
+    The mask must use the same coordinate extent as the returned image. Graniot
+    accepts both WMS 1.3 EPSG:4326 order (south,west,north,east) and classic
+    lon/lat order in different templates, so this parser validates both and
+    picks the one implied by VERSION/CRS first.
     """
     if not isinstance(params, dict):
         return None
@@ -1229,20 +1435,33 @@ def _bounds_from_wms_params(params: Dict[str, Any]) -> Optional[Dict[str, float]
         a, b, c, d = nums  # type: ignore[misc]
         version = str(params.get("VERSION") or params.get("version") or "").strip()
         crs = str(params.get("CRS") or params.get("crs") or params.get("SRS") or params.get("srs") or "").upper()
-        if version.startswith("1.3") and "4326" in crs:
+
+        def latlon_candidate() -> Optional[Dict[str, float]]:
             south, west, north, east = a, b, c, d
-        else:
+            if south is None or west is None or north is None or east is None:
+                return None
+            if -90 <= south < north <= 90 and -180 <= west < east <= 180:
+                return {"south": float(south), "west": float(west), "north": float(north), "east": float(east)}
+            return None
+
+        def lonlat_candidate() -> Optional[Dict[str, float]]:
             west, south, east, north = a, b, c, d
-        if south is None or west is None or north is None or east is None:
+            if south is None or west is None or north is None or east is None:
+                return None
+            if -90 <= south < north <= 90 and -180 <= west < east <= 180:
+                return {"south": float(south), "west": float(west), "north": float(north), "east": float(east)}
             return None
-        if not (south < north and west < east):
-            return None
-        return {"south": float(south), "west": float(west), "north": float(north), "east": float(east)}
+
+        if version.startswith("1.3") and "4326" in crs:
+            return latlon_candidate() or lonlat_candidate()
+        if version or crs:
+            return lonlat_candidate() or latlon_candidate()
+        return latlon_candidate() or lonlat_candidate()
     except Exception:
         return None
 
 
-def _pixel_points_from_polygon(poly: Any, bounds: Dict[str, float], width: int, height: int, scale: int = 1) -> List[tuple[int, int]]:
+def _pixel_points_from_coords(coords: Any, bounds: Dict[str, float], width: int, height: int, scale: int = 1) -> List[tuple[int, int]]:
     south = float(bounds["south"])
     north = float(bounds["north"])
     west = float(bounds["west"])
@@ -1251,8 +1470,8 @@ def _pixel_points_from_polygon(poly: Any, bounds: Dict[str, float], width: int, 
     lat_span = north - south
     if lon_span <= 0 or lat_span <= 0:
         return []
-    points = []
-    for lon, lat in list(poly.exterior.coords):
+    points: List[tuple[int, int]] = []
+    for lon, lat in list(coords):
         x = ((float(lon) - west) / lon_span) * width * scale
         y = ((north - float(lat)) / lat_span) * height * scale
         # Keep a tiny padding around the image to avoid cutting a border pixel
@@ -1261,6 +1480,9 @@ def _pixel_points_from_polygon(poly: Any, bounds: Dict[str, float], width: int, 
         y = max(-2 * scale, min((height + 2) * scale, y))
         points.append((int(round(x)), int(round(y))))
     return points
+
+def _pixel_points_from_polygon(poly: Any, bounds: Dict[str, float], width: int, height: int, scale: int = 1) -> List[tuple[int, int]]:
+    return _pixel_points_from_coords(poly.exterior.coords, bounds, width, height, scale=scale)
 
 
 def _geometry_intersection_with_bounds(geometry: Any, bounds: Dict[str, float]) -> Optional[Any]:
@@ -1301,25 +1523,32 @@ def _apply_backend_polygon_mask(
     if not parts:
         return content, media_type, False, {"reason": "no_polygon_intersection", "bounds": bounds}
 
-    # Backend mask in the exact WMS response coordinate system. Use a higher
-    # scale for stable edges, but DO NOT replace the original alpha. Graniot PNGs
-    # may contain RGB values in fully transparent pixels; replacing alpha makes
-    # those hidden pixels visible as solid purple/green blobs. Multiplying alpha
-    # clips the raster without inventing pixels that Graniot did not render.
+    # Backend mask in the exact WMS response coordinate system. The alpha channel
+    # is rebuilt from the repaired polygon, not multiplied with the source alpha.
+    # This prevents Graniot transparent padding/nodata inside the lot from making
+    # the image look incomplete while still preventing any bleed outside the lot.
     scale = 4 if max(width, height) <= 2048 else 2
     mask = Image.new("L", (width * scale, height * scale), 0)
     draw = ImageDraw.Draw(mask)
     drew_any = False
     part_count = 0
+    hole_count = 0
 
     for poly in parts:
-        points = _pixel_points_from_polygon(poly, bounds, width, height, scale=scale)
-        if len(points) >= 3:
-            # Draw only exterior rings. Interior rings from local parcel uploads
-            # are frequently subdivision artifacts, not real holes in Graniot.
-            draw.polygon(points, fill=255)
-            drew_any = True
-            part_count += 1
+        exterior_points = _pixel_points_from_coords(poly.exterior.coords, bounds, width, height, scale=scale)
+        if len(exterior_points) < 3:
+            continue
+        draw.polygon(exterior_points, fill=255)
+        drew_any = True
+        part_count += 1
+
+        # Real inner rings are preserved as transparent holes. Invalid/self-
+        # intersecting rings were repaired by Shapely before this point.
+        for interior in getattr(poly, "interiors", []) or []:
+            interior_points = _pixel_points_from_coords(interior.coords, bounds, width, height, scale=scale)
+            if len(interior_points) >= 3:
+                draw.polygon(interior_points, fill=0)
+                hole_count += 1
 
     if not drew_any:
         return content, media_type, False, {"reason": "mask_draw_empty", "bounds": bounds}
@@ -1330,13 +1559,11 @@ def _apply_backend_polygon_mask(
         except AttributeError:
             resampling = Image.LANCZOS
         mask = mask.resize((width, height), resampling)
-        # Hard threshold: no leaks outside the local polygon. A low threshold
-        # keeps border pixels filled without exposing distant transparent RGB.
-        mask = mask.point(lambda value: 255 if value >= 24 else 0)
+        # Hard threshold: no leaks outside the local polygon, including complex
+        # rings. Low threshold keeps border pixels from disappearing.
+        mask = mask.point(lambda value: 255 if value >= 16 else 0)
 
-    original_alpha = image.getchannel("A")
-    final_alpha = ImageChops.multiply(original_alpha, mask)
-    image.putalpha(final_alpha)
+    image.putalpha(mask)
 
     output = BytesIO()
     image.save(output, format="PNG", optimize=True)
@@ -1344,9 +1571,10 @@ def _apply_backend_polygon_mask(
         "width": width,
         "height": height,
         "parts": part_count,
+        "holes": hole_count,
         "bounds": bounds,
+        "alpha_mode": "geometry_mask",
     }
-
 
 def _response_preview_text(response: Any) -> str:
     try:
@@ -2315,7 +2543,18 @@ async def wms_proxy(
     # but no signed WMS token, or can receive the UUID-like parcel key from the
     # frontend. In both cases /api/wms/ returns {"Invalid access key."}. Recover
     # the current properties.image_url from Graniot and use its signed token.
-    needs_signed_recovery = bool(local) and not signed_template_access_key and (bool(access_key) or bool(local_graniot_parcel_id))
+    incoming_parcel_key_from_signed = _parcel_key_from_signed_wms_access_key(access_key)
+    template_parcel_key_from_signed = _parcel_key_from_signed_wms_access_key(signed_template_access_key)
+    template_mismatch = bool(
+        incoming_parcel_key_from_signed
+        and template_parcel_key_from_signed
+        and _normalized_token(incoming_parcel_key_from_signed) != _normalized_token(template_parcel_key_from_signed)
+    )
+    needs_signed_recovery = bool(local) and (
+        (not signed_template_access_key)
+        or template_mismatch
+        or _is_uuid_like(access_key)
+    ) and (bool(access_key) or bool(local_graniot_parcel_id))
     if needs_signed_recovery:
         recovered_wms_data = await _recover_wms_data_from_graniot(
             client,
@@ -2334,8 +2573,11 @@ async def wms_proxy(
                     signed_template_access_key = str(recovered_key).strip()
             _store_recovered_wms_data(local, recovered_wms_data)
 
-    if signed_template_access_key:
-        access_key = str(signed_template_access_key).strip()
+    # Keep the signed access_key requested by the frontend when present. This
+    # is critical for split parcels: each subparcel has its own signed token.
+    # Only use the template token when the request contains an old UUID-like key
+    # or no signed key at all.
+    access_key = _choose_wms_access_key(access_key, signed_template_access_key)
     wms_path = _wms_path_from_template(template)
 
     bbox_values = _bbox_values_from_bounds(south, west, north, east)
@@ -2378,8 +2620,11 @@ async def wms_proxy(
     # (`security: - {}`). Try without auth first to match the spec and to avoid
     # Graniot returning JSON/500/502 because of an unexpected API-key header.
     # Authenticated requests remain as fallback for private deployments.
+    try_auth_fallback = bool(getattr(settings, "GRANIOT_WMS_TRY_AUTH_FALLBACK", False))
+    auth_modes = (False, True) if try_auth_fallback else (False,)
+
     for variant_index, params in enumerate(variants, start=1):
-        for use_auth in (False, True):
+        for use_auth in auth_modes:
             try:
                 log_event({
                     "event": "dataris.graniot.wms_proxy.request",
@@ -2432,7 +2677,13 @@ async def wms_proxy(
 
                 request_bounds = _bounds_from_wms_params(params)
                 clip_bounds = request_bounds or bbox_values or _clip_bounds_from_context(template, bbox_values, local)
-                clip_geometry, clip_geometry_source = _clip_geometry_from_payload(local, template_params, recovered_wms_data)
+                clip_geometry, clip_geometry_source = _clip_geometry_from_payload(
+                    local,
+                    template_params,
+                    recovered_wms_data,
+                    access_key=access_key,
+                    graniot_parcel_id=local_graniot_parcel_id,
+                )
                 content, final_media_type, backend_clip_applied, clip_info = _apply_backend_polygon_mask(
                     raw.content,
                     media_type=media_type,

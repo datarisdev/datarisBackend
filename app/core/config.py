@@ -51,10 +51,29 @@ class Settings(BaseSettings):
 
     # Graniot debug logging. Values are redacted before writing logs.
     # Disable in production once the integration is stable.
-    GRANIOT_DEBUG_LOGS_ENABLED: bool = True
+    GRANIOT_DEBUG_LOGS_ENABLED: bool = False
     GRANIOT_DEBUG_LOG_TO_FILE: bool = True
     GRANIOT_DEBUG_LOG_FILE: str | None = None
     GRANIOT_DEBUG_MAX_BODY_CHARS: int = 30000
+    # /api/wms/ is public in the Graniot OpenAPI. Keep auth fallback disabled
+    # by default to avoid duplicate WMS requests/log spam. Enable only if a
+    # private Graniot deployment requires auth for WMS images.
+    GRANIOT_WMS_TRY_AUTH_FALLBACK: bool = False
+    # Keep uppercase OGC WMS attempts disabled for Graniot /api/wms/. That
+    # endpoint expects lowercase `layers`; uppercase `LAYERS` only creates
+    # noisy 400 responses like {"layers": ["This field is required."]}.
+    GRANIOT_WMS_TRY_STANDARD_FALLBACK: bool = False
+
+
+    # DigiformsApp integration. Keep credentials only in backend env vars.
+    DIGIFORMS_BASE_URL: str = "https://d.interlinksoft.net/Digiforms/api"
+    DIGIFORMS_CLIENT_ID: str = "178"
+    DIGIFORMS_API_USER: str = "api"
+    DIGIFORMS_API_PASSWORD: str | None = None
+    DIGIFORMS_AUTH_TIMEOUT_SECONDS: int = 30
+    DIGIFORMS_PORTAL_URL: str = "https://d.interlinksoft.net/Digiforms/"
+    DIGIFORMS_DEFAULT_PROFILE: str = "user"
+    DIGIFORMS_PROVISIONING_ENABLED: bool = True
 
     # OpenAI Copiloto de Aplicación Aérea.
     # OPENAI_API_KEY debe configurarse en producción; si no existe, el backend devuelve
