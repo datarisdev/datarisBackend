@@ -66,7 +66,7 @@ class Settings(BaseSettings):
 
 
     # DigiformsApp integration. Keep credentials only in backend env vars.
-    DIGIFORMS_BASE_URL: str = "https://d.interlinksoft.net/Digiforms/api"
+    DIGIFORMS_BASE_URL: str = "https://d.interlinksoft.net/Digiforms/Api/user"
     DIGIFORMS_CLIENT_ID: str = "178"
     DIGIFORMS_API_USER: str = "api"
     DIGIFORMS_API_PASSWORD: str | None = None

@@ -19,6 +19,11 @@ from fastapi.responses import FileResponse
 from jose import JWTError, jwt
 from pydantic import BaseModel
 
+try:
+    import psycopg2
+except Exception:  # pragma: no cover - optional fallback for local/dev environments
+    psycopg2 = None
+
 from app.core.config import settings
 from app.services.telemetry.helicopter_processor import process_helicopter_zip
 from app.services.telemetry.aerial_copilot import process_aerial_copilot
@@ -30,13 +35,16 @@ ROOT = Path(os.getenv("DATARIS_COMPAT_STORAGE_DIR", "app/storage")).resolve()
 DB_FILE = ROOT / "compat_db.json"
 FILES = ROOT / "compat_files"
 LOCK = RLock()
+ENSURING_STORAGE = False
+STATE_TABLE = os.getenv("DATARIS_COMPAT_STATE_TABLE", "dataris_compat_state")
+STATE_KEY = os.getenv("DATARIS_COMPAT_STATE_KEY", "default")
 
 TABLES = [
     "profiles", "user_roles", "admin_users", "companies", "platform_modules",
     "company_modules", "user_modules", "parcels", "satellite_images",
     "field_notes", "parcel_crops", "aerial_analyses", "analysis_sessions",
     "analysis_data_points", "laborapp_registros", "laborapp_empleados_foto",
-    "extension_requests", "digiforms_accounts",
+    "extension_requests", "digiforms_accounts", "digiforms_user_links", "digiforms_operation_logs",
 ]
 
 DEFAULT_MODULES = [
@@ -198,46 +206,189 @@ def default_db() -> Dict[str, Any]:
     }
 
 
-def read_db() -> Dict[str, Any]:
-    ensure_storage()
+def database_url_for_state() -> str:
+    return str(os.getenv("DATARIS_COMPAT_DATABASE_URL") or os.getenv("DATABASE_URL") or "").strip()
+
+
+def postgres_dsn() -> str:
+    url = database_url_for_state()
+    if url.startswith("postgresql+psycopg2://"):
+        return "postgresql://" + url.split("postgresql+psycopg2://", 1)[1]
+    if url.startswith("postgresql+asyncpg://"):
+        return "postgresql://" + url.split("postgresql+asyncpg://", 1)[1]
+    return url
+
+
+def use_postgres_state() -> bool:
+    mode = str(os.getenv("DATARIS_COMPAT_PERSISTENCE", "auto")).strip().lower()
+    if mode in {"file", "json", "local"}:
+        return False
+    if mode in {"postgres", "postgresql", "db", "database"}:
+        return bool(psycopg2 and postgres_dsn().startswith("postgres"))
+
+    dsn = postgres_dsn()
+    if not psycopg2 or not dsn.startswith("postgres"):
+        return False
+
+    # Local development often points to localhost and should keep using the JSON
+    # file unless explicitly requested with DATARIS_COMPAT_PERSISTENCE=postgres.
+    lowered = dsn.lower()
+    if "localhost" in lowered or "127.0.0.1" in lowered:
+        return False
+    return True
+
+
+def postgres_connection():
+    if not psycopg2:
+        raise RuntimeError("psycopg2 is not installed")
+    return psycopg2.connect(postgres_dsn())
+
+
+def ensure_state_table() -> None:
+    if not use_postgres_state():
+        return
+    ddl = f"""
+        CREATE TABLE IF NOT EXISTS {STATE_TABLE} (
+            id TEXT PRIMARY KEY,
+            payload JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """
+    with postgres_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(ddl)
+
+
+def read_db_from_file() -> Dict[str, Any]:
     with DB_FILE.open("r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def write_db(db: Dict[str, Any]) -> None:
-    ROOT.mkdir(parents=True, exist_ok=True)
-    tmp = DB_FILE.with_suffix(".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(db, f, ensure_ascii=False, indent=2, default=str)
-    tmp.replace(DB_FILE)
+def read_db_from_postgres() -> Optional[Dict[str, Any]]:
+    ensure_state_table()
+    with postgres_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT payload FROM {STATE_TABLE} WHERE id = %s", (STATE_KEY,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            payload = row[0]
+            if isinstance(payload, str):
+                return json.loads(payload)
+            return payload
 
+
+def write_db_to_postgres(db: Dict[str, Any]) -> None:
+    ensure_state_table()
+    payload = json.dumps(db, ensure_ascii=False, default=str)
+    sql = f"""
+        INSERT INTO {STATE_TABLE} (id, payload, updated_at)
+        VALUES (%s, %s::jsonb, NOW())
+        ON CONFLICT (id)
+        DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()
+    """
+    with postgres_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (STATE_KEY, payload))
+
+
+def read_db() -> Dict[str, Any]:
+    ensure_storage()
+    if use_postgres_state():
+        data = read_db_from_postgres()
+        if data is not None:
+            return data
+        data = default_db()
+        write_db_to_postgres(data)
+        return data
+    return read_db_from_file()
+
+
+def write_db(db: Dict[str, Any]) -> None:
+    """Persist the compatibility database.
+
+    Production Cloud Run must not depend on /tmp for application state because
+    instances are ephemeral and multiple instances do not share files. When a
+    production DATABASE_URL is available, this stores the compat JSON state in
+    PostgreSQL automatically. Local development keeps the JSON file fallback.
+    """
+    if use_postgres_state():
+        write_db_to_postgres(db)
+        return
+
+    ROOT.mkdir(parents=True, exist_ok=True)
+
+    tmp = ROOT / f"{DB_FILE.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+
+    try:
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(db, f, ensure_ascii=False, indent=2, default=str)
+        tmp.replace(DB_FILE)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
 
 def ensure_storage() -> None:
-    ROOT.mkdir(parents=True, exist_ok=True)
-    FILES.mkdir(parents=True, exist_ok=True)
-    if not DB_FILE.exists():
-        write_db(default_db())
+    global ENSURING_STORAGE
+    if ENSURING_STORAGE:
         return
+    ENSURING_STORAGE = True
     try:
-        with DB_FILE.open("r", encoding="utf-8") as f:
-            db = json.load(f)
-    except Exception:
-        write_db(default_db())
-        return
-    changed = False
+        ROOT.mkdir(parents=True, exist_ok=True)
+        FILES.mkdir(parents=True, exist_ok=True)
+
+        if use_postgres_state():
+            ensure_state_table()
+            db = read_db_from_postgres()
+            if db is None:
+                if DB_FILE.exists():
+                    try:
+                        db = read_db_from_file()
+                    except Exception:
+                        db = default_db()
+                else:
+                    db = default_db()
+                write_db_to_postgres(normalize_db(db))
+            else:
+                before = json.dumps(db, sort_keys=True, default=str)
+                normalized = normalize_db(db)
+                after = json.dumps(normalized, sort_keys=True, default=str)
+                if after != before:
+                    write_db_to_postgres(normalized)
+            return
+
+        if not DB_FILE.exists():
+            write_db(default_db())
+            return
+        try:
+            db = read_db_from_file()
+        except Exception:
+            write_db(default_db())
+            return
+        before = json.dumps(db, sort_keys=True, default=str)
+        normalized = normalize_db(db)
+        after = json.dumps(normalized, sort_keys=True, default=str)
+        if after != before:
+            write_db(normalized)
+    finally:
+        ENSURING_STORAGE = False
+
+
+def normalize_db(db: Dict[str, Any]) -> Dict[str, Any]:
     db.setdefault("users", [])
     tables = db.setdefault("tables", {})
-    for table in TABLES:
-        if table not in tables:
-            tables[table] = []
-            changed = True
+    for table_name in TABLES:
+        tables.setdefault(table_name, [])
     t = now()
-    if not tables["platform_modules"]:
+    if not tables.get("platform_modules"):
         tables["platform_modules"] = [
             {"id": mid, "name": name, "description": desc, "icon": icon, "is_active": True, "created_at": t, "updated_at": t}
             for mid, name, desc, icon in DEFAULT_MODULES
         ]
-        changed = True
     else:
         existing_modules = {m.get("id") for m in tables.get("platform_modules", [])}
         for mid, name, desc, icon in DEFAULT_MODULES:
@@ -251,7 +402,6 @@ def ensure_storage() -> None:
                     "created_at": t,
                     "updated_at": t,
                 })
-                changed = True
 
     existing_modules = {m.get("id") for m in tables.get("platform_modules", [])}
     for mid, name, desc, icon in EXTENSION_MODULES:
@@ -265,16 +415,8 @@ def ensure_storage() -> None:
                 "created_at": t,
                 "updated_at": t,
             })
-            changed = True
 
-    # Do not auto-enable modules for every company or user during upgrades.
-    # Module visibility must come only from the assignments made in Admin > Empresas
-    # and Admin > Usuarios. The default admin/company already receive all defaults in
-    # default_db(), but existing companies keep exactly the modules configured by the admin.
-
-    if changed:
-        write_db(db)
-
+    return db
 
 def table(db: Dict[str, Any], name: str) -> List[Dict[str, Any]]:
     return db.setdefault("tables", {}).setdefault(name, [])
