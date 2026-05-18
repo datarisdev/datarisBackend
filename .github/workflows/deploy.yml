@@ -1,86 +1,244 @@
-name: Deploy Backend to Cloud Run
+name: Deploy Backend to Google Cloud Run
 
-# Manual only
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
-      environment:
-        description: 'Select environment to deploy'
+      target:
+        description: Environment to deploy
         required: true
-        default: 'staging'
+        default: production
         type: choice
         options:
-          - prod
+          - production
           - staging
-      deployment_name:
-        description: 'Optional name to identify this deployment'
+      skip_smoke_test:
+        description: Skip local Docker smoke test before pushing image
         required: false
-        default: ''
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: cloud-run-deploy-${{ github.event_name == 'workflow_dispatch' && inputs.target || 'production' }}
+  cancel-in-progress: false
 
 env:
-  PROJECT_ID: dataris-dev
-  REGION: europe-west1
-  REPO: backend
+  PROJECT_ID: project-dac5410a-cbc8-4901-bd0
+  REGION: us-central1
+  ARTIFACT_REPOSITORY: cloud-run-source-deploy
+
+  # Servicio real que aparece en Google Cloud Run en las capturas.
+  # Si después crean un servicio separado de producción, cambia este valor por dataris-api-production.
+  SERVICE_PRODUCTION: dataris-api-staging
+  SERVICE_STAGING: dataris-api-staging
+
+  PORT: '8080'
+  CPU: '4'
+  MEMORY: 8Gi
+  CONCURRENCY: '1'
+  TIMEOUT: 3600s
+  MIN_INSTANCES: '0'
+  MAX_INSTANCES: '3'
 
 jobs:
   deploy:
+    name: Build, push and deploy to Cloud Run
     runs-on: ubuntu-latest
-    environment: ${{ github.event.inputs.environment }}
-    
+    timeout-minutes: 45
+    environment: ${{ github.event_name == 'workflow_dispatch' && inputs.target || 'production' }}
+
+    env:
+      WIF_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      WIF_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      SA_KEY_JSON: ${{ secrets.GCP_SA_KEY }}
+
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.ref_name }}
 
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      - name: Resolve deployment target
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      - name: Set up gcloud
-        uses: google-github-actions/setup-gcloud@v2
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TARGET_ENV="${{ inputs.target }}"
+          else
+            TARGET_ENV="production"
+          fi
+
+          case "$TARGET_ENV" in
+            production)
+              SERVICE="$SERVICE_PRODUCTION"
+              TAG_ALIAS="prod-latest"
+              ;;
+            staging)
+              SERVICE="$SERVICE_STAGING"
+              TAG_ALIAS="staging-latest"
+              ;;
+            *)
+              echo "Unsupported target environment: $TARGET_ENV" >&2
+              exit 1
+              ;;
+          esac
+
+          SHORT_SHA="${GITHUB_SHA::12}"
+          IMAGE_BASE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPOSITORY}/${SERVICE}"
+          IMAGE_SHA="${IMAGE_BASE}:${SHORT_SHA}"
+          IMAGE_LATEST="${IMAGE_BASE}:${TAG_ALIAS}"
+
+          echo "target_env=$TARGET_ENV" >> "$GITHUB_OUTPUT"
+          echo "service=$SERVICE" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "image_sha=$IMAGE_SHA" >> "$GITHUB_OUTPUT"
+          echo "image_latest=$IMAGE_LATEST" >> "$GITHUB_OUTPUT"
+          echo "tag_alias=$TAG_ALIAS" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Deployment target"
+            echo "- Environment: $TARGET_ENV"
+            echo "- Service: $SERVICE"
+            echo "- Image: $IMAGE_SHA"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Validate Google Cloud authentication configuration
+        run: |
+          set -euo pipefail
+          if [[ -n "$WIF_PROVIDER" && -n "$WIF_SERVICE_ACCOUNT" ]]; then
+            echo "Using Workload Identity Federation authentication."
+            exit 0
+          fi
+
+          if [[ -n "$SA_KEY_JSON" ]]; then
+            echo "Using fallback Service Account JSON authentication."
+            exit 0
+          fi
+
+          echo "::error::Configure GCP_WORKLOAD_IDENTITY_PROVIDER + GCP_SERVICE_ACCOUNT, or fallback GCP_SA_KEY."
+          exit 1
+
+      - name: Authenticate to Google Cloud with Workload Identity Federation
+        if: ${{ env.WIF_PROVIDER != '' && env.WIF_SERVICE_ACCOUNT != '' }}
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.WIF_SERVICE_ACCOUNT }}
+
+      - name: Authenticate to Google Cloud with Service Account JSON fallback
+        if: ${{ (env.WIF_PROVIDER == '' || env.WIF_SERVICE_ACCOUNT == '') && env.SA_KEY_JSON != '' }}
+        uses: google-github-actions/auth@v3
+        with:
+          credentials_json: ${{ env.SA_KEY_JSON }}
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
         with:
           project_id: ${{ env.PROJECT_ID }}
 
-      - name: Determine service & tag
+      - name: Configure Docker authentication for Artifact Registry
         run: |
-          BRANCH_NAME="${GITHUB_REF##*/}"
-          ENVIRONMENT="${{ github.event.inputs.environment }}"
-          DEPLOYMENT_NAME="${{ github.event.inputs.deployment_name }}"
+          set -euo pipefail
+          gcloud auth print-access-token | docker login \
+            -u oauth2accesstoken \
+            --password-stdin \
+            "https://${REGION}-docker.pkg.dev"
 
-          if [[ "$ENVIRONMENT" == "prod" ]]; then
-            SERVICE=backend-prod
-            TAG=prod
-          else
-            SERVICE=backend-staging
-            TAG=staging
-          fi
-
-          # Optional: append deployment name to tag, replacing spaces with hyphens
-          if [[ -n "$DEPLOYMENT_NAME" ]]; then
-            SAFE_NAME="${DEPLOYMENT_NAME// /-}"
-            TAG="${TAG}-${SAFE_NAME}"
-          fi
-
-          echo "SERVICE=$SERVICE" >> $GITHUB_ENV
-          echo "TAG=$TAG" >> $GITHUB_ENV
-          echo "BRANCH=$BRANCH_NAME" >> $GITHUB_ENV
-
-      - name: Build & push Docker image
+      - name: Build Docker image
         run: |
-          gcloud builds submit \
-            --tag "$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/backend:$TAG" \
+          set -euo pipefail
+          docker build \
+            --pull \
+            --platform linux/amd64 \
+            -t "${{ steps.vars.outputs.image_sha }}" \
+            -t "${{ steps.vars.outputs.image_latest }}" \
+            .
+
+      - name: Smoke test Docker image locally
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.skip_smoke_test == false }}
+        run: |
+          set -euo pipefail
+
+          docker run -d \
+            --name dataris-backend-smoke \
+            -p 8080:8080 \
+            -e PORT=8080 \
+            "${{ steps.vars.outputs.image_sha }}"
+
+          cleanup() {
+            docker logs dataris-backend-smoke || true
+            docker rm -f dataris-backend-smoke || true
+          }
+          trap cleanup EXIT
+
+          for attempt in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:8080/health"; then
+              echo "Local container health check OK"
+              exit 0
+            fi
+            echo "Waiting for local container health check... attempt ${attempt}/30"
+            sleep 2
+          done
+
+          echo "Local container did not become healthy"
+          exit 1
+
+      - name: Push Docker image to Artifact Registry
+        run: |
+          set -euo pipefail
+          docker push "${{ steps.vars.outputs.image_sha }}"
+          docker push "${{ steps.vars.outputs.image_latest }}"
+
+      - name: Deploy image to Cloud Run
+        run: |
+          set -euo pipefail
+
+          gcloud run deploy "${{ steps.vars.outputs.service }}" \
             --project "$PROJECT_ID" \
-            --account admin-dev@dataris-dev.iam.gserviceaccount.com
-
-
-      - name: Deploy to Cloud Run
-        run: |
-          gcloud run deploy "$SERVICE" \
-            --image "$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/backend:$TAG" \
             --region "$REGION" \
             --platform managed \
+            --image "${{ steps.vars.outputs.image_sha }}" \
+            --port "$PORT" \
+            --cpu "$CPU" \
+            --memory "$MEMORY" \
+            --concurrency "$CONCURRENCY" \
+            --timeout "$TIMEOUT" \
+            --min-instances "$MIN_INSTANCES" \
+            --max-instances "$MAX_INSTANCES" \
+            --cpu-boost \
             --allow-unauthenticated \
-            --add-cloudsql-instances "${{ secrets.CLOUDSQL_INSTANCE }}" \
-            --set-env-vars DATABASE_URL="${{ secrets.DATABASE_URL }}",JWT_SECRET_KEY="${{ secrets.JWT_SECRET_KEY }}",REDIS_URL="${{ secrets.REDIS_URL }}",RUN_MIGRATIONS=false
+            --update-env-vars "ENVIRONMENT=${{ steps.vars.outputs.target_env }},GOOGLE_CLOUD_PROJECT=${PROJECT_ID},RUN_MIGRATIONS=false" \
+            --labels "managed-by=github-actions,commit-sha=${GITHUB_SHA},environment=${{ steps.vars.outputs.target_env }}" \
+            --quiet
+
+      - name: Verify Cloud Run deployment
+        run: |
+          set -euo pipefail
+          SERVICE_URL="$(gcloud run services describe "${{ steps.vars.outputs.service }}" \
+            --project "$PROJECT_ID" \
+            --region "$REGION" \
+            --format='value(status.url)')"
+
+          echo "Cloud Run URL: $SERVICE_URL"
+          echo "- URL: $SERVICE_URL" >> "$GITHUB_STEP_SUMMARY"
+
+          for attempt in $(seq 1 30); do
+            if curl -fsS "$SERVICE_URL/health"; then
+              echo "Cloud Run health check OK"
+              exit 0
+            fi
+            echo "Waiting for Cloud Run health check... attempt ${attempt}/30"
+            sleep 3
+          done
+
+          echo "Cloud Run service did not become healthy"
+          gcloud run services describe "${{ steps.vars.outputs.service }}" \
+            --project "$PROJECT_ID" \
+            --region "$REGION"
+          exit 1

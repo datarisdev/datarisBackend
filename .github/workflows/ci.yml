@@ -1,0 +1,71 @@
+name: CI Backend
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches-ignore:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-backend-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: dataris-backend-ci
+
+jobs:
+  validate:
+    name: Validate Docker build and API health
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --pull \
+            --platform linux/amd64 \
+            -t "$IMAGE_NAME:${GITHUB_SHA}" \
+            .
+
+      - name: Run container smoke test
+        run: |
+          set -euo pipefail
+
+          docker run -d \
+            --name dataris-backend-ci \
+            -p 8080:8080 \
+            -e PORT=8080 \
+            "$IMAGE_NAME:${GITHUB_SHA}"
+
+          cleanup() {
+            docker logs dataris-backend-ci || true
+            docker rm -f dataris-backend-ci || true
+          }
+          trap cleanup EXIT
+
+          for attempt in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:8080/health"; then
+              echo "API health check OK"
+              exit 0
+            fi
+            echo "Waiting for API health check... attempt ${attempt}/30"
+            sleep 2
+          done
+
+          echo "API did not become healthy"
+          exit 1
+
+      - name: Validate Python syntax inside image
+        run: |
+          docker run --rm "$IMAGE_NAME:${GITHUB_SHA}" \
+            python -m compileall app api scripts
