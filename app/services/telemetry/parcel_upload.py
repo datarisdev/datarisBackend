@@ -13,7 +13,7 @@ from shapely.geometry import Polygon, mapping, shape as shapely_shape
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import transform, unary_union
 
-from app.utils.geojson_normalizer import normalize_geojson
+from app.utils.geojson_normalizer import summarize_geojson
 
 
 def _safe_extract(zip_file: zipfile.ZipFile, destination: Path) -> None:
@@ -101,16 +101,9 @@ def _record_props(reader: shapefile.Reader, record: Any) -> Dict[str, Any]:
 
 
 def _read_shapefile(shp_path: Path) -> Dict[str, Any]:
-    """Read SHP and return backend-normalized WGS84 GeoJSON.
-
-    If the ZIP/SHP does not include .prj, normalize_geojson tries common CRS
-    candidates and picks the one that produces valid WGS84 bounds. This avoids
-    saving projected UTM/GTM coordinates that Mapbox cannot draw.
-    """
-    src_crs = _read_prj(shp_path)
+    src_crs = _read_prj(shp_path) or CRS.from_epsg(4326)
     reader = shapefile.Reader(str(shp_path))
-    raw_features: List[Dict[str, Any]] = []
-
+    features: List[Dict[str, Any]] = []
     for sr in reader.iterShapeRecords():
         try:
             geom = shapely_shape(sr.shape.__geo_interface__)
@@ -118,30 +111,30 @@ def _read_shapefile(shp_path: Path) -> Dict[str, Any]:
             continue
         if geom.is_empty:
             continue
-        if geom.geom_type not in {"Polygon", "MultiPolygon"}:
+        geom_wgs = _to_crs(geom, src_crs, CRS.from_epsg(4326))
+        # Parcelas/lotes deben ser polígonos. Si viene multiparte, se respeta.
+        if geom_wgs.geom_type not in {"Polygon", "MultiPolygon"}:
             continue
-        raw_features.append({
+        features.append({
             "type": "Feature",
             "properties": _record_props(reader, sr.record),
-            "geometry": mapping(geom),
+            "geometry": mapping(geom_wgs),
         })
-
-    if not raw_features:
+    if not features:
         raise ValueError("El shapefile no contiene polígonos válidos")
-
-    normalized = normalize_geojson(_feature_collection(raw_features), source_crs=src_crs, keep_all_geometry_types=False)
-    if normalized.get("feature_count", 0) <= 0:
-        raise ValueError("No se pudieron normalizar las geometrías del shapefile a coordenadas WGS84 válidas")
-
+    fc = _feature_collection(features)
+    summary = summarize_geojson(fc)
+    area = summary.get("area") or round(_area_ha_wgs(features), 4)
     return {
-        "geometry": normalized["geometry"],
-        "area": round(float(normalized.get("area") or 0), 4),
-        "bounds": normalized.get("bounds"),
-        "center": normalized.get("center"),
-        "bbox": normalized.get("bbox"),
-        "source_crs": normalized.get("source_crs"),
-        "geometry_type": normalized.get("geometry_type"),
-        "feature_count": normalized.get("feature_count"),
+        "geometry": summary.get("geometry_geojson") or fc,
+        "geometry_geojson": summary.get("geometry_geojson") or fc,
+        "geometry_bounds": summary.get("geometry_bounds"),
+        "geometry_center": summary.get("geometry_center"),
+        "bbox": summary.get("bbox"),
+        "geometry_type": summary.get("geometry_type"),
+        "geometry_feature_count": summary.get("geometry_feature_count"),
+        "geometry_source_crs": str(src_crs.to_authority()[0] + ":" + src_crs.to_authority()[1]) if src_crs and src_crs.to_authority() else str(src_crs or "EPSG:4326"),
+        "area": area,
     }
 
 
@@ -179,18 +172,18 @@ def _parse_kml_text(text: str) -> Dict[str, Any]:
                 })
     if not features:
         raise ValueError("El KML/KMZ no contiene polígonos válidos")
-    normalized = normalize_geojson(_feature_collection(features), source_crs="EPSG:4326", keep_all_geometry_types=False)
-    if normalized.get("feature_count", 0) <= 0:
-        raise ValueError("No se pudieron normalizar las geometrías del KML/KMZ")
+    fc = _feature_collection(features)
+    summary = summarize_geojson(fc)
     return {
-        "geometry": normalized["geometry"],
-        "area": round(float(normalized.get("area") or 0), 4),
-        "bounds": normalized.get("bounds"),
-        "center": normalized.get("center"),
-        "bbox": normalized.get("bbox"),
-        "source_crs": normalized.get("source_crs"),
-        "geometry_type": normalized.get("geometry_type"),
-        "feature_count": normalized.get("feature_count"),
+        "geometry": summary.get("geometry_geojson") or fc,
+        "geometry_geojson": summary.get("geometry_geojson") or fc,
+        "geometry_bounds": summary.get("geometry_bounds"),
+        "geometry_center": summary.get("geometry_center"),
+        "bbox": summary.get("bbox"),
+        "geometry_type": summary.get("geometry_type"),
+        "geometry_feature_count": summary.get("geometry_feature_count"),
+        "geometry_source_crs": "EPSG:4326",
+        "area": summary.get("area") or round(_area_ha_wgs(features), 4),
     }
 
 
