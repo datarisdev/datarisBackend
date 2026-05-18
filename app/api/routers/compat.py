@@ -28,6 +28,7 @@ from app.core.config import settings
 from app.services.telemetry.helicopter_processor import process_helicopter_zip
 from app.services.telemetry.aerial_copilot import process_aerial_copilot
 from app.services.telemetry.parcel_upload import parse_parcel_file
+from app.utils.geojson_normalizer import enrich_geometry_row, normalize_geojson
 
 router = APIRouter(prefix="/compat", tags=["Frontend Compatibility"])
 
@@ -456,6 +457,18 @@ def add_defaults(table_name: str, row: Dict[str, Any], user_id: Optional[str]) -
     if table_name == "admin_users":
         row.setdefault("admin_role", "company_admin")
         row.setdefault("is_active", True)
+    if table_name in {"parcels", "aerial_analyses", "analysis_sessions"}:
+        try:
+            if row.get("geometry") or row.get("geometry_geojson"):
+                row = enrich_geometry_row(row, "geometry")
+            for key in ("geojson", "result_geojson", "flight_geojson", "kml_geojson", "coverage_geojson", "analysis_geojson"):
+                if row.get(key):
+                    normalized = normalize_geojson(row.get(key))
+                    if normalized.get("feature_count", 0) > 0:
+                        row[key] = normalized["geometry"]
+                        row[f"{key}_bounds"] = normalized.get("bounds")
+        except Exception:
+            pass
     return row
 
 
@@ -493,6 +506,21 @@ def apply_filters(rows: List[Dict[str, Any]], filters: List[Dict[str, Any]]) -> 
 def enrich(db: Dict[str, Any], table_name: str, row: Dict[str, Any]) -> Dict[str, Any]:
     r = dict(row)
     tables = db.get("tables", {})
+    if table_name in {"parcels", "aerial_analyses", "analysis_sessions"}:
+        # Always send render-safe WGS84 GeoJSON to the frontend. This keeps
+        # Mapbox as a pure renderer and prevents stale/projected SHP coordinates
+        # from hiding parcels, NDVI overlays, drone/helicopter geometries, etc.
+        try:
+            if r.get("geometry") or r.get("geometry_geojson"):
+                r = enrich_geometry_row(r, "geometry")
+            for key in ("geojson", "result_geojson", "flight_geojson", "kml_geojson", "coverage_geojson", "analysis_geojson"):
+                if r.get(key):
+                    normalized = normalize_geojson(r.get(key))
+                    if normalized.get("feature_count", 0) > 0:
+                        r[key] = normalized["geometry"]
+                        r[f"{key}_bounds"] = normalized.get("bounds")
+        except Exception:
+            pass
     if table_name == "company_modules":
         r["platform_modules"] = next((m for m in tables.get("platform_modules", []) if m.get("id") == r.get("module_id")), None)
     if table_name == "field_notes" and r.get("parcel_id"):
@@ -856,12 +884,22 @@ async def upload_parcel_from_satellite(
             "id": str(uuid.uuid4()),
             "user_id": user["id"],
             "name": name.strip(),
-            "area": parsed["area"],
-            "geometry": parsed["geometry"],
+            "area": parsed.get("area") or 0,
+            "geometry": parsed.get("geometry"),
+            "geometry_geojson": parsed.get("geometry"),
+            "geometry_bounds": parsed.get("bounds"),
+            "bounds": parsed.get("bounds"),
+            "geometry_center": parsed.get("center"),
+            "center": parsed.get("center"),
+            "bbox": parsed.get("bbox"),
+            "geometry_source_crs": parsed.get("source_crs"),
+            "geometry_type": parsed.get("geometry_type"),
+            "geometry_feature_count": parsed.get("feature_count"),
             "file_url": public_url,
             "created_at": t,
             "updated_at": t,
         }
+        row = enrich_geometry_row(row, "geometry")
         with LOCK:
             db = read_db()
             table(db, "parcels").append(row)

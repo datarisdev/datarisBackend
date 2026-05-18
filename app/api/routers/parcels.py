@@ -9,6 +9,7 @@ from app.api.deps import get_current_user, get_db
 from app.models.user import User
 from app.utils.storage_parcels import delete_parcel_files, upload_parcel_file
 from app.utils.geometry import calculate_area_hectares, extract_area_from_properties_or_geometry, extract_main_properties
+from app.utils.geojson_normalizer import normalize_geojson
 
 import logging
 logging.basicConfig(level=logging.INFO)
@@ -35,17 +36,26 @@ def create_parcel(
         parcel_id=str(parcel_id),
     )'''
 
-    # 2️⃣ Parse geometry JSON
+    # Backend must normalize geometry before it reaches Mapbox. The frontend only
+    # renders WGS84 GeoJSON. This accepts FeatureCollection, Feature, Polygon or
+    # MultiPolygon JSON sent by legacy screens.
     geometry_dict = json.loads(geometry)
+    normalized = normalize_geojson(geometry_dict, keep_all_geometry_types=False)
+    if normalized.get("feature_count", 0) <= 0:
+        raise HTTPException(status_code=400, detail="La geometría no contiene polígonos válidos en coordenadas WGS84")
 
-    # 1️⃣ Try extracting from SHP properties
+    geometry_dict = normalized["geometry"]
+
     area_from_props = extract_area_from_properties_or_geometry(geometry_dict)
 
     if area_from_props:
         area = area_from_props
         logging.info(f"area from Shape_Area: {area} ha")
 
-    # 2️⃣ Fallback to geometry calculation
+    elif normalized.get("area"):
+        area = normalized["area"]
+        logging.info(f"area calculated by normalizer: {area} ha")
+
     elif not area or area <= 0:
         area = calculate_area_hectares(geometry_dict)
         logging.info(f"area calculated from geometry: {area} ha")
