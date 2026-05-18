@@ -24,7 +24,21 @@ DIGIFORMS_MODULE = {
     "description": "Formularios digitales de campo, captura offline, GPS, fotos y reportes desde DigiformsApp.",
     "icon": "FileText",
     "is_active": True,
+    "is_extension": True,
+    "is_requestable": True,
 }
+
+GRANIOT_MODULE = {
+    "id": "graniot",
+    "name": "Graniot",
+    "description": "Integración para capas satelitales, NDVI, fechas, estadísticas y sincronización de lotes desde Graniot.",
+    "icon": "Leaf",
+    "is_active": True,
+    "is_extension": True,
+    "is_requestable": True,
+}
+
+DEFAULT_EXTENSION_MODULES = [DIGIFORMS_MODULE, GRANIOT_MODULE]
 
 
 def require_user(authorization: Optional[str]) -> Dict[str, Any]:
@@ -88,17 +102,44 @@ def request_person_name(db: Dict[str, Any], user: Dict[str, Any]) -> str:
     return name or (user.get("user_metadata") or {}).get("first_name") or user.get("email") or "Usuario"
 
 
-def ensure_digiforms_module(db: Dict[str, Any]) -> Dict[str, Any]:
+def normalize_extension_id(value: Any) -> str:
+    return str(value or "").strip().lower().replace("_", "-").replace(" ", "-")
+
+
+def ensure_extension_catalog(db: Dict[str, Any]) -> List[Dict[str, Any]]:
     modules = table(db, "platform_modules")
-    module = next((m for m in modules if m.get("id") == DIGIFORMS_MODULE["id"]), None)
-    if module:
-        module.update({k: v for k, v in DIGIFORMS_MODULE.items() if k != "id"})
-        module.setdefault("created_at", now())
-        module["updated_at"] = now()
-        return module
-    created = {**DIGIFORMS_MODULE, "created_at": now(), "updated_at": now()}
-    modules.append(created)
-    return created
+    t = now()
+    for base in DEFAULT_EXTENSION_MODULES:
+        module = next((m for m in modules if normalize_extension_id(m.get("id") or m.get("name")) == base["id"]), None)
+        if module:
+            # No forzamos is_active si el admin ya la desactivó; solo completamos metadata.
+            module.setdefault("id", base["id"])
+            module.setdefault("name", base["name"])
+            module.setdefault("description", base["description"])
+            module.setdefault("icon", base["icon"])
+            module.setdefault("is_active", base["is_active"])
+            module["is_extension"] = True
+            module.setdefault("is_requestable", True)
+            module.setdefault("created_at", t)
+            module["updated_at"] = module.get("updated_at") or t
+        else:
+            modules.append({**base, "created_at": t, "updated_at": t})
+    return [m for m in modules if m.get("is_extension") or normalize_extension_id(m.get("id") or m.get("name")) in {"digiforms", "graniot"}]
+
+
+def ensure_digiforms_module(db: Dict[str, Any]) -> Dict[str, Any]:
+    return next((m for m in ensure_extension_catalog(db) if normalize_extension_id(m.get("id") or m.get("name")) == DIGIFORMS_MODULE["id"]), DIGIFORMS_MODULE)
+
+
+def extension_module_for(db: Dict[str, Any], extension_id: str) -> Optional[Dict[str, Any]]:
+    ensure_extension_catalog(db)
+    normalized = normalize_extension_id(extension_id)
+    return next((m for m in table(db, "platform_modules") if normalize_extension_id(m.get("id") or m.get("name")) == normalized), None)
+
+
+def safe_extension_name(db: Dict[str, Any], extension_id: str) -> str:
+    module = extension_module_for(db, extension_id)
+    return str((module or {}).get("name") or extension_id)
 
 
 def enrich_request(db: Dict[str, Any], row: Dict[str, Any]) -> Dict[str, Any]:
@@ -117,14 +158,15 @@ def enrich_request(db: Dict[str, Any], row: Dict[str, Any]) -> Dict[str, Any]:
     return item
 
 
-def extension_enabled_for(db: Dict[str, Any], company_id: Optional[str], user_id: Optional[str]) -> bool:
+def extension_enabled_for(db: Dict[str, Any], company_id: Optional[str], user_id: Optional[str], extension_id: str = DIGIFORMS_MODULE["id"]) -> bool:
+    extension_id = normalize_extension_id(extension_id)
     if not company_id and not user_id:
         return False
     company_enabled = bool(
         company_id
         and any(
             cm.get("company_id") == company_id
-            and cm.get("module_id") == DIGIFORMS_MODULE["id"]
+            and normalize_extension_id(cm.get("module_id")) == extension_id
             and cm.get("is_enabled", cm.get("is_active", False)) is not False
             and cm.get("is_active", cm.get("is_enabled", True)) is not False
             for cm in table(db, "company_modules")
@@ -134,7 +176,7 @@ def extension_enabled_for(db: Dict[str, Any], company_id: Optional[str], user_id
         user_id
         and any(
             um.get("user_id") == user_id
-            and um.get("module_id") == DIGIFORMS_MODULE["id"]
+            and normalize_extension_id(um.get("module_id")) == extension_id
             and um.get("is_enabled", um.get("is_active", False)) is not False
             and um.get("is_active", um.get("is_enabled", True)) is not False
             for um in table(db, "user_modules")
@@ -142,7 +184,7 @@ def extension_enabled_for(db: Dict[str, Any], company_id: Optional[str], user_id
     )
     approved_request_enabled = bool(
         any(
-            r.get("extension_id") == DIGIFORMS_MODULE["id"]
+            normalize_extension_id(r.get("extension_id")) == extension_id
             and r.get("status") in {"approved", "enabled"}
             and (
                 (user_id and r.get("requested_by_user_id") == user_id)
@@ -154,14 +196,15 @@ def extension_enabled_for(db: Dict[str, Any], company_id: Optional[str], user_id
     return company_enabled or user_enabled or approved_request_enabled
 
 
-def enable_extension_for(db: Dict[str, Any], company_id: Optional[str], user_id: Optional[str]) -> None:
-    ensure_digiforms_module(db)
+def enable_extension_for(db: Dict[str, Any], company_id: Optional[str], user_id: Optional[str], extension_id: str = DIGIFORMS_MODULE["id"]) -> None:
+    ensure_extension_catalog(db)
+    extension_id = normalize_extension_id(extension_id)
     t = now()
-    if company_id and not any(cm.get("company_id") == company_id and cm.get("module_id") == DIGIFORMS_MODULE["id"] for cm in table(db, "company_modules")):
+    if company_id and not any(cm.get("company_id") == company_id and normalize_extension_id(cm.get("module_id")) == extension_id for cm in table(db, "company_modules")):
         table(db, "company_modules").append({
             "id": str(uuid.uuid4()),
             "company_id": company_id,
-            "module_id": DIGIFORMS_MODULE["id"],
+            "module_id": extension_id,
             "is_enabled": True,
             "is_active": True,
             "created_at": t,
@@ -169,18 +212,18 @@ def enable_extension_for(db: Dict[str, Any], company_id: Optional[str], user_id:
         })
     elif company_id:
         for cm in table(db, "company_modules"):
-            if cm.get("company_id") == company_id and cm.get("module_id") == DIGIFORMS_MODULE["id"]:
+            if cm.get("company_id") == company_id and normalize_extension_id(cm.get("module_id")) == extension_id:
                 cm["is_enabled"] = True
                 cm["is_active"] = True
                 cm["updated_at"] = t
 
-    if user_id and not any(um.get("user_id") == user_id and um.get("module_id") == DIGIFORMS_MODULE["id"] for um in table(db, "user_modules")):
+    if user_id and not any(um.get("user_id") == user_id and normalize_extension_id(um.get("module_id")) == extension_id for um in table(db, "user_modules")):
         admin = admin_record_for(db, user_id)
         table(db, "user_modules").append({
             "id": str(uuid.uuid4()),
             "user_id": user_id,
             "admin_user_id": admin.get("id") if admin else None,
-            "module_id": DIGIFORMS_MODULE["id"],
+            "module_id": extension_id,
             "is_enabled": True,
             "is_active": True,
             "created_at": t,
@@ -188,7 +231,7 @@ def enable_extension_for(db: Dict[str, Any], company_id: Optional[str], user_id:
         })
     elif user_id:
         for um in table(db, "user_modules"):
-            if um.get("user_id") == user_id and um.get("module_id") == DIGIFORMS_MODULE["id"]:
+            if um.get("user_id") == user_id and normalize_extension_id(um.get("module_id")) == extension_id:
                 um["is_enabled"] = True
                 um["is_active"] = True
                 um["updated_at"] = t
@@ -201,6 +244,114 @@ def request_visibility_filter(db: Dict[str, Any], user: Dict[str, Any], rows: Li
     if admin and admin.get("admin_role") == "company_admin":
         return [r for r in rows if r.get("company_id") == admin.get("company_id")]
     return [r for r in rows if r.get("requested_by_user_id") == user.get("id")]
+
+
+@router.get("/catalog")
+def list_extensions_catalog(authorization: Optional[str] = Header(default=None)):
+    # Requiere sesión para que el catálogo pueda incluir estado del usuario.
+    user = require_user(authorization)
+    with LOCK:
+        db = read_db()
+        rows = ensure_extension_catalog(db)
+        company_id = company_for_user(db, user["id"])
+        result = []
+        for row in rows:
+            extension_id = normalize_extension_id(row.get("id") or row.get("name"))
+            result.append({
+                "id": extension_id,
+                "name": row.get("name") or extension_id,
+                "description": row.get("description"),
+                "icon": row.get("icon"),
+                "is_active": row.get("is_active", True) is not False,
+                "is_requestable": row.get("is_requestable", True) is not False,
+                "enabled": extension_enabled_for(db, company_id, user["id"], extension_id),
+                "created_at": row.get("created_at"),
+                "updated_at": row.get("updated_at"),
+            })
+        write_db(db)
+    return {"data": result, "error": None, "count": len(result)}
+
+
+@router.post("/catalog")
+def create_extension_catalog_item(payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
+    user = require_user(authorization)
+    with LOCK:
+        db = read_db()
+        admin = admin_record_for(db, user.get("id"))
+        if not is_admin(admin):
+            raise HTTPException(status_code=403, detail="No tienes permisos para administrar extensiones")
+        extension_id = normalize_extension_id(payload.get("id") or payload.get("name"))
+        if not extension_id:
+            raise HTTPException(status_code=400, detail="El id o nombre de la extensión es obligatorio")
+        ensure_extension_catalog(db)
+        modules = table(db, "platform_modules")
+        existing = next((m for m in modules if normalize_extension_id(m.get("id") or m.get("name")) == extension_id), None)
+        t = now()
+        item = {
+            "id": extension_id,
+            "name": str(payload.get("name") or extension_id).strip(),
+            "description": (payload.get("description") or "").strip() or None,
+            "icon": (payload.get("icon") or "Puzzle").strip(),
+            "is_active": payload.get("is_active", True) is not False,
+            "is_requestable": payload.get("is_requestable", True) is not False,
+            "is_extension": True,
+            "updated_at": t,
+        }
+        if existing:
+            existing.update(item)
+            existing.setdefault("created_at", t)
+            row = existing
+        else:
+            row = {**item, "created_at": t}
+            modules.append(row)
+        write_db(db)
+    return {"data": row, "error": None}
+
+
+@router.put("/catalog/{extension_id}")
+def update_extension_catalog_item(extension_id: str, payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
+    user = require_user(authorization)
+    with LOCK:
+        db = read_db()
+        admin = admin_record_for(db, user.get("id"))
+        if not is_admin(admin):
+            raise HTTPException(status_code=403, detail="No tienes permisos para administrar extensiones")
+        ensure_extension_catalog(db)
+        normalized = normalize_extension_id(extension_id)
+        row = next((m for m in table(db, "platform_modules") if normalize_extension_id(m.get("id") or m.get("name")) == normalized), None)
+        if not row:
+            raise HTTPException(status_code=404, detail="Extensión no encontrada")
+        for field in ["name", "description", "icon", "is_active", "is_requestable"]:
+            if field in payload:
+                row[field] = payload[field]
+        row["is_extension"] = True
+        row["updated_at"] = now()
+        write_db(db)
+    return {"data": row, "error": None}
+
+
+@router.get("/{extension_id}/status")
+def generic_extension_status(extension_id: str, authorization: Optional[str] = Header(default=None)):
+    user = require_user(authorization)
+    normalized = normalize_extension_id(extension_id)
+    with LOCK:
+        db = read_db()
+        module = extension_module_for(db, normalized)
+        if not module or module.get("is_active", True) is False:
+            return {"data": {"extension_id": normalized, "enabled": False, "status": "unavailable", "request": None}, "error": None}
+        company_id = company_for_user(db, user["id"])
+        rows = [
+            r for r in table(db, "extension_requests")
+            if normalize_extension_id(r.get("extension_id")) == normalized
+            and (
+                r.get("requested_by_user_id") == user["id"]
+                or (company_id and r.get("company_id") == company_id and r.get("status") in {"approved", "enabled"})
+            )
+        ]
+        rows.sort(key=lambda r: r.get("enabled_at") or r.get("updated_at") or r.get("created_at", ""), reverse=True)
+        latest = enrich_request(db, rows[0]) if rows else None
+        enabled = extension_enabled_for(db, company_id, user["id"], normalized)
+    return {"data": {"extension_id": normalized, "enabled": enabled, "status": "enabled" if enabled else ((latest or {}).get("status") or "not_requested"), "request": latest}, "error": None}
 
 
 @router.get("/digiforms/status")
@@ -254,18 +405,18 @@ def digiforms_status(authorization: Optional[str] = Header(default=None)):
 @router.post("/requests")
 def create_extension_request(payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
     user = require_user(authorization)
-    extension_id = str(payload.get("extension_id") or DIGIFORMS_MODULE["id"]).strip().lower()
-    if extension_id != DIGIFORMS_MODULE["id"]:
-        raise HTTPException(status_code=400, detail="Por ahora este flujo solo está habilitado para DigiformsApp")
+    extension_id = normalize_extension_id(payload.get("extension_id") or DIGIFORMS_MODULE["id"])
 
     with LOCK:
         db = read_db()
-        ensure_digiforms_module(db)
+        module = extension_module_for(db, extension_id)
+        if not module or module.get("is_active", True) is False or module.get("is_requestable", True) is False:
+            raise HTTPException(status_code=400, detail="Esta extensión no está disponible para solicitud")
         company_id = company_for_user(db, user["id"])
-        if extension_enabled_for(db, company_id, user["id"]):
-            enable_extension_for(db, company_id, user["id"])
+        if extension_enabled_for(db, company_id, user["id"], extension_id):
+            enable_extension_for(db, company_id, user["id"], extension_id)
             write_db(db)
-            return {"data": {"already_enabled": True, "message": "DigiformsApp ya está habilitada para tu cuenta."}, "error": None}
+            return {"data": {"already_enabled": True, "message": f"{safe_extension_name(db, extension_id)} ya está habilitada para tu cuenta."}, "error": None}
 
         existing_open = next(
             (
@@ -285,7 +436,7 @@ def create_extension_request(payload: Dict[str, Any] = Body(default_factory=dict
         row = {
             "id": str(uuid.uuid4()),
             "extension_id": extension_id,
-            "extension_name": "DigiformsApp",
+            "extension_name": safe_extension_name(db, extension_id),
             "status": "pending",
             "request_type": request_type,
             "has_existing_account": bool(payload.get("has_existing_account")),
@@ -296,7 +447,7 @@ def create_extension_request(payload: Dict[str, Any] = Body(default_factory=dict
             "requested_by_user_id": user["id"],
             "requester_email": user.get("email"),
             "requester_name": request_person_name(db, user),
-            "client_message": "Recibimos tu solicitud para activar DigiformsApp. El equipo de Dataris verificará la cuenta, permisos y compatibilidad antes de habilitarla.",
+            "client_message": f"Recibimos tu solicitud para activar {safe_extension_name(db, extension_id)}. El equipo de Dataris verificará la cuenta, permisos y compatibilidad antes de habilitarla.",
             "admin_notes": None,
             "reviewed_by_user_id": None,
             "reviewed_at": None,
@@ -314,7 +465,8 @@ def list_extension_requests(status: Optional[str] = None, authorization: Optiona
     user = require_user(authorization)
     with LOCK:
         db = read_db()
-        rows = [r for r in table(db, "extension_requests") if r.get("extension_id") == DIGIFORMS_MODULE["id"]]
+        ensure_extension_catalog(db)
+        rows = [r for r in table(db, "extension_requests")]
         rows = request_visibility_filter(db, user, rows)
         if status and status != "all":
             rows = [r for r in rows if r.get("status") == status]
@@ -345,7 +497,7 @@ def reject_extension_request(request_id: str, payload: Dict[str, Any] = Body(def
         row.update({
             "status": "rejected",
             "admin_notes": (payload.get("admin_notes") or payload.get("reason") or "").strip() or "Solicitud rechazada por administración.",
-            "client_message": (payload.get("client_message") or "Tu solicitud de DigiformsApp fue revisada, pero aún no puede habilitarse. El equipo de Dataris te contactará con más información.").strip(),
+            "client_message": (payload.get("client_message") or "Tu solicitud de extensión fue revisada, pero aún no puede habilitarse. El equipo de Dataris te contactará con más información.").strip(),
             "reviewed_by_user_id": user["id"],
             "reviewed_at": t,
             "updated_at": t,
@@ -367,6 +519,21 @@ async def approve_extension_request(request_id: str, payload: Dict[str, Any] = B
             raise HTTPException(status_code=404, detail="Solicitud no encontrada")
         if admin.get("admin_role") == "company_admin" and row.get("company_id") != admin.get("company_id"):
             raise HTTPException(status_code=403, detail="No puedes habilitar solicitudes de otra empresa")
+        extension_id = normalize_extension_id(row.get("extension_id") or DIGIFORMS_MODULE["id"])
+        if extension_id != DIGIFORMS_MODULE["id"]:
+            t = now()
+            enable_extension_for(db, row.get("company_id"), row.get("requested_by_user_id"), extension_id)
+            row.update({
+                "status": "approved",
+                "admin_notes": (payload.get("admin_notes") or f"Extensión {safe_extension_name(db, extension_id)} revisada y habilitada desde el panel de administración.").strip(),
+                "client_message": f"Tu extensión {safe_extension_name(db, extension_id)} ya fue habilitada. Ahora puedes utilizarla desde Dataris.",
+                "reviewed_by_user_id": user["id"],
+                "reviewed_at": t,
+                "enabled_at": t,
+                "updated_at": t,
+            })
+            write_db(db)
+            return {"data": enrich_request(db, row), "error": None}
         row["status"] = "in_review"
         row["updated_at"] = now()
         write_db(db)
@@ -425,7 +592,7 @@ async def approve_extension_request(request_id: str, payload: Dict[str, Any] = B
     with LOCK:
         db = read_db()
         row = next((r for r in table(db, "extension_requests") if r.get("id") == request_id), row)
-        enable_extension_for(db, row.get("company_id"), row.get("requested_by_user_id"))
+        enable_extension_for(db, row.get("company_id"), row.get("requested_by_user_id"), DIGIFORMS_MODULE["id"])
         t = now()
         row.update({
             "status": "approved",
