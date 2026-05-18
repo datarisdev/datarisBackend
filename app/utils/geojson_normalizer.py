@@ -1,367 +1,336 @@
 from __future__ import annotations
 
 import json
-import math
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from pyproj import CRS, Transformer
-from shapely.geometry import GeometryCollection, MultiLineString, MultiPoint, MultiPolygon, mapping, shape as shapely_shape
+from shapely.geometry import mapping, shape
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import transform, unary_union
 
-try:  # Shapely 2.x
-    from shapely.validation import make_valid as shapely_make_valid
-except Exception:  # pragma: no cover
-    shapely_make_valid = None
-
-WGS84 = CRS.from_epsg(4326)
 MAX_MERCATOR_LATITUDE = 85.051129
-MIN_BOUNDS_SPAN = 1e-8
-
-# CRSs commonly seen in Central America / agricultural exports. The list is only
-# used when a SHP/GeoJSON arrives without .prj metadata and coordinates are not
-# already valid longitude/latitude values.
-FALLBACK_SOURCE_CRS = [
-    "EPSG:4326",
-    "EPSG:3857",
-    "EPSG:32614", "EPSG:32615", "EPSG:32616", "EPSG:32617",
-    "EPSG:32714", "EPSG:32715", "EPSG:32716", "EPSG:32717",
-    "EPSG:5367",  # Guatemala Transverse Mercator, when pyproj knows it.
-]
-
-GeometryMetrics = Dict[str, Any]
+MIN_RING_POINTS = 3
 
 
-def _json_safe(value: Any) -> Any:
-    if value is None or isinstance(value, (str, bool, int, float)):
-        if isinstance(value, float) and not math.isfinite(value):
-            return None
-        return value
-    if hasattr(value, "isoformat"):
-        try:
-            return value.isoformat()
-        except Exception:
-            return str(value)
+def _jsonable(value: Any) -> Any:
     if isinstance(value, dict):
-        return {str(k): _json_safe(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [_json_safe(v) for v in value]
-    return str(value)
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, tuple):
+        return [_jsonable(v) for v in value]
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return value
 
 
-def _parse_json_if_needed(value: Any) -> Any:
+def parse_json_if_needed(value: Any) -> Any:
     current = value
     for _ in range(3):
         if not isinstance(current, str):
             return current
-        trimmed = current.strip()
-        if not trimmed:
+        text = current.strip()
+        if not text:
             return None
-        if trimmed[0] not in "[{":
-            return current
         try:
-            current = json.loads(trimmed)
+            current = json.loads(text)
         except Exception:
             return current
     return current
 
 
-def _iter_feature_geometries(value: Any) -> Iterable[Tuple[Dict[str, Any], Dict[str, Any]]]:
-    parsed = _parse_json_if_needed(value)
-    if not parsed:
-        return
-
-    if isinstance(parsed, dict):
-        geom_type = parsed.get("type")
-        if geom_type == "FeatureCollection":
-            for feature in parsed.get("features") or []:
-                if isinstance(feature, dict) and feature.get("geometry"):
-                    yield feature.get("geometry"), _json_safe(feature.get("properties") or {})
-            return
-        if geom_type == "Feature":
-            if parsed.get("geometry"):
-                yield parsed.get("geometry"), _json_safe(parsed.get("properties") or {})
-            return
-        if geom_type in {"Point", "MultiPoint", "LineString", "MultiLineString", "Polygon", "MultiPolygon", "GeometryCollection"}:
-            yield parsed, {}
-            return
-
-        # Common wrappers found in compatibility APIs and cached rows.
-        for key in ("geometry", "geojson", "geometry_geojson", "data", "parcel"):
-            child = parsed.get(key)
-            if child:
-                yield from _iter_feature_geometries(child)
-                return
-
-    if isinstance(parsed, list):
-        # Raw ring / list of rings fallback.
-        if parsed and isinstance(parsed[0], (list, tuple)):
-            yield {"type": "Polygon", "coordinates": [parsed]}, {}
-
-
-def _repair_geometry(geom: BaseGeometry) -> BaseGeometry:
-    if geom.is_empty:
-        return geom
-    if geom.is_valid:
-        return geom
+def _is_num(value: Any) -> bool:
     try:
-        if shapely_make_valid:
-            fixed = shapely_make_valid(geom)
-            if fixed and not fixed.is_empty:
-                return fixed
+        return value is not None and float(value) == float(value)
     except Exception:
-        pass
-    try:
-        fixed = geom.buffer(0)
-        if fixed and not fixed.is_empty:
-            return fixed
-    except Exception:
-        pass
-    return geom
+        return False
 
 
-def _transformer(src: CRS, dst: CRS = WGS84) -> Optional[Transformer]:
+def _num(value: Any) -> Optional[float]:
     try:
-        if src == dst:
+        if value is None:
             return None
-        return Transformer.from_crs(src, dst, always_xy=True)
+        numeric = float(value)
+        if numeric != numeric:
+            return None
+        return numeric
     except Exception:
         return None
 
 
-def _to_wgs84(geom: BaseGeometry, src: CRS) -> BaseGeometry:
-    tr = _transformer(src, WGS84)
-    if tr is None:
-        return geom
-    return transform(tr.transform, geom)
+def _norm_lng(value: float) -> float:
+    return ((value + 180) % 360 + 360) % 360 - 180
 
 
-def _valid_wgs_bounds(geom: BaseGeometry) -> bool:
-    if not geom or geom.is_empty:
-        return False
-    try:
-        west, south, east, north = geom.bounds
-    except Exception:
-        return False
-    values = [west, south, east, north]
-    if not all(math.isfinite(float(v)) for v in values):
-        return False
-    if west < -180 or east > 180:
-        return False
-    if south < -MAX_MERCATOR_LATITUDE or north > MAX_MERCATOR_LATITUDE:
-        return False
-    if abs(east - west) < MIN_BOUNDS_SPAN or abs(north - south) < MIN_BOUNDS_SPAN:
-        return False
-    return True
+def _valid_lat(value: float) -> bool:
+    return -MAX_MERCATOR_LATITUDE <= value <= MAX_MERCATOR_LATITUDE
 
 
-def _score_wgs_geom(geom: BaseGeometry, crs_name: str) -> float:
-    if not _valid_wgs_bounds(geom):
-        return -1e9
-    west, south, east, north = geom.bounds
-    centroid = geom.centroid
-    lng = float(centroid.x)
-    lat = float(centroid.y)
-    score = 20.0
-
-    # Strong preference for Guatemala / Central America data because the product
-    # currently works there, but still accepts valid data elsewhere.
-    if -93.5 <= lng <= -88.0 and 13.0 <= lat <= 18.5:
-        score += 100.0
-    elif -105.0 <= lng <= -75.0 and 3.0 <= lat <= 25.0:
-        score += 70.0
-    elif -180 <= lng <= 180 and -60 <= lat <= 75:
-        score += 30.0
-
-    # Prefer explicit lon/lat when coordinates already look sane.
-    if crs_name.upper().endswith("4326"):
-        score += 15.0
-
-    # Penalize enormous extents for a parcel/flight geometry.
-    span = max(abs(east - west), abs(north - south))
-    if span > 15:
-        score -= 40.0
-    elif span < 2:
-        score += 10.0
-    return score
+def _valid_lng(value: float) -> bool:
+    return -180 <= value <= 180
 
 
-def _coerce_crs(value: Any) -> Optional[CRS]:
-    if not value:
-        return None
-    try:
-        return CRS.from_user_input(value)
-    except Exception:
-        return None
-
-
-def _infer_source_crs(raw_geoms: List[BaseGeometry], source_crs: Any = None) -> CRS:
-    explicit = _coerce_crs(source_crs)
-    if explicit:
-        return explicit
-
-    union = unary_union(raw_geoms) if len(raw_geoms) > 1 else raw_geoms[0]
-    best: Tuple[float, CRS] | None = None
-    for candidate in FALLBACK_SOURCE_CRS:
-        crs = _coerce_crs(candidate)
-        if not crs:
+def _coord_order(points: Iterable[List[Any]], fallback: str = "lnglat") -> str:
+    lnglat = 0
+    latlng = 0
+    for point in points:
+        if not isinstance(point, (list, tuple)) or len(point) < 2:
             continue
-        try:
-            wgs = _repair_geometry(_to_wgs84(union, crs))
-            score = _score_wgs_geom(wgs, candidate)
-            if best is None or score > best[0]:
-                best = (score, crs)
-        except Exception:
+        a = _num(point[0])
+        b = _num(point[1])
+        if a is None or b is None:
             continue
+        if _valid_lng(a) and _valid_lat(b):
+            lnglat += 1
+        if _valid_lat(a) and _valid_lng(b):
+            latlng += 1
+        if not _valid_lat(a) and _valid_lng(a) and _valid_lat(b):
+            lnglat += 8
+        if not _valid_lat(b) and _valid_lng(b) and _valid_lat(a):
+            latlng += 8
+    if lnglat > latlng:
+        return "lnglat"
+    if latlng > lnglat:
+        return "latlng"
+    return fallback
 
-    if best and best[0] > -1e8:
-        return best[1]
-    return WGS84
+
+def _normalize_point(point: Any, order: str = "lnglat") -> Optional[List[float]]:
+    if not isinstance(point, (list, tuple)) or len(point) < 2:
+        return None
+    first = _num(point[0])
+    second = _num(point[1])
+    if first is None or second is None:
+        return None
+    lng = first if order == "lnglat" else second
+    lat = second if order == "lnglat" else first
+    if not _valid_lng(lng) or not _valid_lat(lat):
+        return None
+    return [_norm_lng(lng), lat]
 
 
-def _extract_polygonal(geom: BaseGeometry) -> List[BaseGeometry]:
-    if geom.is_empty:
+def _normalize_ring(ring: Any, fallback_order: str = "lnglat") -> List[List[float]]:
+    if not isinstance(ring, list):
         return []
-    if geom.geom_type in {"Polygon", "MultiPolygon"}:
-        return [geom]
-    if geom.geom_type == "GeometryCollection":
-        result: List[BaseGeometry] = []
-        for child in getattr(geom, "geoms", []):
-            result.extend(_extract_polygonal(child))
-        return result
-    return []
+    raw_points = [p for p in ring if isinstance(p, (list, tuple)) and len(p) >= 2 and _is_num(p[0]) and _is_num(p[1])]
+    if len(raw_points) < MIN_RING_POINTS:
+        return []
+    order = _coord_order(raw_points, fallback_order)
+    points = [p for p in (_normalize_point(point, order) for point in raw_points) if p]
+    if len(points) < MIN_RING_POINTS:
+        return []
+    if points[0] != points[-1]:
+        points.append(points[0])
+    return points
 
 
-def _area_hectares(geoms_wgs: List[BaseGeometry]) -> float:
-    polygons: List[BaseGeometry] = []
-    for geom in geoms_wgs:
-        polygons.extend(_extract_polygonal(geom))
-    if not polygons:
-        return 0.0
-    union = unary_union(polygons) if len(polygons) > 1 else polygons[0]
-    if union.is_empty:
-        return 0.0
-    c = union.centroid
-    zone = int((float(c.x) + 180) // 6) + 1
-    epsg = 32600 + zone if float(c.y) >= 0 else 32700 + zone
-    try:
-        metric = CRS.from_epsg(epsg)
-        tr = Transformer.from_crs(WGS84, metric, always_xy=True)
-        projected = transform(tr.transform, union)
-        return round(float(projected.area) / 10000.0, 4)
-    except Exception:
-        return 0.0
-
-
-def _bounds_and_center(geoms: List[BaseGeometry]) -> Tuple[Optional[Dict[str, float]], Optional[Dict[str, float]], Optional[List[float]]]:
-    valid = [g for g in geoms if g and not g.is_empty]
-    if not valid:
-        return None, None, None
-    union = unary_union(valid) if len(valid) > 1 else valid[0]
-    if union.is_empty:
-        return None, None, None
-    west, south, east, north = [float(v) for v in union.bounds]
-    if not all(math.isfinite(v) for v in [west, south, east, north]):
-        return None, None, None
-    centroid = union.centroid
-    center = {"lat": float(centroid.y), "lng": float(centroid.x)}
-    bounds = {"south": south, "north": north, "west": west, "east": east}
-    bbox = [west, south, east, north]
-    return bounds, center, bbox
-
-
-def normalize_geojson(value: Any, source_crs: Any = None, keep_all_geometry_types: bool = True) -> GeometryMetrics:
-    """
-    Normalizes SHP/KML/GeoJSON-like geometry to a safe WGS84 GeoJSON FeatureCollection.
-
-    Output geometry always uses GeoJSON order [lng, lat]. The frontend should only
-    render this normalized geometry; area, bounds and center are calculated here.
-    """
-    raw_features = list(_iter_feature_geometries(value))
-    raw_geoms: List[BaseGeometry] = []
-    props_by_index: List[Dict[str, Any]] = []
-
-    for geom_json, props in raw_features:
+def _normalize_geometry(geometry: Any) -> Optional[Dict[str, Any]]:
+    geom = parse_json_if_needed(geometry)
+    if not isinstance(geom, dict):
+        return None
+    gtype = geom.get("type")
+    if gtype == "Feature":
+        return _normalize_geometry(geom.get("geometry"))
+    if gtype == "FeatureCollection":
+        return None
+    if gtype == "Polygon":
+        rings = [_normalize_ring(ring, "lnglat") for ring in (geom.get("coordinates") or [])]
+        rings = [ring for ring in rings if len(ring) >= MIN_RING_POINTS + 1]
+        return {"type": "Polygon", "coordinates": rings} if rings else None
+    if gtype == "MultiPolygon":
+        polygons = []
+        for polygon in geom.get("coordinates") or []:
+            rings = [_normalize_ring(ring, "lnglat") for ring in (polygon or [])]
+            rings = [ring for ring in rings if len(ring) >= MIN_RING_POINTS + 1]
+            if rings:
+                polygons.append(rings)
+        return {"type": "MultiPolygon", "coordinates": polygons} if polygons else None
+    if gtype in {"LineString", "MultiLineString", "Point", "MultiPoint"}:
+        # For flight tracks/points: keep valid GeoJSON order and let the frontend render it.
         try:
-            geom = _repair_geometry(shapely_shape(geom_json))
+            geom_obj = shape(geom)
+            if geom_obj.is_empty:
+                return None
+            return mapping(geom_obj)
         except Exception:
-            continue
-        if geom.is_empty:
-            continue
-        raw_geoms.append(geom)
-        props_by_index.append(_json_safe(props or {}))
+            return geom
+    if gtype == "GeometryCollection":
+        geoms = [_normalize_geometry(child) for child in (geom.get("geometries") or [])]
+        geoms = [child for child in geoms if child]
+        return {"type": "GeometryCollection", "geometries": geoms} if geoms else None
+    return None
 
-    if not raw_geoms:
-        return {
-            "geometry": {"type": "FeatureCollection", "features": []},
-            "area": 0.0,
-            "bounds": None,
-            "center": None,
-            "bbox": None,
-            "feature_count": 0,
-            "source_crs": None,
-            "geometry_type": None,
-        }
 
-    src = _infer_source_crs(raw_geoms, source_crs)
-    normalized_features: List[Dict[str, Any]] = []
-    normalized_geoms: List[BaseGeometry] = []
+def normalize_geojson(value: Any) -> Optional[Dict[str, Any]]:
+    raw = parse_json_if_needed(value)
+    if not raw:
+        return None
 
-    for geom, props in zip(raw_geoms, props_by_index):
-        try:
-            geom_wgs = _repair_geometry(_to_wgs84(geom, src))
-        except Exception:
-            continue
-        if geom_wgs.is_empty or not _valid_wgs_bounds(geom_wgs):
-            continue
-        if not keep_all_geometry_types and geom_wgs.geom_type not in {"Polygon", "MultiPolygon"}:
-            continue
-        normalized_geoms.append(geom_wgs)
-        normalized_features.append({
-            "type": "Feature",
-            "properties": props,
-            "geometry": mapping(geom_wgs),
-        })
+    if isinstance(raw, dict) and raw.get("geometry_geojson"):
+        return normalize_geojson(raw.get("geometry_geojson"))
+    if isinstance(raw, dict) and raw.get("geojson"):
+        return normalize_geojson(raw.get("geojson"))
 
-    bounds, center, bbox = _bounds_and_center(normalized_geoms)
-    geometry_type = None
-    if normalized_geoms:
-        types = sorted({g.geom_type for g in normalized_geoms})
-        geometry_type = types[0] if len(types) == 1 else "Mixed"
+    features: List[Dict[str, Any]] = []
+    if isinstance(raw, dict) and raw.get("type") == "FeatureCollection":
+        for feature in raw.get("features") or []:
+            if not isinstance(feature, dict):
+                continue
+            geom = _normalize_geometry(feature.get("geometry"))
+            if not geom:
+                continue
+            features.append({
+                "type": "Feature",
+                "properties": _jsonable(feature.get("properties") or {}),
+                "geometry": geom,
+            })
+    elif isinstance(raw, dict) and raw.get("type") == "Feature":
+        geom = _normalize_geometry(raw.get("geometry"))
+        if geom:
+            features.append({"type": "Feature", "properties": _jsonable(raw.get("properties") or {}), "geometry": geom})
+    elif isinstance(raw, dict) and raw.get("type"):
+        geom = _normalize_geometry(raw)
+        if geom:
+            features.append({"type": "Feature", "properties": {}, "geometry": geom})
+    elif isinstance(raw, dict) and raw.get("geometry"):
+        return normalize_geojson(raw.get("geometry"))
 
+    if not features:
+        return None
+    return {"type": "FeatureCollection", "features": features}
+
+
+def _iter_coords(value: Any):
+    if isinstance(value, (list, tuple)) and len(value) >= 2 and _is_num(value[0]) and _is_num(value[1]):
+        lng = _num(value[0])
+        lat = _num(value[1])
+        if lng is not None and lat is not None and _valid_lng(lng) and _valid_lat(lat):
+            yield lng, lat
+        return
+    if isinstance(value, list):
+        for item in value:
+            yield from _iter_coords(item)
+
+
+def geometry_bounds(feature_collection: Optional[Dict[str, Any]]) -> Optional[Dict[str, float]]:
+    if not feature_collection:
+        return None
+    coords: List[Tuple[float, float]] = []
+    for feature in feature_collection.get("features") or []:
+        coords.extend(list(_iter_coords((feature.get("geometry") or {}).get("coordinates"))))
+    if not coords:
+        return None
+    lngs = [c[0] for c in coords]
+    lats = [c[1] for c in coords]
+    return {"south": min(lats), "north": max(lats), "west": min(lngs), "east": max(lngs)}
+
+
+def geometry_center(bounds: Optional[Dict[str, float]]) -> Optional[Dict[str, float]]:
+    if not bounds:
+        return None
     return {
-        "geometry": {"type": "FeatureCollection", "features": normalized_features},
-        "area": _area_hectares(normalized_geoms),
-        "bounds": bounds,
-        "center": center,
-        "bbox": bbox,
-        "feature_count": len(normalized_features),
-        "source_crs": src.to_string() if src else None,
-        "geometry_type": geometry_type,
+        "lat": (float(bounds["south"]) + float(bounds["north"])) / 2,
+        "lng": (float(bounds["west"]) + float(bounds["east"])) / 2,
     }
 
 
-def enrich_geometry_row(row: Dict[str, Any], geometry_key: str = "geometry") -> Dict[str, Any]:
-    result = dict(row or {})
-    geometry = result.get("geometry_geojson") or result.get(geometry_key)
-    if not geometry:
-        return result
-    try:
-        normalized = normalize_geojson(geometry)
-    except Exception:
-        return result
-    if normalized.get("feature_count", 0) <= 0:
-        return result
+def _metric_crs_for_geom(geom: BaseGeometry) -> CRS:
+    c = geom.centroid
+    zone = int((float(c.x) + 180) // 6) + 1
+    epsg = 32600 + zone if float(c.y) >= 0 else 32700 + zone
+    return CRS.from_epsg(epsg)
 
-    result[geometry_key] = normalized["geometry"]
-    result["geometry_geojson"] = normalized["geometry"]
-    result["geometry_bounds"] = normalized.get("bounds")
-    result["bounds"] = normalized.get("bounds") or result.get("bounds")
-    result["geometry_center"] = normalized.get("center")
-    result["center"] = normalized.get("center") or result.get("center")
-    result["bbox"] = normalized.get("bbox")
-    result["geometry_type"] = normalized.get("geometry_type")
-    result["geometry_feature_count"] = normalized.get("feature_count")
-    if not result.get("area") and normalized.get("area"):
-        result["area"] = normalized["area"]
-    return result
+
+def geometry_area_ha(feature_collection: Optional[Dict[str, Any]]) -> Optional[float]:
+    if not feature_collection:
+        return None
+    geoms = []
+    for feature in feature_collection.get("features") or []:
+        try:
+            geom = shape(feature.get("geometry"))
+            if geom.is_empty:
+                continue
+            if geom.geom_type in {"Polygon", "MultiPolygon"}:
+                geoms.append(geom)
+        except Exception:
+            continue
+    if not geoms:
+        return None
+    union = unary_union(geoms)
+    metric = _metric_crs_for_geom(union)
+    transformer = Transformer.from_crs(CRS.from_epsg(4326), metric, always_xy=True)
+    metric_geom = transform(transformer.transform, union)
+    return round(float(metric_geom.area / 10000.0), 4)
+
+
+def summarize_geojson(value: Any) -> Dict[str, Any]:
+    fc = normalize_geojson(value)
+    bounds = geometry_bounds(fc)
+    center = geometry_center(bounds)
+    area = geometry_area_ha(fc)
+    first_type = None
+    if fc and fc.get("features"):
+        first_type = ((fc["features"][0].get("geometry") or {}).get("type"))
+    return {
+        "geometry_geojson": fc,
+        "geometry_bounds": bounds,
+        "geometry_center": center,
+        "bbox": [bounds["west"], bounds["south"], bounds["east"], bounds["north"]] if bounds else None,
+        "geometry_type": first_type,
+        "geometry_feature_count": len(fc.get("features") or []) if fc else 0,
+        "area": area,
+    }
+
+
+def normalize_record_geometries(table_name: str, row: Dict[str, Any]) -> Dict[str, Any]:
+    row = dict(row or {})
+
+    if table_name == "parcels":
+        source = row.get("geometry_geojson") or row.get("geometry") or row.get("geojson")
+        summary = summarize_geojson(source)
+        if summary.get("geometry_geojson"):
+            row["geometry"] = summary["geometry_geojson"]
+            row["geometry_geojson"] = summary["geometry_geojson"]
+            row["geometry_bounds"] = summary["geometry_bounds"]
+            row["bounds"] = summary["geometry_bounds"]
+            row["geometry_center"] = summary["geometry_center"]
+            row["center"] = summary["geometry_center"]
+            row["bbox"] = summary["bbox"]
+            row["geometry_type"] = summary["geometry_type"]
+            row["geometry_feature_count"] = summary["geometry_feature_count"]
+            if not row.get("area") and summary.get("area") is not None:
+                row["area"] = summary["area"]
+        return row
+
+    def normalize_nested(value: Any) -> Any:
+        if isinstance(value, list):
+            return [normalize_nested(item) for item in value]
+        if isinstance(value, dict):
+            result = {k: normalize_nested(v) for k, v in value.items()}
+            for key in ("geometry", "geojson", "coveredGeom", "uncoveredGeom", "overlapGeom", "parcelas", "sprOn", "sprOff", "sprOnTracks", "sprOffTracks"):
+                if key in result:
+                    fc = normalize_geojson(result[key])
+                    if fc:
+                        result[key] = fc
+            return result
+        return value
+
+    if table_name in {"aerial_analyses", "analysis_sessions", "analysis_data_points"}:
+        for key in ("geometry", "geojson", "parcel_geometries", "parcel_results", "source_geojson", "result_geojson"):
+            if key in row:
+                row[key] = normalize_nested(row[key])
+        source = row.get("geometry") or row.get("geojson") or row.get("source_geojson")
+        summary = summarize_geojson(source)
+        if summary.get("geometry_geojson"):
+            row.setdefault("geometry_geojson", summary["geometry_geojson"])
+            row.setdefault("geometry_bounds", summary["geometry_bounds"])
+            row.setdefault("geometry_center", summary["geometry_center"])
+            row.setdefault("bbox", summary["bbox"])
+            row.setdefault("geometry_type", summary["geometry_type"])
+            row.setdefault("geometry_feature_count", summary["geometry_feature_count"])
+        return row
+
+    return row
