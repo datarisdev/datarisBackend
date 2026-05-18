@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from app.core.config import settings
-from app.api.routers import auth, users, profiles, user_roles, admin_user, parcels, satellite_image, platform_modules, field_notes, parcel_crops, weather, compat, compat_extensions, graniot
+from app.api.routers import auth, users, profiles, user_roles, admin_user, parcels, satellite_image, platform_modules, field_notes, parcel_crops, weather, compat, compat_extensions, graniot, me_access
 from app.models.base import Base
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
@@ -37,6 +37,7 @@ app.include_router(weather.router, prefix=settings.API_V1_STR)
 app.include_router(compat.router, prefix=settings.API_V1_STR)
 app.include_router(compat_extensions.router, prefix=settings.API_V1_STR)
 app.include_router(graniot.router, prefix=settings.API_V1_STR)
+app.include_router(me_access.router, prefix=settings.API_V1_STR)
 
 @app.get("/health")
 def health():
