@@ -6,9 +6,13 @@ import hashlib
 import json
 import mimetypes
 import os
+import secrets
 import shutil
+import smtplib
+import string
 import uuid
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
 from pathlib import Path
 from threading import RLock
 from typing import Any, Dict, List, Optional
@@ -504,11 +508,18 @@ def enrich(db: Dict[str, Any], table_name: str, row: Dict[str, Any]) -> Dict[str
     if table_name == "admin_users" and r.get("user_id"):
         user = next((u for u in db.get("users", []) if u.get("id") == r.get("user_id")), None)
         profile = next((p for p in tables.get("profiles", []) if p.get("user_id") == r.get("user_id") or p.get("id") == r.get("user_id")), None)
+        company = next((c for c in tables.get("companies", []) if c.get("id") == r.get("company_id")), None)
         if user:
             r.setdefault("email", user.get("email"))
         if profile:
             r.setdefault("first_name", profile.get("first_name"))
             r.setdefault("last_name", profile.get("last_name"))
+        if company:
+            r.setdefault("companies", {
+                "name": company.get("name"),
+                "max_hectares": company.get("max_hectares"),
+                "used_hectares": company.get("used_hectares"),
+            })
     if table_name == "extension_requests":
         module = next((m for m in tables.get("platform_modules", []) if m.get("id") == r.get("extension_id")), None)
         company = next((c for c in tables.get("companies", []) if c.get("id") == r.get("company_id")), None)
@@ -650,6 +661,218 @@ def delete_auth_user(user_id: str):
             db["tables"][name] = [r for r in rows if r.get("user_id") != user_id and r.get("id") != user_id]
         write_db(db)
     return {"data": {"ok": True}, "error": None}
+
+
+def require_admin_context(authorization: Optional[str], db: Dict[str, Any]) -> Dict[str, Any]:
+    user = bearer_user(authorization)
+    if not user:
+        raise HTTPException(status_code=401, detail="No autenticado")
+    admin_row = next(
+        (
+            row
+            for row in table(db, "admin_users")
+            if row.get("user_id") == user.get("id") and row.get("is_active", True)
+        ),
+        None,
+    )
+    if not admin_row or admin_row.get("admin_role") not in {"superadmin", "company_admin"}:
+        raise HTTPException(status_code=403, detail="No autorizado para administrar usuarios")
+    return {"user": user, "admin": admin_row}
+
+
+def generate_temporary_password(length: int = 12) -> str:
+    alphabet = string.ascii_letters + string.digits
+    # Evita caracteres ambiguos para que el usuario pueda copiarla fácilmente.
+    alphabet = alphabet.replace("O", "").replace("0", "").replace("l", "").replace("I", "")
+    while True:
+        password = "".join(secrets.choice(alphabet) for _ in range(length))
+        if any(c.islower() for c in password) and any(c.isupper() for c in password) and any(c.isdigit() for c in password):
+            return password
+
+
+def send_temporary_password_email(email: str, password: str, first_name: Optional[str] = None) -> Dict[str, Any]:
+    host = os.getenv("SMTP_HOST", "").strip()
+    port = int(os.getenv("SMTP_PORT", "587") or "587")
+    username = os.getenv("SMTP_USERNAME", "").strip()
+    smtp_password = os.getenv("SMTP_PASSWORD", "").strip()
+    sender = os.getenv("SMTP_FROM_EMAIL", username or "").strip()
+    sender_name = os.getenv("SMTP_FROM_NAME", "Dataris").strip()
+    use_tls = os.getenv("SMTP_USE_TLS", "true").strip().lower() not in {"0", "false", "no"}
+    frontend_url = os.getenv("FRONTEND_URL", "https://app.dataris.es").rstrip("/")
+
+    if not host or not sender:
+        return {"sent": False, "reason": "SMTP no configurado"}
+
+    display_name = first_name or "usuario"
+    message = EmailMessage()
+    message["Subject"] = "Acceso temporal a Dataris"
+    message["From"] = f"{sender_name} <{sender}>" if sender_name else sender
+    message["To"] = email
+    message.set_content(
+        f"Hola {display_name},\n\n"
+        "Se creó tu acceso a Dataris.\n\n"
+        f"Correo: {email}\n"
+        f"Contraseña temporal: {password}\n\n"
+        f"Ingresa en: {frontend_url}/login\n\n"
+        "Por seguridad, cambia tu contraseña al ingresar por primera vez.\n\n"
+        "Equipo Dataris"
+    )
+
+    try:
+        with smtplib.SMTP(host, port, timeout=12) as smtp:
+            if use_tls:
+                smtp.starttls()
+            if username and smtp_password:
+                smtp.login(username, smtp_password)
+            smtp.send_message(message)
+        return {"sent": True, "reason": None}
+    except Exception as exc:
+        return {"sent": False, "reason": str(exc)}
+
+
+@router.post("/admin/users/manual")
+def create_manual_admin_user(payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
+    """Crea usuarios desde el panel admin con contraseña temporal generada por backend.
+
+    El frontend ya no crea usuarios con signUp directo. Este endpoint centraliza:
+    - generación de contraseña temporal,
+    - creación de user/profile/admin_user,
+    - asignación de módulos,
+    - actualización de hectáreas,
+    - envío opcional de correo SMTP.
+    """
+    with LOCK:
+        db = read_db()
+        ctx = require_admin_context(authorization, db)
+        current_admin = ctx["admin"]
+        is_super_admin = current_admin.get("admin_role") == "superadmin"
+
+        email = clean_email(payload.get("email"))
+        if any(str(u.get("email", "")).lower() == email for u in db.get("users", [])):
+            raise HTTPException(status_code=400, detail="Ya existe un usuario con ese correo")
+
+        company_id = payload.get("company_id") or current_admin.get("company_id")
+        if not is_super_admin and company_id != current_admin.get("company_id"):
+            raise HTTPException(status_code=403, detail="No puedes crear usuarios para otra empresa")
+
+        admin_role = str(payload.get("admin_role") or "company_user")
+        if admin_role not in {"superadmin", "company_admin", "company_user"}:
+            admin_role = "company_user"
+        if not is_super_admin and admin_role in {"superadmin", "company_admin"}:
+            admin_role = "company_user"
+
+        assigned_hectares = float(payload.get("assigned_hectares") or 0)
+        is_active = bool(payload.get("is_active", True))
+        first_name = str(payload.get("first_name") or "").strip() or None
+        last_name = str(payload.get("last_name") or "").strip() or None
+        selected_modules = payload.get("modules") or []
+        if not isinstance(selected_modules, list):
+            selected_modules = []
+
+        company = next((c for c in table(db, "companies") if c.get("id") == company_id), None) if company_id else None
+        if company_id and not company:
+            raise HTTPException(status_code=400, detail="Empresa no encontrada")
+
+        if company:
+            used = float(company.get("used_hectares") or 0)
+            max_hectares = float(company.get("max_hectares") or 0)
+            if assigned_hectares > max(0, max_hectares - used):
+                raise HTTPException(status_code=400, detail="Las hectáreas asignadas superan el disponible de la empresa")
+
+        if not is_super_admin and company_id:
+            enabled_company_modules = {
+                row.get("module_id")
+                for row in table(db, "company_modules")
+                if row.get("company_id") == company_id and row.get("is_enabled", True)
+            }
+            selected_modules = [module_id for module_id in selected_modules if module_id in enabled_company_modules]
+
+        t = now()
+        user_id = str(uuid.uuid4())
+        temporary_password = generate_temporary_password()
+        user = {
+            "id": user_id,
+            "email": email,
+            "password_hash": password_hash(temporary_password),
+            "is_active": is_active,
+            "created_at": t,
+            "updated_at": t,
+            "user_metadata": {
+                "first_name": first_name,
+                "last_name": last_name,
+                "temporary_password": True,
+                "must_change_password": True,
+            },
+        }
+        db.setdefault("users", []).append(user)
+
+        table(db, "profiles").append({
+            "id": user_id,
+            "user_id": user_id,
+            "email": email,
+            "first_name": first_name,
+            "last_name": last_name,
+            "company_name": company.get("name") if company else None,
+            "company_logo_url": None,
+            "avatar_url": None,
+            "phone": None,
+            "location": None,
+            "hectareas": assigned_hectares,
+            "max_users": 0,
+            "created_at": t,
+            "updated_at": t,
+        })
+
+        # Roles del sistema principal: admin para quienes administran empresa/plataforma, user para usuario normal.
+        app_role = "admin" if admin_role in {"superadmin", "company_admin"} else "user"
+        table(db, "user_roles").append({"id": str(uuid.uuid4()), "user_id": user_id, "role": app_role, "created_at": t})
+
+        admin_user_id = str(uuid.uuid4())
+        admin_row = {
+            "id": admin_user_id,
+            "user_id": user_id,
+            "company_id": company_id,
+            "admin_role": admin_role,
+            "assigned_hectares": assigned_hectares,
+            "created_by": current_admin.get("id"),
+            "is_active": is_active,
+            "created_at": t,
+            "updated_at": t,
+        }
+        table(db, "admin_users").append(admin_row)
+
+        valid_modules = {m.get("id") for m in table(db, "platform_modules") if m.get("is_active", True)}
+        for module_id in selected_modules:
+            if module_id not in valid_modules:
+                continue
+            table(db, "user_modules").append({
+                "id": str(uuid.uuid4()),
+                "user_id": user_id,
+                "admin_user_id": admin_user_id,
+                "module_id": module_id,
+                "is_enabled": True,
+                "is_active": True,
+                "created_at": t,
+                "updated_at": t,
+            })
+
+        if company:
+            company["used_hectares"] = float(company.get("used_hectares") or 0) + assigned_hectares
+            company["updated_at"] = t
+
+        email_result = send_temporary_password_email(email, temporary_password, first_name)
+        write_db(db)
+
+    return {
+        "data": {
+            "user": public_user(user),
+            "admin_user": enrich(db, "admin_users", admin_row),
+            "temporary_password": temporary_password,
+            "email_sent": bool(email_result.get("sent")),
+            "email_message": email_result.get("reason"),
+        },
+        "error": None,
+    }
 
 
 @router.post("/tables/{table_name}/query")
