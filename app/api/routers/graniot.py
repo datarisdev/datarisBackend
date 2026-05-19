@@ -764,6 +764,8 @@ def _public_graniot_subparcels(payload: Any) -> List[Dict[str, Any]]:
             "graniot_wms_access_key": data.get("graniot_wms_access_key"),
             "graniot_wms_url": data.get("graniot_wms_url"),
             "graniot_image_url": data.get("graniot_image_url"),
+            "graniot_bbox": data.get("graniot_bbox"),
+            "bbox": data.get("graniot_bbox"),
             "graniot_geometry": data.get("graniot_geometry"),
             "name": props.get("name") or raw.get("name"),
             "hectares": props.get("hectares"),
@@ -2515,6 +2517,235 @@ DEFAULT_NDVI_RESOLUTION_ID = 1
 DEFAULT_NDVI_RESOLUTION_KEY = "80f07c38-39b9-4df9-8c0b-a586e52b2843"
 
 
+# Confirmed Graniot catalog values from /api/layers/layers-platform/ and
+# /api/layers/get_wms_layers/.  The important distinction is:
+# - `key` is required by /parcels/{id}/layers/{layer_key}/statistics and json-index.
+# - `wms_layer` is required by /api/wms/?layers=... .
+# The resolver below prevents a UI selection like "NDVI_UAV" from being used on
+# a parcel that only has Sentinel resolution 1 images, which caused the all-blue
+# raster that was observed in production.
+GRANIOT_KNOWN_INDEX_LAYERS: List[Dict[str, Any]] = [
+    {
+        "family": "NDVI",
+        "source": "sentinel",
+        "key": "7a66c49e-acdb-46c6-aea4-505fdf3edf48",
+        "wms_layer": "NDVI",
+        "name": "NDVI",
+        "resolution_id": 1,
+        "resolution_key": "80f07c38-39b9-4df9-8c0b-a586e52b2843",
+        "resolution_label": "10x10 meters",
+        "priority": 10,
+    },
+    {
+        "family": "GNDVI",
+        "source": "sentinel",
+        "key": "686f6293-e092-44b3-842f-2ad22867b167",
+        "wms_layer": "GNDVI",
+        "name": "GNDVI",
+        "resolution_id": 1,
+        "resolution_key": "80f07c38-39b9-4df9-8c0b-a586e52b2843",
+        "resolution_label": "10x10 meters",
+        "priority": 10,
+    },
+    {
+        "family": "NDVI",
+        "source": "planet",
+        "key": "ea30b1ef-26e0-4743-beb2-3c12da6a2bb9",
+        "wms_layer": "NDVI_PLANET",
+        "name": "NDVI_PLANET",
+        "resolution_id": 2,
+        "resolution_key": "1df21923-9466-4859-86e6-c0d18b3dc9ec",
+        "resolution_label": "3x3 meters",
+        "priority": 20,
+    },
+    {
+        "family": "GNDVI",
+        "source": "planet",
+        "key": "647fe571-a753-4b8f-a9b1-431dee3c192a",
+        "wms_layer": "GNDVI_PLANET",
+        "name": "GNDVI_PLANET",
+        "resolution_id": 2,
+        "resolution_key": "1df21923-9466-4859-86e6-c0d18b3dc9ec",
+        "resolution_label": "3x3 meters",
+        "priority": 20,
+    },
+    {
+        "family": "NDVI",
+        "source": "planet4",
+        "key": "90211e25-3e1d-4b98-b747-bcd132d2f605",
+        "wms_layer": "NDVI_PLANET4",
+        "name": "NDVI_PLANET4",
+        "resolution_id": 6,
+        "resolution_key": "c13d3296-dbdb-4af2-b22e-9893b019926a",
+        "resolution_label": "3x3 meters (4bands)",
+        "priority": 30,
+    },
+    {
+        "family": "NDVI",
+        "source": "superresolution",
+        "key": "01cf0b02-6d62-46ef-aeed-e8de477a5b55",
+        "wms_layer": "NDVI_SUPERRESOLUTION",
+        "name": "NDVI_SUPERRESOLUTION",
+        "resolution_id": 12,
+        "resolution_key": "c1ebf592-31e5-4f00-9072-49f473c3d438",
+        "resolution_label": "1x1 meter",
+        "priority": 40,
+    },
+    {
+        "family": "NDVI",
+        "source": "uav",
+        "key": "32fc2f64-9c84-42ce-bbd0-3ef48678789d",
+        "wms_layer": "NDVI_UAV",
+        "name": "NDVI_UAV",
+        "resolution_id": 7,
+        "resolution_key": "e7aed7dc-e439-4b38-9847-66cd94b01ff8",
+        "resolution_label": "UAV",
+        "priority": 80,
+    },
+    {
+        "family": "NDVI",
+        "source": "uav-rgb-ms",
+        "key": "c83eee1e-94aa-46a2-a40d-c76878f91fab",
+        "wms_layer": "NDVI_UAV_RGB_MS",
+        "name": "NDVI_UAV_RGB_MS",
+        "resolution_id": 17,
+        "resolution_key": "1e412157-ab19-434f-9b74-e72db9e602da",
+        "resolution_label": "UAV RGB-MS",
+        "priority": 90,
+    },
+]
+
+
+def _clean_layer_token(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _index_family_from_text(value: Any) -> Optional[str]:
+    text = _clean_layer_token(value).replace("-", "_").replace(" ", "_")
+    if not text:
+        return None
+    # Check GNDVI before NDVI because GNDVI contains NDVI.
+    if "gndvi" in text:
+        return "GNDVI"
+    if "ndvi" in text:
+        return "NDVI"
+    return None
+
+
+def _known_layer_from_request(layer_key: Any, wms_layer: Any) -> Optional[Dict[str, Any]]:
+    requested = {_clean_layer_token(layer_key), _clean_layer_token(wms_layer)}
+    for layer in GRANIOT_KNOWN_INDEX_LAYERS:
+        keys = {
+            _clean_layer_token(layer.get("key")),
+            _clean_layer_token(layer.get("wms_layer")),
+            _clean_layer_token(layer.get("name")),
+        }
+        if requested & keys:
+            return layer
+    return None
+
+
+def _available_resolution_entries_from_source(source: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw = source.get("raw") if isinstance(source.get("raw"), dict) else {}
+    props = raw.get("properties") if isinstance(raw.get("properties"), dict) else {}
+    for candidate in (
+        source.get("parcelresolution_set"),
+        props.get("parcelresolution_set"),
+        raw.get("parcelresolution_set"),
+    ):
+        candidate = _safe_json_loads(candidate)
+        if isinstance(candidate, list):
+            return [item for item in candidate if isinstance(item, dict)]
+    return []
+
+
+def _source_has_image_for_resolution(source: Dict[str, Any], resolution_id: Optional[int]) -> bool:
+    entries = _available_resolution_entries_from_source(source)
+    if not entries or resolution_id is None:
+        return True
+    for item in entries:
+        try:
+            if int(item.get("resolution")) == int(resolution_id) and bool(item.get("last_image_date") or item.get("date") or item.get("image_date")):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _available_resolution_ids_with_images(sources: List[Dict[str, Any]]) -> set[int]:
+    ids: set[int] = set()
+    for source in sources:
+        for item in _available_resolution_entries_from_source(source):
+            try:
+                if item.get("last_image_date") or item.get("date") or item.get("image_date"):
+                    ids.add(int(item.get("resolution")))
+            except Exception:
+                continue
+    return ids
+
+
+def _resolve_requested_graniot_layer(
+    *,
+    layer_key: str,
+    wms_layer: str,
+    resolution_id: Optional[int],
+    resolution_key: Optional[str],
+    sources: List[Dict[str, Any]],
+    warnings: List[str],
+) -> Dict[str, Any]:
+    requested = _known_layer_from_request(layer_key, wms_layer)
+    family = (
+        (requested or {}).get("family")
+        or _index_family_from_text(wms_layer)
+        or _index_family_from_text(layer_key)
+    )
+    available_ids = _available_resolution_ids_with_images(sources)
+
+    if family:
+        compatible = [layer for layer in GRANIOT_KNOWN_INDEX_LAYERS if layer.get("family") == family]
+        if available_ids:
+            compatible_with_image = [layer for layer in compatible if int(layer.get("resolution_id")) in available_ids]
+        else:
+            compatible_with_image = compatible
+
+        if requested and (not available_ids or int(requested.get("resolution_id")) in available_ids):
+            selected = requested
+        elif compatible_with_image:
+            selected = sorted(compatible_with_image, key=lambda item: int(item.get("priority", 999)))[0]
+            if requested and selected.get("key") != requested.get("key"):
+                warnings.append(
+                    f"La capa solicitada {requested.get('wms_layer')} usa resolución {requested.get('resolution_id')}, "
+                    f"pero el lote tiene imágenes en {sorted(available_ids) or 'otra resolución'}. "
+                    f"Se usó {selected.get('wms_layer')} para evitar una imagen NDVI incompatible."
+                )
+        else:
+            selected = requested or compatible[0]
+            warnings.append(
+                f"No se encontró una capa {family} con imagen disponible para las resoluciones del lote; "
+                f"se intentará con {selected.get('wms_layer')}."
+            )
+
+        return {
+            "key": str(selected.get("key") or layer_key or ""),
+            "wms_layer": str(selected.get("wms_layer") or wms_layer or selected.get("name") or ""),
+            "resolution_id": int(selected.get("resolution_id")) if selected.get("resolution_id") is not None else resolution_id,
+            "resolution_key": str(selected.get("resolution_key") or resolution_key or ""),
+            "resolution_label": selected.get("resolution_label"),
+            "source": selected.get("source"),
+            "family": selected.get("family") or family,
+            "auto_selected": bool(requested and selected.get("key") != requested.get("key")),
+        }
+
+    return {
+        "key": layer_key,
+        "wms_layer": wms_layer or DEFAULT_NDVI_WMS_LAYER,
+        "resolution_id": resolution_id,
+        "resolution_key": resolution_key,
+        "family": None,
+        "auto_selected": False,
+    }
+
+
 def _local_parcel_geometry(row: Dict[str, Any]) -> Optional[Any]:
     for key in ("geometry_geojson", "geojson", "feature_collection", "geometry"):
         value = row.get(key)
@@ -2737,6 +2968,106 @@ def _persist_graniot_sources(local_parcel_id: str, user_id: str, raw: Any, sourc
         write_db(db)
 
 
+
+
+def _sources_from_local_row(local: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return WMS-capable Graniot sources already stored in a local parcel row."""
+    sources: List[Dict[str, Any]] = []
+    for item in (local.get("graniot_parcels") or []):
+        if isinstance(item, dict):
+            sources.append({
+                "graniot_parcel_id": item.get("graniot_parcel_id"),
+                "graniot_parcel_key": item.get("graniot_parcel_key"),
+                "graniot_access_key": item.get("graniot_access_key"),
+                "graniot_wms_access_key": item.get("graniot_wms_access_key"),
+                "graniot_wms_url": item.get("graniot_wms_url"),
+                "graniot_image_url": item.get("graniot_image_url"),
+                "graniot_bbox": item.get("graniot_bbox") or item.get("bbox"),
+                "parcelresolution_set": item.get("parcelresolution_set"),
+                "raw": item.get("raw") or item,
+            })
+
+    if not sources:
+        raw_source = _wms_data_from_payload(
+            local.get("graniot_raw"),
+            access_key=local.get("graniot_wms_access_key") or local.get("graniot_access_key"),
+            parcel_id=local.get("graniot_parcel_id"),
+        )
+        if raw_source:
+            sources = [raw_source]
+
+    # Rows synchronized by older versions may have only first-level fields.
+    if not sources and (local.get("graniot_wms_url") or local.get("graniot_image_url") or local.get("graniot_access_key")):
+        sources = [{
+            "graniot_parcel_id": local.get("graniot_parcel_id"),
+            "graniot_parcel_key": local.get("graniot_parcel_key"),
+            "graniot_access_key": local.get("graniot_access_key"),
+            "graniot_wms_access_key": local.get("graniot_wms_access_key"),
+            "graniot_wms_url": local.get("graniot_wms_url"),
+            "graniot_image_url": local.get("graniot_image_url"),
+            "graniot_bbox": local.get("graniot_bbox") or local.get("bbox"),
+            "parcelresolution_set": local.get("parcelresolution_set"),
+            "raw": local,
+        }]
+    return [source for source in sources if source.get("graniot_wms_url") or source.get("graniot_image_url") or source.get("graniot_wms_access_key") or source.get("graniot_access_key")]
+
+
+async def _attempt_auto_sync_for_map_layer(
+    *,
+    local_parcel_id: str,
+    authorization: Optional[str],
+    warnings: List[str],
+) -> List[Dict[str, Any]]:
+    """Create/sync the local parcel in Graniot and recover its WMS template.
+
+    A local Dataris polygon cannot show real NDVI until Graniot knows that
+    polygon and returns properties.wms_url/properties.image_url. This function is
+    intentionally called only after direct id/geometry matching failed.
+    """
+    try:
+        sync_result = await sync_local_parcel(
+            local_parcel_id,
+            payload={"metadata": {"auto_sync_source": "ndvi-map-layer"}},
+            authorization=authorization,
+        )
+        raw = (sync_result.get("data") or {}).get("graniot") if isinstance(sync_result, dict) else None
+        synced_parcel = (sync_result.get("data") or {}).get("parcel") if isinstance(sync_result, dict) else None
+
+        sources: List[Dict[str, Any]] = []
+        if isinstance(synced_parcel, dict):
+            sources.extend(_sources_from_local_row(synced_parcel))
+        if raw:
+            recovered = _wms_data_from_payload(raw)
+            if recovered:
+                sources.append(recovered)
+            sources.extend(_all_wms_data_from_payload(raw))
+
+        # Refresh the row after sync because sync_local_parcel persists ids and templates.
+        with LOCK:
+            db = read_db()
+            row = next((p for p in table(db, "parcels") if p.get("id") == local_parcel_id), None)
+        if row:
+            sources.extend(_sources_from_local_row(row))
+
+        deduped: List[Dict[str, Any]] = []
+        seen = set()
+        for source in sources:
+            key = str(source.get("graniot_parcel_id") or source.get("graniot_wms_access_key") or source.get("graniot_access_key") or source.get("graniot_wms_url") or "")
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            if source.get("graniot_wms_url") or source.get("graniot_image_url") or source.get("graniot_wms_access_key") or source.get("graniot_access_key"):
+                deduped.append(source)
+        if deduped:
+            warnings.append("El lote local fue sincronizado automáticamente con Graniot para poder solicitar WMS real.")
+        else:
+            warnings.append("El lote se intentó sincronizar con Graniot, pero la respuesta no incluyó WMS/image_url todavía.")
+        return deduped
+    except Exception as exc:
+        warnings.append(f"No se pudo sincronizar automáticamente el lote con Graniot: {exc}")
+        return []
+
 @router.get("/parcels/{local_parcel_id}/ndvi/map-layer")
 async def get_local_parcel_ndvi_map_layer(
     local_parcel_id: str,
@@ -2749,6 +3080,7 @@ async def get_local_parcel_ndvi_map_layer(
     height: int = Query(default=1024),
     maxcc: float = Query(default=100),
     include_statistics: bool = Query(default=True),
+    auto_sync: bool = Query(default=True),
     authorization: Optional[str] = Header(default=None),
 ):
     user = _require_user(authorization)
@@ -2763,24 +3095,7 @@ async def get_local_parcel_ndvi_map_layer(
 
     # Start with locally stored Graniot WMS sources. If none exist, recover by
     # matching the local polygon against /api/parcels/ FeatureCollection.
-    sources: List[Dict[str, Any]] = []
-    for item in (local.get("graniot_parcels") or []):
-        if isinstance(item, dict):
-            sources.append({
-                "graniot_parcel_id": item.get("graniot_parcel_id"),
-                "graniot_parcel_key": item.get("graniot_parcel_key"),
-                "graniot_access_key": item.get("graniot_access_key"),
-                "graniot_wms_access_key": item.get("graniot_wms_access_key"),
-                "graniot_wms_url": item.get("graniot_wms_url"),
-                "graniot_image_url": item.get("graniot_image_url"),
-                "graniot_bbox": item.get("graniot_bbox") or item.get("bbox"),
-                "raw": item.get("raw") or item,
-            })
-
-    if not sources:
-        raw_source = _wms_data_from_payload(local.get("graniot_raw"), parcel_id=local.get("graniot_parcel_id"))
-        if raw_source:
-            sources = [raw_source]
+    sources: List[Dict[str, Any]] = _sources_from_local_row(local)
 
     raw_parcels = None
     if not sources:
@@ -2798,38 +3113,67 @@ async def get_local_parcel_ndvi_map_layer(
         except Exception as exc:
             warnings.append(f"No se pudo recuperar el lote desde Graniot: {exc}")
 
+    if not sources and auto_sync:
+        sources = await _attempt_auto_sync_for_map_layer(
+            local_parcel_id=local_parcel_id,
+            authorization=authorization,
+            warnings=warnings,
+        )
+
     if not sources:
         return {
             "data": {
                 "available": False,
-                "reason": "Este lote aún no tiene WMS real de Graniot asociado. Sincroniza el lote o verifica que exista en Graniot con una geometría equivalente.",
+                "reason": "Este lote todavía no tiene WMS real de Graniot. No está sincronizado en Graniot o Graniot aún no ha generado image_url/wms_url para esa geometría.",
+                "requires_sync": True,
                 "overlays": [],
                 "warnings": warnings,
             },
             "error": None,
         }
 
-    resolved_date = date or _date_from_graniot_sources(sources, resolution_id)
+    resolved_layer = _resolve_requested_graniot_layer(
+        layer_key=layer_key or DEFAULT_NDVI_LAYER_KEY,
+        wms_layer=wms_layer or DEFAULT_NDVI_WMS_LAYER,
+        resolution_id=resolution_id,
+        resolution_key=resolution_key,
+        sources=sources,
+        warnings=warnings,
+    )
+    resolved_resolution_id = resolved_layer.get("resolution_id")
+
+    # Prefer the latest image date actually reported by Graniot for the selected
+    # resolution. This avoids asking WMS for the UI calendar date when no image
+    # exists there, which can produce misleading single-color rasters.
+    graniot_latest_date = _date_from_graniot_sources(sources, resolved_resolution_id)
+    resolved_date = graniot_latest_date or date
+
+    render_sources = [source for source in sources if _source_has_image_for_resolution(source, resolved_resolution_id)]
+    if not render_sources:
+        render_sources = sources
+        if resolved_resolution_id is not None:
+            warnings.append(f"El lote no reporta imagen para la resolución {resolved_resolution_id}; se intentará renderizar con la información WMS disponible.")
+
     overlays = [
         overlay for overlay in (
             _source_to_map_overlay(
                 local_parcel_id=local_parcel_id,
                 source=source,
-                layer_name=wms_layer or DEFAULT_NDVI_WMS_LAYER,
+                layer_name=resolved_layer.get("wms_layer") or DEFAULT_NDVI_WMS_LAYER,
                 date=resolved_date,
                 width=width,
                 height=height,
-            ) for source in sources
+            ) for source in render_sources
         ) if overlay
     ]
 
     statistics: Any = None
-    graniot_parcel_id = sources[0].get("graniot_parcel_id") or local.get("graniot_parcel_id")
-    if include_statistics and graniot_parcel_id and layer_key:
+    graniot_parcel_id = render_sources[0].get("graniot_parcel_id") or sources[0].get("graniot_parcel_id") or local.get("graniot_parcel_id")
+    if include_statistics and graniot_parcel_id and resolved_layer.get("key"):
         try:
             to_date = resolved_date or datetime.now(timezone.utc).date().isoformat()
             statistics = await client.get(
-                f"/api/parcels/{graniot_parcel_id}/layers/{layer_key}/statistics/",
+                f"/api/parcels/{graniot_parcel_id}/layers/{resolved_layer.get('key')}/statistics/",
                 params={"from_date": "2020-01-01", "to_date": to_date, "maxcc": maxcc},
             )
         except Exception as exc:
@@ -2843,15 +3187,20 @@ async def get_local_parcel_ndvi_map_layer(
             "available": bool(overlays),
             "date": resolved_date,
             "layer": {
-                "key": layer_key,
-                "wms_layer": wms_layer or DEFAULT_NDVI_WMS_LAYER,
-                "resolution_id": resolution_id,
-                "resolution_key": resolution_key,
+                "key": resolved_layer.get("key"),
+                "wms_layer": resolved_layer.get("wms_layer") or DEFAULT_NDVI_WMS_LAYER,
+                "resolution_id": resolved_layer.get("resolution_id"),
+                "resolution_key": resolved_layer.get("resolution_key"),
+                "resolution_label": resolved_layer.get("resolution_label"),
+                "source": resolved_layer.get("source"),
+                "family": resolved_layer.get("family"),
+                "auto_selected": resolved_layer.get("auto_selected"),
             },
             "overlays": overlays,
             "statistics": statistics,
             "warnings": warnings,
-            "source_count": len(sources),
+            "source_count": len(render_sources),
+            "available_resolution_ids": sorted(_available_resolution_ids_with_images(sources)),
         },
         "error": None,
     }
