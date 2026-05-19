@@ -2503,6 +2503,360 @@ async def sync_local_parcel(
         _raise_graniot_error(exc)
 
 
+# ---- Dataris Graniot NDVI map-layer orchestration -------------------------
+# The satellite UI should not guess WMS access keys or layer identifiers. This
+# endpoint resolves the local parcel against Graniot, recovers the signed WMS
+# template returned by Graniot, and returns render-ready overlays. The frontend
+# only paints the resulting image URLs over the bounds returned here.
+
+DEFAULT_NDVI_LAYER_KEY = "7a66c49e-acdb-46c6-aea4-505fdf3edf48"
+DEFAULT_NDVI_WMS_LAYER = "NDVI"
+DEFAULT_NDVI_RESOLUTION_ID = 1
+DEFAULT_NDVI_RESOLUTION_KEY = "80f07c38-39b9-4df9-8c0b-a586e52b2843"
+
+
+def _local_parcel_geometry(row: Dict[str, Any]) -> Optional[Any]:
+    for key in ("geometry_geojson", "geojson", "feature_collection", "geometry"):
+        value = row.get(key)
+        value = _safe_json_loads(value)
+        if not value:
+            continue
+        try:
+            if isinstance(value, dict) and value.get("type") == "FeatureCollection":
+                geoms = []
+                for feature in value.get("features") or []:
+                    geom = feature.get("geometry") if isinstance(feature, dict) else None
+                    if geom:
+                        shp = _normalize_geometry_axes(shapely_shape(geom))
+                        if not shp.is_empty:
+                            geoms.append(shp)
+                return unary_union(geoms) if geoms else None
+            if isinstance(value, dict) and value.get("type") == "Feature":
+                geom = value.get("geometry")
+                return _normalize_geometry_axes(shapely_shape(geom)) if geom else None
+            if isinstance(value, dict) and value.get("type") in {"Polygon", "MultiPolygon", "GeometryCollection"}:
+                return _normalize_geometry_axes(shapely_shape(value))
+        except Exception:
+            continue
+    return None
+
+
+def _feature_geometry(item: Dict[str, Any]) -> Optional[Any]:
+    try:
+        geom = item.get("geometry")
+        if not geom:
+            props = item.get("properties") if isinstance(item.get("properties"), dict) else {}
+            geom = props.get("geometry")
+        if not geom:
+            return None
+        shp = _normalize_geometry_axes(shapely_shape(geom))
+        return shp if not shp.is_empty else None
+    except Exception:
+        return None
+
+
+def _geometry_match_score(local_geom: Any, candidate_geom: Any) -> float:
+    try:
+        if not local_geom or not candidate_geom or local_geom.is_empty or candidate_geom.is_empty:
+            return 0.0
+        if not local_geom.intersects(candidate_geom):
+            return 0.0
+        intersection_area = float(local_geom.intersection(candidate_geom).area)
+        if intersection_area <= 0:
+            return 0.0
+        local_area = max(float(local_geom.area), 1e-12)
+        candidate_area = max(float(candidate_geom.area), 1e-12)
+        # Use the best of coverage and IoU. Coverage helps when Graniot splits a
+        # local polygon into several parcels; IoU helps exact one-to-one matches.
+        union_area = max(float(local_geom.union(candidate_geom).area), 1e-12)
+        coverage_local = intersection_area / local_area
+        coverage_candidate = intersection_area / candidate_area
+        iou = intersection_area / union_area
+        return max(iou, min(coverage_local, coverage_candidate), coverage_local * 0.95)
+    except Exception:
+        return 0.0
+
+
+def _graniot_name(value: Dict[str, Any]) -> str:
+    props = value.get("properties") if isinstance(value.get("properties"), dict) else {}
+    return str(props.get("name") or value.get("name") or "").strip().lower()
+
+
+def _find_graniot_matches_for_local(local: Dict[str, Any], graniot_payload: Any) -> List[Dict[str, Any]]:
+    features = _items(graniot_payload)
+    if not features:
+        return []
+
+    wanted_id = _normalized_token(local.get("graniot_parcel_id"))
+    wanted_name = str(local.get("name") or "").strip().lower()
+    local_geom = _local_parcel_geometry(local)
+
+    exact: List[Dict[str, Any]] = []
+    if wanted_id:
+        exact = [f for f in features if _normalized_token(f.get("id")) == wanted_id]
+        if exact:
+            return exact
+
+    scored: List[tuple[float, Dict[str, Any]]] = []
+    if local_geom is not None:
+        for feature in features:
+            candidate_geom = _feature_geometry(feature)
+            if candidate_geom is None:
+                continue
+            score = _geometry_match_score(local_geom, candidate_geom)
+            if score >= 0.05:
+                scored.append((score, feature))
+        if scored:
+            scored.sort(key=lambda item: item[0], reverse=True)
+            best = scored[0][0]
+            # Keep all strong split-parcel matches. For normal one-to-one lots,
+            # this returns only the highest scoring feature.
+            threshold = max(0.08, min(0.55, best * 0.55))
+            return [feature for score, feature in scored if score >= threshold][:12]
+
+    if wanted_name:
+        name_matches = [f for f in features if wanted_name and (wanted_name == _graniot_name(f) or wanted_name in _graniot_name(f) or _graniot_name(f) in wanted_name)]
+        if name_matches:
+            return name_matches[:12]
+
+    return []
+
+
+def _date_from_graniot_sources(sources: List[Dict[str, Any]], preferred_resolution_id: Optional[int] = DEFAULT_NDVI_RESOLUTION_ID) -> Optional[str]:
+    dates: List[str] = []
+    for source in sources:
+        raw = source.get("raw") if isinstance(source.get("raw"), dict) else {}
+        props = raw.get("properties") if isinstance(raw.get("properties"), dict) else {}
+        for candidate in (
+            source.get("parcelresolution_set"),
+            props.get("parcelresolution_set"),
+            raw.get("parcelresolution_set"),
+        ):
+            date = _latest_image_date_from_resolutions(candidate, preferred_resolution_id)
+            if date:
+                dates.append(date)
+            elif preferred_resolution_id is not None:
+                # Fallback to any available image date if the requested resolution
+                # has no image but another resolution does.
+                any_date = _latest_image_date_from_resolutions(candidate, None)
+                if any_date:
+                    dates.append(any_date)
+    return sorted(set(dates))[-1] if dates else None
+
+
+def _source_to_map_overlay(
+    *,
+    local_parcel_id: str,
+    source: Dict[str, Any],
+    layer_name: str,
+    date: Optional[str],
+    width: int,
+    height: int,
+) -> Optional[Dict[str, Any]]:
+    access_key = (
+        source.get("graniot_wms_access_key")
+        or _signed_wms_access_key(source.get("graniot_wms_url"))
+        or _signed_wms_access_key(source.get("graniot_image_url"))
+        or source.get("graniot_access_key")
+    )
+    bounds = (
+        _bbox_from_graniot_bbox(source.get("graniot_bbox"))
+        or _bounds_from_wms_template(source.get("graniot_wms_url"))
+        or _bounds_from_wms_template(source.get("graniot_image_url"))
+    )
+    if not access_key or not bounds:
+        return None
+
+    query: Dict[str, Any] = {
+        "parcel_id": local_parcel_id,
+        "access_key": access_key,
+        "layer": layer_name,
+        "width": width,
+        "height": height,
+        "south": bounds["south"],
+        "west": bounds["west"],
+        "north": bounds["north"],
+        "east": bounds["east"],
+    }
+    if date:
+        query["time"] = date
+
+    return {
+        "id": str(source.get("graniot_parcel_id") or source.get("graniot_parcel_key") or source.get("graniot_access_key") or local_parcel_id),
+        "graniot_parcel_id": source.get("graniot_parcel_id"),
+        "image_url": f"/api/graniot/wms-proxy?{urlencode(query)}",
+        "bounds": bounds,
+        "date": date,
+        "layer": layer_name,
+        "source": "graniot-wms-proxy",
+    }
+
+
+def _persist_graniot_sources(local_parcel_id: str, user_id: str, raw: Any, sources: List[Dict[str, Any]], selected_date: Optional[str]) -> None:
+    if not sources:
+        return
+    public_sources = []
+    for source in sources:
+        raw_obj = source.get("raw") if isinstance(source.get("raw"), dict) else {}
+        props = raw_obj.get("properties") if isinstance(raw_obj.get("properties"), dict) else {}
+        public_sources.append({
+            "graniot_parcel_id": source.get("graniot_parcel_id"),
+            "graniot_parcel_key": source.get("graniot_parcel_key"),
+            "graniot_access_key": source.get("graniot_access_key"),
+            "graniot_wms_access_key": source.get("graniot_wms_access_key"),
+            "graniot_wms_url": source.get("graniot_wms_url"),
+            "graniot_image_url": source.get("graniot_image_url"),
+            "graniot_geometry": source.get("graniot_geometry"),
+            "graniot_bbox": source.get("graniot_bbox"),
+            "bounds": _bbox_from_graniot_bbox(source.get("graniot_bbox")) or _bounds_from_wms_template(source.get("graniot_wms_url")) or _bounds_from_wms_template(source.get("graniot_image_url")),
+            "name": props.get("name") or raw_obj.get("name"),
+            "hectares": props.get("hectares"),
+            "parcelresolution_set": props.get("parcelresolution_set") or raw_obj.get("parcelresolution_set"),
+            "last_image_date": selected_date or _latest_image_date_from_resolutions(props.get("parcelresolution_set") or raw_obj.get("parcelresolution_set")),
+        })
+
+    first = public_sources[0]
+    with LOCK:
+        db = read_db()
+        row = next((p for p in table(db, "parcels") if p.get("id") == local_parcel_id and p.get("user_id") == user_id), None)
+        if not row:
+            return
+        row.update({
+            "graniot_parcel_id": first.get("graniot_parcel_id") or row.get("graniot_parcel_id"),
+            "graniot_parcel_key": first.get("graniot_parcel_key") or row.get("graniot_parcel_key"),
+            "graniot_access_key": first.get("graniot_access_key") or row.get("graniot_access_key"),
+            "graniot_wms_access_key": first.get("graniot_wms_access_key") or row.get("graniot_wms_access_key"),
+            "graniot_wms_url": first.get("graniot_wms_url") or row.get("graniot_wms_url"),
+            "graniot_image_url": first.get("graniot_image_url") or row.get("graniot_image_url"),
+            "graniot_parcels": public_sources,
+            "graniot_raw": raw,
+            "graniot_synced_at": now(),
+            "graniot_sync_error": None,
+            "updated_at": now(),
+        })
+        write_db(db)
+
+
+@router.get("/parcels/{local_parcel_id}/ndvi/map-layer")
+async def get_local_parcel_ndvi_map_layer(
+    local_parcel_id: str,
+    layer_key: str = Query(default=DEFAULT_NDVI_LAYER_KEY),
+    wms_layer: str = Query(default=DEFAULT_NDVI_WMS_LAYER),
+    resolution_id: int = Query(default=DEFAULT_NDVI_RESOLUTION_ID),
+    resolution_key: str = Query(default=DEFAULT_NDVI_RESOLUTION_KEY),
+    date: Optional[str] = Query(default=None),
+    width: int = Query(default=1024),
+    height: int = Query(default=1024),
+    maxcc: float = Query(default=100),
+    include_statistics: bool = Query(default=True),
+    authorization: Optional[str] = Header(default=None),
+):
+    user = _require_user(authorization)
+    with LOCK:
+        db = read_db()
+        local = next((p for p in table(db, "parcels") if p.get("id") == local_parcel_id and p.get("user_id") == user["id"]), None)
+    if not local:
+        raise HTTPException(status_code=404, detail="Lote local no encontrado")
+
+    client = GraniotClient()
+    warnings: List[str] = []
+
+    # Start with locally stored Graniot WMS sources. If none exist, recover by
+    # matching the local polygon against /api/parcels/ FeatureCollection.
+    sources: List[Dict[str, Any]] = []
+    for item in (local.get("graniot_parcels") or []):
+        if isinstance(item, dict):
+            sources.append({
+                "graniot_parcel_id": item.get("graniot_parcel_id"),
+                "graniot_parcel_key": item.get("graniot_parcel_key"),
+                "graniot_access_key": item.get("graniot_access_key"),
+                "graniot_wms_access_key": item.get("graniot_wms_access_key"),
+                "graniot_wms_url": item.get("graniot_wms_url"),
+                "graniot_image_url": item.get("graniot_image_url"),
+                "graniot_bbox": item.get("graniot_bbox") or item.get("bbox"),
+                "raw": item.get("raw") or item,
+            })
+
+    if not sources:
+        raw_source = _wms_data_from_payload(local.get("graniot_raw"), parcel_id=local.get("graniot_parcel_id"))
+        if raw_source:
+            sources = [raw_source]
+
+    raw_parcels = None
+    if not sources:
+        try:
+            raw_parcels = await client.get("/api/parcels/")
+            matches = _find_graniot_matches_for_local(local, raw_parcels)
+            sources = [_extract_wms_data_from_parcel_object(match) for match in matches]
+            sources = [source for source in sources if source.get("graniot_wms_url") or source.get("graniot_image_url")]
+            if sources:
+                resolved_date = date or _date_from_graniot_sources(sources, resolution_id)
+                _persist_graniot_sources(local_parcel_id, user["id"], raw_parcels, sources, resolved_date)
+                date = resolved_date
+            else:
+                warnings.append("No se encontró un lote equivalente en Graniot para esta geometría local.")
+        except Exception as exc:
+            warnings.append(f"No se pudo recuperar el lote desde Graniot: {exc}")
+
+    if not sources:
+        return {
+            "data": {
+                "available": False,
+                "reason": "Este lote aún no tiene WMS real de Graniot asociado. Sincroniza el lote o verifica que exista en Graniot con una geometría equivalente.",
+                "overlays": [],
+                "warnings": warnings,
+            },
+            "error": None,
+        }
+
+    resolved_date = date or _date_from_graniot_sources(sources, resolution_id)
+    overlays = [
+        overlay for overlay in (
+            _source_to_map_overlay(
+                local_parcel_id=local_parcel_id,
+                source=source,
+                layer_name=wms_layer or DEFAULT_NDVI_WMS_LAYER,
+                date=resolved_date,
+                width=width,
+                height=height,
+            ) for source in sources
+        ) if overlay
+    ]
+
+    statistics: Any = None
+    graniot_parcel_id = sources[0].get("graniot_parcel_id") or local.get("graniot_parcel_id")
+    if include_statistics and graniot_parcel_id and layer_key:
+        try:
+            to_date = resolved_date or datetime.now(timezone.utc).date().isoformat()
+            statistics = await client.get(
+                f"/api/parcels/{graniot_parcel_id}/layers/{layer_key}/statistics/",
+                params={"from_date": "2020-01-01", "to_date": to_date, "maxcc": maxcc},
+            )
+        except Exception as exc:
+            statistics = {"status": "unavailable", "data": [], "warning": str(exc)}
+
+    if not overlays:
+        warnings.append("Graniot devolvió el lote, pero no hay access_key o bounds válidos para construir la imagen WMS.")
+
+    return {
+        "data": {
+            "available": bool(overlays),
+            "date": resolved_date,
+            "layer": {
+                "key": layer_key,
+                "wms_layer": wms_layer or DEFAULT_NDVI_WMS_LAYER,
+                "resolution_id": resolution_id,
+                "resolution_key": resolution_key,
+            },
+            "overlays": overlays,
+            "statistics": statistics,
+            "warnings": warnings,
+            "source_count": len(sources),
+        },
+        "error": None,
+    }
+
+
 @router.get("/parcels/{parcel_id}/resolutions/{resolution_key}/dates")
 async def get_dates(
     parcel_id: str,
