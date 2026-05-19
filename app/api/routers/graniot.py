@@ -46,7 +46,11 @@ def _items(payload: Any) -> List[Dict[str, Any]]:
     if isinstance(payload, list):
         return [x for x in payload if isinstance(x, dict)]
     if isinstance(payload, dict):
-        for key in ("results", "data", "items", "layers"):
+        # Graniot /api/parcels/ returns a GeoJSON FeatureCollection. The parcel
+        # id, bbox, properties.wms_url and properties.image_url live in features[].
+        if payload.get("type") == "FeatureCollection" and isinstance(payload.get("features"), list):
+            return [x for x in payload.get("features") or [] if isinstance(x, dict)]
+        for key in ("results", "data", "items", "layers", "features"):
             value = payload.get(key)
             if isinstance(value, list):
                 return [x for x in value if isinstance(x, dict)]
@@ -109,24 +113,75 @@ def _layer_items(payload: Any) -> List[Dict[str, Any]]:
     return list(deduped.values())
 
 
-def _normalize_layer(layer: Dict[str, Any]) -> Dict[str, Any]:
+def _resolution_key_from_layer(layer: Dict[str, Any]) -> Optional[str]:
+    resolution_obj = layer.get("layer_resolution")
+    if isinstance(resolution_obj, dict):
+        value = resolution_obj.get("key") or resolution_obj.get("id") or resolution_obj.get("resolution")
+        return str(value) if value not in (None, "") else None
+    value = layer.get("resolution_key") or layer.get("layer_resolution_key")
+    if value not in (None, ""):
+        return str(value)
+    return None
+
+
+def _resolution_label_from_layer(layer: Dict[str, Any]) -> Optional[str]:
+    resolution_obj = layer.get("layer_resolution")
+    if isinstance(resolution_obj, dict):
+        value = resolution_obj.get("resolution") or resolution_obj.get("label") or resolution_obj.get("name")
+        return str(value) if value not in (None, "") else None
+    value = layer.get("resolution_name") or layer.get("resolution_label")
+    if value not in (None, ""):
+        return str(value)
+    return None
+
+
+def _wms_layer_name_for(layer: Dict[str, Any], wms_names: Optional[set[str]] = None) -> str:
+    # Confirmed Graniot behavior:
+    # - /parcels/{id}/layers/{layer_key}/statistics and json-index require layer.key UUID.
+    # - /api/wms/?layers=... requires the WMS layer name, e.g. NDVI, NDVI_PLANET.
+    candidates = [
+        layer.get("wms_layer"),
+        layer.get("wms_name"),
+        layer.get("layer"),
+        layer.get("layers"),
+        layer.get("name"),
+    ]
+    for candidate in candidates:
+        if candidate in (None, ""):
+            continue
+        text = str(candidate).strip()
+        if not text:
+            continue
+        if not wms_names or text in wms_names or text.upper() in {name.upper() for name in wms_names}:
+            return text
+    fallback = layer.get("name") or layer.get("key") or layer.get("id") or ""
+    return str(fallback).strip()
+
+
+def _normalize_layer(layer: Dict[str, Any], wms_names: Optional[set[str]] = None) -> Dict[str, Any]:
     displayed = layer.get("displayed_name") or layer.get("display_name") or layer.get("label") or layer.get("name") or "Capa"
-    key = str(layer.get("key") or layer.get("layer_key") or layer.get("name") or layer.get("id") or "")
-    name = layer.get("name") or displayed
-    resolution = layer.get("layer_resolution") or layer.get("resolution_name") or layer.get("resolution")
-    wms_layer = layer.get("wms_layer") or layer.get("wms_name") or layer.get("layer") or layer.get("layers") or key or name
+    name = str(layer.get("name") or displayed or "").strip()
+    # Keep UUID `key` for Graniot statistics/json-index. If no UUID exists
+    # (get_wms_layers returns only names), use the WMS name as a safe fallback.
+    key = str(layer.get("key") or layer.get("layer_key") or name or layer.get("id") or "").strip()
+    resolution_key = _resolution_key_from_layer(layer)
+    resolution_label = _resolution_label_from_layer(layer)
+    wms_layer = _wms_layer_name_for(layer, wms_names)
     return {
         "id": layer.get("id"),
         "key": key,
         "name": name,
         "displayed_name": displayed,
         "label": displayed,
-        "wms_layer": str(wms_layer) if wms_layer is not None else key,
+        "wms_layer": wms_layer,
         "color": layer.get("color"),
         "legend": layer.get("legend"),
         "config": layer.get("config"),
         "layer_stats": layer.get("layer_stats"),
-        "layer_resolution": resolution,
+        "layer_resolution": resolution_key or layer.get("layer_resolution") or layer.get("resolution_name") or layer.get("resolution"),
+        "layer_resolution_key": resolution_key,
+        "resolution_key": resolution_key,
+        "resolution_label": resolution_label,
         "resolution": layer.get("resolution"),
         "resolution_id": layer.get("resolution") if isinstance(layer.get("resolution"), int) else layer.get("resolution_id"),
         "is_sentinel": layer.get("is_sentinel"),
@@ -136,7 +191,6 @@ def _normalize_layer(layer: Dict[str, Any]) -> Dict[str, Any]:
         "menu_priority": layer.get("menu_priority"),
         "raw": layer,
     }
-
 
 def _normalize_resolution(resolution: Dict[str, Any]) -> Dict[str, Any]:
     return {
@@ -673,6 +727,26 @@ def _all_wms_data_from_payload(payload: Any) -> List[Dict[str, Any]]:
     return items
 
 
+def _latest_image_date_from_resolutions(value: Any, resolution_id: Optional[int] = None) -> Optional[str]:
+    value = _safe_json_loads(value)
+    if not isinstance(value, list):
+        return None
+    candidates: List[str] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        if resolution_id is not None:
+            try:
+                if int(item.get("resolution")) != int(resolution_id):
+                    continue
+            except Exception:
+                continue
+        date = item.get("last_image_date") or item.get("date") or item.get("image_date")
+        if date:
+            candidates.append(str(date)[:10])
+    return sorted(candidates)[-1] if candidates else None
+
+
 def _public_graniot_subparcels(payload: Any) -> List[Dict[str, Any]]:
     public_items: List[Dict[str, Any]] = []
     for data in _all_wms_data_from_payload(payload):
@@ -681,6 +755,8 @@ def _public_graniot_subparcels(payload: Any) -> List[Dict[str, Any]]:
             or _bounds_from_wms_template(data.get("graniot_wms_url"))
             or _bounds_from_wms_template(data.get("graniot_image_url"))
         )
+        raw = data.get("raw") if isinstance(data.get("raw"), dict) else {}
+        props = raw.get("properties") if isinstance(raw.get("properties"), dict) else {}
         public_items.append({
             "graniot_parcel_id": data.get("graniot_parcel_id"),
             "graniot_parcel_key": data.get("graniot_parcel_key"),
@@ -689,6 +765,10 @@ def _public_graniot_subparcels(payload: Any) -> List[Dict[str, Any]]:
             "graniot_wms_url": data.get("graniot_wms_url"),
             "graniot_image_url": data.get("graniot_image_url"),
             "graniot_geometry": data.get("graniot_geometry"),
+            "name": props.get("name") or raw.get("name"),
+            "hectares": props.get("hectares"),
+            "parcelresolution_set": props.get("parcelresolution_set") or raw.get("parcelresolution_set"),
+            "last_image_date": _latest_image_date_from_resolutions(props.get("parcelresolution_set") or raw.get("parcelresolution_set")),
             "bounds": bounds,
         })
     return public_items
@@ -811,6 +891,7 @@ def _store_recovered_wms_data(local: Optional[Dict[str, Any]], data: Optional[Di
         "graniot_access_key": data.get("graniot_wms_access_key") or data.get("graniot_access_key"),
         "graniot_wms_access_key": data.get("graniot_wms_access_key"),
         "graniot_wms_url": data.get("graniot_wms_url"),
+        "graniot_image_url": data.get("graniot_image_url"),
         "graniot_bbox": data.get("graniot_bbox"),
         "graniot_geometry": data.get("graniot_geometry"),
     }.items() if v not in (None, "")}
@@ -1029,8 +1110,45 @@ def _build_wms_param_variants(
     geometry = template_params.get("Geometry") or template_params.get("geometry")
     bbox_from_template = template_params.get("BBOX") or template_params.get("bbox")
 
-    # 1) Official Graniot request with explicit image size. This is the closest
-    # to the Graniot OpenAPI and generally returns the complete parcel raster.
+    # 1) Exact Graniot image_url template. This is the most accurate request for
+    # fitting the raster to the parcel because Graniot provides Geometry, BBOX,
+    # WIDTH/HEIGHT and CRS in properties.image_url. The signed access_key comes
+    # from properties.wms_url and is merged into template_params before here.
+    if template_params and (geometry or bbox_from_template):
+        exact_template = dict(template_params)
+        exact_template["access_key"] = access_key_value
+        exact_template["layers"] = layer_value
+        exact_template.setdefault("FORMAT", "image/png")
+        exact_template.setdefault("response_format", "image/png")
+        exact_template.setdefault("WIDTH", width)
+        exact_template.setdefault("HEIGHT", height)
+        exact_template.setdefault("width", width)
+        exact_template.setdefault("height", height)
+        if time:
+            exact_template["TIME"] = time
+            exact_template["time"] = time
+        variants.append(exact_template)
+
+    # 2) Graniot-style request with the exact Geometry and requested BBOX.
+    graniot_style = {
+        "access_key": access_key_value,
+        "layers": layer_value,
+        "response_format": "image/png",
+        "width": width,
+        "height": height,
+    }
+    if geometry:
+        graniot_style["Geometry"] = geometry
+    if time:
+        graniot_style["time"] = time
+    if bbox_latlon:
+        graniot_style["BBOX"] = bbox_latlon
+    elif bbox_from_template:
+        graniot_style["BBOX"] = bbox_from_template
+    variants.append(graniot_style)
+
+    # 3) Documented request plus BBOX. Some deployments accept it and it keeps
+    # the raster coordinate system aligned with the overlay bounds.
     official_sized = {
         "access_key": access_key_value,
         "layers": layer_value,
@@ -1040,9 +1158,15 @@ def _build_wms_param_variants(
     }
     if time:
         official_sized["time"] = time
+    if bbox_latlon:
+        official_bbox = dict(official_sized)
+        official_bbox["BBOX"] = bbox_latlon
+        variants.append(official_bbox)
+
+    # 4) Official Graniot request with explicit image size.
     variants.append(official_sized)
 
-    # 2) Official minimal request for deployments that choose size server-side.
+    # 5) Official minimal request for deployments that choose size server-side.
     official_minimal = {
         "access_key": access_key_value,
         "layers": layer_value,
@@ -1052,16 +1176,8 @@ def _build_wms_param_variants(
         official_minimal["time"] = time
     variants.append(official_minimal)
 
-    # 3) Documented request plus BBOX. Some deployments accept it and it makes
-    # the raster coordinate system exactly match the Leaflet overlay bounds.
-    if bbox_latlon:
-        official_bbox = dict(official_sized)
-        official_bbox["BBOX"] = bbox_latlon
-        variants.append(official_bbox)
-
     if template_params:
-        # 4) Sanitized version of Graniot's image_url. Preserve only parameters
-        # documented for /api/wms/ and drop unsupported OGC query string fields.
+        # 6) Sanitized template fallback.
         allowed_template_keys = {
             "bands",
             "content",
@@ -1087,39 +1203,6 @@ def _build_wms_param_variants(
         if time:
             sanitized_template["time"] = time
         variants.append(sanitized_template)
-
-    if template_params and (geometry or bbox_from_template):
-        # 5) Exact Graniot image_url template fallback. It carries legacy
-        # Geometry/BBOX parameters used by the web app, but can be stale for rows
-        # resynchronized from Dataris, so keep it after the official variants.
-        exact_template = dict(template_params)
-        exact_template["access_key"] = access_key_value
-        exact_template["layers"] = layer_value
-        exact_template.setdefault("response_format", "image/png")
-        exact_template.setdefault("width", width)
-        exact_template.setdefault("height", height)
-        if time:
-            exact_template["time"] = time
-        variants.append(exact_template)
-
-    # 6) Legacy Graniot-style fallback with Geometry/BBOX. Prefer the requested
-    # BBOX over template BBOX so image coordinates match the overlay.
-    graniot_style = {
-        "access_key": access_key_value,
-        "layers": layer_value,
-        "response_format": "image/png",
-        "width": width,
-        "height": height,
-    }
-    if geometry:
-        graniot_style["Geometry"] = geometry
-    if time:
-        graniot_style["time"] = time
-    if bbox_latlon:
-        graniot_style["BBOX"] = bbox_latlon
-    elif bbox_from_template:
-        graniot_style["BBOX"] = bbox_from_template
-    variants.append(graniot_style)
 
     # 7) Standard OGC WMS fallbacks are disabled by default because Graniot's
     # /api/wms/ endpoint expects lowercase `layers` and returns
@@ -2113,10 +2196,27 @@ async def list_layers(
     _require_user(authorization)
     client = GraniotClient()
     try:
-        # Prefer the endpoint that Graniot exposes specifically for WMS-capable layers.
-        # This keeps the satellite UI aligned with the layers that can actually be rendered.
+        # Confirmed Graniot catalog behavior:
+        # - /api/layers/layers-platform/ returns UUID layer.key, resolution and stats metadata.
+        # - /api/layers/get_wms_layers/ returns WMS layer names such as NDVI.
+        # Dataris must combine both: key for statistics/json-index, name for WMS.
+        wms_raw = None
+        wms_names: set[str] = set()
+        try:
+            wms_raw = await client.get("/api/layers/get_wms_layers/")
+            for item in _layer_items(wms_raw):
+                name = item.get("name") or item.get("layer") or item.get("layers") or item.get("key")
+                if name not in (None, ""):
+                    wms_names.add(str(name).strip())
+        except Exception as exc:
+            log_event({
+                "event": "dataris.graniot.layers.wms_catalog_failed",
+                "operation": "list-layers",
+                "exception_type": type(exc).__name__,
+                "message": str(exc),
+            })
+
         attempts = [
-            ("/api/layers/get_wms_layers/", {}),
             ("/api/layers/layers-platform/", {}),
             ("/api/layers/", {"resolution_id": resolution_id, "resolution_name": resolution_name}),
         ]
@@ -2130,7 +2230,12 @@ async def list_layers(
                 raw = await client.get(path, params=params)
                 items = _layer_items(raw)
                 if items:
-                    layers = [_normalize_layer(item) for item in items]
+                    layers = [_normalize_layer(item, wms_names=wms_names) for item in items]
+                    # When WMS names are known, keep only renderable layers for the
+                    # map selector. If the WMS catalog is unavailable, return the API catalog.
+                    if wms_names:
+                        layers = [layer for layer in layers if str(layer.get("wms_layer") or "").strip() in wms_names]
+
                     def _priority(value: Any) -> int:
                         try:
                             return 999999 if value is None else int(value)
@@ -2139,13 +2244,35 @@ async def list_layers(
 
                     layers.sort(key=lambda x: (
                         _priority(x.get("menu_priority")),
-                        str(x.get("layer_resolution") or ""),
+                        str(x.get("resolution_label") or x.get("layer_resolution") or ""),
                         str(x.get("displayed_name") or ""),
+                        str(x.get("name") or ""),
                     ))
-                    return {"data": layers, "raw": raw, "error": None, "count": len(layers), "source_path": path}
+                    return {
+                        "data": layers,
+                        "raw": raw,
+                        "wms_raw": wms_raw,
+                        "error": None,
+                        "count": len(layers),
+                        "source_path": path,
+                        "wms_layer_names": sorted(wms_names),
+                    }
             except Exception as exc:
                 last_error = exc
                 continue
+
+        # Last-resort WMS-only response. These can render as images but will not
+        # provide statistics/json-index UUIDs. Prefer this over demo layers.
+        if wms_raw is not None:
+            wms_layers = [_normalize_layer(item, wms_names=wms_names) for item in _layer_items(wms_raw)]
+            return {
+                "data": wms_layers,
+                "raw": wms_raw,
+                "error": None,
+                "count": len(wms_layers),
+                "source_path": "/api/layers/get_wms_layers/",
+                "wms_layer_names": sorted(wms_names),
+            }
 
         if last_error:
             raise last_error

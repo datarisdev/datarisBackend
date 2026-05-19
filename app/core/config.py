@@ -39,8 +39,8 @@ class Settings(BaseSettings):
     GRANIOT_API_KEY: str | None = None
     # The public ReDoc spec does not declare a security scheme; make it configurable.
     # Common valid values are: X-API-Key, Api-Key, Authorization.
-    GRANIOT_AUTH_HEADER: str = "Authorization"
-    GRANIOT_AUTH_SCHEME: str = "Api-Key"
+    GRANIOT_AUTH_HEADER: str = "X-API-Key"
+    GRANIOT_AUTH_SCHEME: str = ""
     GRANIOT_CLIENT_ID: str | None = None
     # Optional: set this when Graniot requires every parcel to belong to a specific farm.
     # If empty, the backend will try to use the first farm returned by /api/farms/.
