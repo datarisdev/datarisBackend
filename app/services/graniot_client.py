@@ -38,8 +38,10 @@ class GraniotClient:
     def __init__(self) -> None:
         self.base_url = (settings.GRANIOT_BASE_URL or "https://app.graniot.com").rstrip("/")
         self.api_key = settings.GRANIOT_API_KEY
-        self.auth_header = (settings.GRANIOT_AUTH_HEADER or "Authorization").strip()
-        self.auth_scheme = (settings.GRANIOT_AUTH_SCHEME or "Api-Key").strip()
+        # Graniot accepts API keys through X-API-Key. Keep env overrides for
+        # private deployments, but make the confirmed production format the default.
+        self.auth_header = (settings.GRANIOT_AUTH_HEADER or "X-API-Key").strip()
+        self.auth_scheme = (settings.GRANIOT_AUTH_SCHEME or "").strip()
         self.timeout = float(settings.GRANIOT_TIMEOUT_SECONDS or 60)
         self.client_id = settings.GRANIOT_CLIENT_ID
 
@@ -73,10 +75,10 @@ class GraniotClient:
         candidates = [configured]
 
         common_pairs: Iterable[Tuple[str, str]] = (
-            ("Authorization", "Api-Key"),
+            ("X-API-Key", ""),
             ("Authorization", "Bearer"),
             ("Authorization", "Token"),
-            ("X-API-Key", ""),
+            ("Authorization", "Api-Key"),
             ("Api-Key", ""),
             ("api-key", ""),
         )
