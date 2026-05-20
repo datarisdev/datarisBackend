@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import json
 import re
-import time
 import base64
 from io import BytesIO
 from datetime import datetime, timezone
@@ -531,51 +530,6 @@ def _signed_wms_access_key(value: Any) -> Optional[str]:
     if key and not _is_uuid_like(key):
         return key
     return None
-
-
-def _signed_wms_access_key_timestamp(value: Any) -> Optional[float]:
-    """Return the timestamp embedded in a Graniot signed WMS key.
-
-    Graniot access keys normally look like:
-    base64url({"parcel_key": "..."}):timestamp:signature
-
-    Some deployments emit the timestamp in seconds, milliseconds or
-    microseconds. This helper normalizes all three to Unix seconds so the proxy
-    can refresh expired/stale tokens before asking /api/wms/.
-    """
-    try:
-        text = str(value or "").strip()
-        if not text or ":" not in text or _is_uuid_like(text):
-            return None
-        parts = text.split(":")
-        if len(parts) < 2:
-            return None
-        raw_ts = re.sub(r"[^0-9.]", "", parts[1])
-        if not raw_ts:
-            return None
-        timestamp = float(raw_ts)
-        if timestamp > 1_000_000_000_000_000:
-            timestamp = timestamp / 1_000_000
-        elif timestamp > 1_000_000_000_000:
-            timestamp = timestamp / 1_000
-        return timestamp
-    except Exception:
-        return None
-
-
-def _signed_wms_access_key_is_stale(value: Any) -> bool:
-    timestamp = _signed_wms_access_key_timestamp(value)
-    if timestamp is None:
-        return False
-    try:
-        max_age_seconds = float(getattr(settings, "GRANIOT_WMS_ACCESS_KEY_MAX_AGE_SECONDS", 12 * 60 * 60))
-    except Exception:
-        max_age_seconds = 12 * 60 * 60
-    age_seconds = time.time() - timestamp
-    # Future timestamps usually mean clock/format differences, not expiration.
-    if age_seconds < 0:
-        return False
-    return age_seconds > max_age_seconds
 
 def _signed_access_key_value(value: Any) -> Optional[str]:
     """Return a usable /api/wms/ access_key.
@@ -1223,44 +1177,6 @@ def _build_wms_param_variants(
     if time:
         official_minimal["time"] = time
     variants.append(official_minimal)
-
-    # 6) If the UI-selected date is not available for this exact parcel/layer,
-    # Graniot may answer JSON instead of an image. Keep a no-time fallback so
-    # the map still renders the latest available raster instead of returning
-    # a 502 to the browser image request.
-    if time:
-        latest_graniot_style = {
-            "access_key": access_key_value,
-            "layers": layer_value,
-            "response_format": "image/png",
-            "width": width,
-            "height": height,
-        }
-        if geometry:
-            latest_graniot_style["Geometry"] = geometry
-        if bbox_latlon:
-            latest_graniot_style["BBOX"] = bbox_latlon
-        elif bbox_from_template:
-            latest_graniot_style["BBOX"] = bbox_from_template
-        variants.append(latest_graniot_style)
-
-        latest_official_sized = {
-            "access_key": access_key_value,
-            "layers": layer_value,
-            "response_format": "image/png",
-            "width": width,
-            "height": height,
-        }
-        if bbox_latlon:
-            latest_official_bbox = dict(latest_official_sized)
-            latest_official_bbox["BBOX"] = bbox_latlon
-            variants.append(latest_official_bbox)
-        variants.append(latest_official_sized)
-        variants.append({
-            "access_key": access_key_value,
-            "layers": layer_value,
-            "response_format": "image/png",
-        })
 
     if template_params:
         # 6) Sanitized template fallback.
@@ -3464,11 +3380,9 @@ async def wms_proxy(
         and template_parcel_key_from_signed
         and _normalized_token(incoming_parcel_key_from_signed) != _normalized_token(template_parcel_key_from_signed)
     )
-    token_is_stale = _signed_wms_access_key_is_stale(access_key) or _signed_wms_access_key_is_stale(signed_template_access_key)
     needs_signed_recovery = bool(local) and (
         (not signed_template_access_key)
         or template_mismatch
-        or token_is_stale
         or _is_uuid_like(access_key)
     ) and (bool(access_key) or bool(local_graniot_parcel_id))
     if needs_signed_recovery:
@@ -3536,7 +3450,7 @@ async def wms_proxy(
     # (`security: - {}`). Try without auth first to match the spec and to avoid
     # Graniot returning JSON/500/502 because of an unexpected API-key header.
     # Authenticated requests remain as fallback for private deployments.
-    try_auth_fallback = bool(getattr(settings, "GRANIOT_WMS_TRY_AUTH_FALLBACK", True))
+    try_auth_fallback = bool(getattr(settings, "GRANIOT_WMS_TRY_AUTH_FALLBACK", False))
     auth_modes = (False, True) if try_auth_fallback else (False,)
 
     for variant_index, params in enumerate(variants, start=1):
