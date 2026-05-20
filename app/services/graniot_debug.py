@@ -151,19 +151,49 @@ def response_preview(content_type: str, content: bytes, text: Optional[str] = No
     return text
 
 
-def log_event(event: Dict[str, Any]) -> None:
-    if not debug_enabled():
-        return
+def _important_logs_to_stdout_enabled() -> bool:
+    return bool(getattr(settings, "GRANIOT_DEBUG_IMPORTANT_LOGS_TO_STDOUT", True))
 
+
+def _is_important_event(enriched: Dict[str, Any]) -> bool:
+    event_name = str(enriched.get("event") or "")
+    if event_name in {
+        "graniot.exception",
+        "dataris.graniot.wms_proxy.failed",
+        "dataris.graniot.recover_wms_data.failed_lookup",
+        "dataris.graniot.store_recovered_wms_data.failed",
+    }:
+        return True
+    if event_name == "graniot.response":
+        try:
+            return int(enriched.get("status_code") or 0) >= 400
+        except Exception:
+            return False
+    return False
+
+
+def log_event(event: Dict[str, Any]) -> None:
     enriched = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         **safe_payload(event),
     }
 
     line = json.dumps(enriched, ensure_ascii=False, default=str)
-    # Write detailed payloads to file when enabled, but do not flood uvicorn
-    # stdout at INFO level during map rendering.
-    logger.debug("GRANIOT_DEBUG %s", line)
+    is_debug_enabled = debug_enabled()
+    is_important = _is_important_event(enriched)
+
+    # Keep critical Graniot/WMS failures visible in Cloud Run Logs even when
+    # full file-based debug logging is disabled. This is what lets us see why
+    # the browser only gets a generic 502.
+    if is_important and _important_logs_to_stdout_enabled():
+        logger.warning("GRANIOT_IMPORTANT %s", line)
+    elif is_debug_enabled:
+        # Write detailed payloads to file when enabled, but do not flood uvicorn
+        # stdout at INFO level during map rendering.
+        logger.debug("GRANIOT_DEBUG %s", line)
+
+    if not is_debug_enabled:
+        return
 
     if bool(getattr(settings, "GRANIOT_DEBUG_LOG_TO_FILE", True)):
         try:
