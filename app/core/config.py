@@ -55,6 +55,11 @@ class Settings(BaseSettings):
     GRANIOT_DEBUG_LOG_TO_FILE: bool = True
     GRANIOT_DEBUG_LOG_FILE: str | None = None
     GRANIOT_DEBUG_MAX_BODY_CHARS: int = 30000
+    # These diagnostics are intentionally separate from full debug logs:
+    # they only print important WMS/Graniot failures to Cloud Run stdout so a
+    # browser 502 can be traced without enabling noisy file logs.
+    GRANIOT_DEBUG_IMPORTANT_LOGS_TO_STDOUT: bool = True
+    GRANIOT_WMS_DIAGNOSTIC_LOGS_ENABLED: bool = True
     # /api/wms/ is public in the Graniot OpenAPI. Keep auth fallback disabled
     # by default to avoid duplicate WMS requests/log spam. Enable only if a
     # private Graniot deployment requires auth for WMS images.

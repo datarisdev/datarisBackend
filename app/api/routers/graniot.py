@@ -4,6 +4,9 @@ import os
 import json
 import re
 import base64
+import logging
+import time
+import uuid
 from io import BytesIO
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -25,6 +28,46 @@ from app.services.graniot_client import GraniotAPIError, GraniotClient, GraniotN
 from app.services.graniot_debug import clear_logs, get_log_file_path, log_event, read_logs, safe_payload
 
 router = APIRouter(prefix="/graniot", tags=["Graniot"])
+
+wms_logger = logging.getLogger("dataris.graniot.wms_proxy")
+
+
+def _wms_diagnostic_logs_enabled() -> bool:
+    """Keep WMS diagnostics visible in Cloud Run even when full Graniot debug logs are disabled."""
+    return bool(getattr(settings, "GRANIOT_WMS_DIAGNOSTIC_LOGS_ENABLED", True))
+
+
+def _wms_log(level: int, message: str, **fields: Any) -> None:
+    if not _wms_diagnostic_logs_enabled():
+        return
+    try:
+        payload = json.dumps(safe_payload(fields), ensure_ascii=False, default=str)
+    except Exception:
+        payload = str(safe_payload(fields))
+    wms_logger.log(level, "WMS_PROXY %s %s", message, payload)
+
+
+def _wms_exception(message: str, exc: Exception, **fields: Any) -> None:
+    if not _wms_diagnostic_logs_enabled():
+        return
+    try:
+        payload = json.dumps(safe_payload({**fields, "exception_type": type(exc).__name__, "message": str(exc)}), ensure_ascii=False, default=str)
+    except Exception:
+        payload = str({**fields, "exception_type": type(exc).__name__, "message": str(exc)})
+    wms_logger.exception("WMS_PROXY %s %s", message, payload)
+
+
+def _wms_access_key_diagnostics(value: Any) -> Dict[str, Any]:
+    text = str(value or "").strip()
+    payload = _decode_signed_wms_access_key_payload(text) if text else None
+    return {
+        "present": bool(text),
+        "length": len(text),
+        "is_uuid_like": _is_uuid_like(text) if text else False,
+        "is_signed_like": bool(text and ":" in text and not _is_uuid_like(text)),
+        "decoded_payload_keys": sorted(list(payload.keys())) if isinstance(payload, dict) else [],
+        "decoded_has_parcel_key": bool(isinstance(payload, dict) and payload.get("parcel_key")),
+    }
 
 
 def _require_user(authorization: Optional[str]) -> Dict[str, Any]:
@@ -3336,6 +3379,8 @@ async def wms_proxy(
     the browser. It first reuses the exact image_url/Geometry returned by
     Graniot, then falls back to BBOX variants for older local rows.
     """
+    request_id = uuid.uuid4().hex[:12]
+    endpoint_started = time.perf_counter()
     clean_layer = str(layer or "").strip()
     if not clean_layer:
         raise HTTPException(status_code=400, detail="layer requerido")
@@ -3354,7 +3399,30 @@ async def wms_proxy(
 
     access_key = str(access_key or "").strip()
     if not access_key:
+        _wms_log(
+            logging.ERROR,
+            "missing_access_key",
+            request_id=request_id,
+            parcel_id=parcel_id,
+            layer=clean_layer,
+            time=time,
+        )
         raise HTTPException(status_code=400, detail="access_key requerido")
+
+    _wms_log(
+        logging.WARNING,
+        "start",
+        request_id=request_id,
+        parcel_id=parcel_id,
+        layer=clean_layer,
+        time=time,
+        width=width,
+        height=height,
+        has_bbox_param=bool(bbox),
+        bounds={"south": south, "west": west, "north": north, "east": east},
+        local_found=bool(local),
+        access_key_info=_wms_access_key_diagnostics(access_key),
+    )
 
     client = GraniotClient()
 
@@ -3368,6 +3436,27 @@ async def wms_proxy(
 
     template_params = _query_params_from_wms_template(template)
     signed_template_access_key = _signed_wms_access_key(template) or _signed_wms_access_key(template_params.get("access_key") or template_params.get("ACCESS_KEY"))
+
+    _wms_log(
+        logging.WARNING,
+        "template_loaded",
+        request_id=request_id,
+        parcel_id=parcel_id,
+        local_found=bool(local),
+        local_graniot_parcel_id=local_graniot_parcel_id,
+        has_template=bool(template),
+        template_param_keys=sorted([str(k) for k in template_params.keys()]),
+        signed_template_access_key_info=_wms_access_key_diagnostics(signed_template_access_key),
+        local_fields_present={
+            "graniot_access_key": bool(local.get("graniot_access_key")) if local else False,
+            "graniot_wms_access_key": bool(local.get("graniot_wms_access_key")) if local else False,
+            "graniot_wms_url": bool(local.get("graniot_wms_url")) if local else False,
+            "graniot_image_url": bool(local.get("graniot_image_url")) if local else False,
+            "graniot_raw": bool(local.get("graniot_raw")) if local else False,
+            "graniot_geometry": bool(local.get("graniot_geometry")) if local else False,
+            "graniot_bbox": bool(local.get("graniot_bbox")) if local else False,
+        },
+    )
 
     # Rows synchronized before this fix can have a template with Geometry/BBOX
     # but no signed WMS token, or can receive the UUID-like parcel key from the
@@ -3386,10 +3475,44 @@ async def wms_proxy(
         or _is_uuid_like(access_key)
     ) and (bool(access_key) or bool(local_graniot_parcel_id))
     if needs_signed_recovery:
-        recovered_wms_data = await _recover_wms_data_from_graniot(
-            client,
-            access_key=access_key,
-            graniot_parcel_id=local_graniot_parcel_id,
+        _wms_log(
+            logging.WARNING,
+            "signed_recovery_start",
+            request_id=request_id,
+            parcel_id=parcel_id,
+            local_graniot_parcel_id=local_graniot_parcel_id,
+            incoming_access_key_info=_wms_access_key_diagnostics(access_key),
+            template_access_key_info=_wms_access_key_diagnostics(signed_template_access_key),
+            template_mismatch=template_mismatch,
+        )
+        try:
+            recovered_wms_data = await _recover_wms_data_from_graniot(
+                client,
+                access_key=access_key,
+                graniot_parcel_id=local_graniot_parcel_id,
+            )
+        except Exception as exc:
+            _wms_exception(
+                "signed_recovery_exception",
+                exc,
+                request_id=request_id,
+                parcel_id=parcel_id,
+                local_graniot_parcel_id=local_graniot_parcel_id,
+            )
+            recovered_wms_data = None
+        _wms_log(
+            logging.WARNING if recovered_wms_data else logging.ERROR,
+            "signed_recovery_result",
+            request_id=request_id,
+            parcel_id=parcel_id,
+            recovered=bool(recovered_wms_data),
+            recovered_fields_present={
+                "graniot_wms_url": bool(recovered_wms_data.get("graniot_wms_url")) if recovered_wms_data else False,
+                "graniot_wms_access_key": bool(recovered_wms_data.get("graniot_wms_access_key")) if recovered_wms_data else False,
+                "graniot_access_key": bool(recovered_wms_data.get("graniot_access_key")) if recovered_wms_data else False,
+                "graniot_bbox": bool(recovered_wms_data.get("graniot_bbox")) if recovered_wms_data else False,
+                "graniot_geometry": bool(recovered_wms_data.get("graniot_geometry")) if recovered_wms_data else False,
+            },
         )
         if recovered_wms_data:
             recovered_template = recovered_wms_data.get("graniot_wms_url")
@@ -3441,7 +3564,34 @@ async def wms_proxy(
         ))
     variants = _dedupe_wms_variants(variants)[:18]
 
+    _wms_log(
+        logging.WARNING,
+        "variants_built",
+        request_id=request_id,
+        parcel_id=parcel_id,
+        layer=clean_layer,
+        time=time,
+        wms_path=wms_path,
+        layer_candidates=layer_candidates,
+        variants_count=len(variants),
+        bbox_latlon_present=bool(bbox_latlon),
+        bbox_lonlat_present=bool(bbox_lonlat),
+        bbox_values_present=bool(bbox_values),
+        recovered_template=bool(recovered_wms_data),
+        access_key_info=_wms_access_key_diagnostics(access_key),
+        first_variant=safe_payload(variants[0]) if variants else None,
+    )
+
     if not variants:
+        _wms_log(
+            logging.ERROR,
+            "no_variants",
+            request_id=request_id,
+            parcel_id=parcel_id,
+            layer=clean_layer,
+            template_param_keys=sorted([str(k) for k in template_params.keys()]),
+            has_template=bool(template),
+        )
         raise HTTPException(status_code=400, detail="No se pudo construir la solicitud WMS para Graniot")
 
     errors: List[Dict[str, Any]] = []
@@ -3455,10 +3605,24 @@ async def wms_proxy(
 
     for variant_index, params in enumerate(variants, start=1):
         for use_auth in auth_modes:
+            attempt_started = time.perf_counter()
             try:
+                _wms_log(
+                    logging.WARNING,
+                    "attempt_start",
+                    request_id=request_id,
+                    parcel_id=parcel_id,
+                    layer=clean_layer,
+                    time=time,
+                    variant_index=variant_index,
+                    use_auth=use_auth,
+                    path=wms_path,
+                    params=safe_payload(params),
+                )
                 log_event({
                     "event": "dataris.graniot.wms_proxy.request",
                     "operation": "wms-proxy",
+                    "request_id": request_id,
                     "local_parcel_id": parcel_id,
                     "layer": clean_layer,
                     "time": time,
@@ -3479,6 +3643,7 @@ async def wms_proxy(
                     use_auth=use_auth,
                     debug_context={
                         "operation": "wms-proxy",
+                        "request_id": request_id,
                         "local_parcel_id": parcel_id,
                         "layer": clean_layer,
                         "time": time,
@@ -3493,16 +3658,32 @@ async def wms_proxy(
                     include_client_id=False,
                 )
 
+                elapsed_ms = round((time.perf_counter() - attempt_started) * 1000, 2)
                 media_type = raw.headers.get("content-type") or "image/png"
                 if not _is_image_response(raw):
                     preview = _response_preview_text(raw)
-                    errors.append({
+                    error_item = {
                         "variant_index": variant_index,
                         "use_auth": use_auth,
                         "status_code": raw.status_code,
                         "content_type": media_type,
+                        "content_length": len(raw.content or b""),
+                        "elapsed_ms": elapsed_ms,
                         "preview": preview,
-                    })
+                        "response_headers": safe_payload(dict(raw.headers)),
+                    }
+                    errors.append(error_item)
+                    _wms_log(
+                        logging.ERROR,
+                        "attempt_non_image_response",
+                        request_id=request_id,
+                        parcel_id=parcel_id,
+                        layer=clean_layer,
+                        time=time,
+                        path=wms_path,
+                        params=safe_payload(params),
+                        error=error_item,
+                    )
                     continue
 
                 request_bounds = _bounds_from_wms_params(params)
@@ -3521,10 +3702,31 @@ async def wms_proxy(
                     geometry=clip_geometry,
                 )
 
+                _wms_log(
+                    logging.WARNING,
+                    "attempt_success",
+                    request_id=request_id,
+                    parcel_id=parcel_id,
+                    layer=clean_layer,
+                    time=time,
+                    variant_index=variant_index,
+                    use_auth=use_auth,
+                    status_code=raw.status_code,
+                    source_media_type=media_type,
+                    output_media_type=final_media_type,
+                    source_content_length=len(raw.content or b""),
+                    output_content_length=len(content or b""),
+                    elapsed_ms=elapsed_ms,
+                    total_elapsed_ms=round((time.perf_counter() - endpoint_started) * 1000, 2),
+                    backend_clip_applied=backend_clip_applied,
+                    clip_info=safe_payload(clip_info),
+                )
+
                 if backend_clip_applied:
                     log_event({
                         "event": "dataris.graniot.wms_proxy.backend_clip_applied",
                         "operation": "wms-proxy",
+                        "request_id": request_id,
                         "local_parcel_id": parcel_id,
                         "layer": clean_layer,
                         "time": time,
@@ -3540,6 +3742,7 @@ async def wms_proxy(
                     log_event({
                         "event": "dataris.graniot.wms_proxy.backend_clip_skipped",
                         "operation": "wms-proxy",
+                        "request_id": request_id,
                         "local_parcel_id": parcel_id,
                         "layer": clean_layer,
                         "time": time,
@@ -3557,37 +3760,83 @@ async def wms_proxy(
                     headers={"Cache-Control": "public, max-age=300"},
                 )
             except GraniotAPIError as exc:
-                errors.append({
+                elapsed_ms = round((time.perf_counter() - attempt_started) * 1000, 2)
+                error_item = {
                     "variant_index": variant_index,
                     "use_auth": use_auth,
                     "status_code": exc.status_code,
                     "message": str(exc),
+                    "elapsed_ms": elapsed_ms,
                     "payload": safe_payload(exc.payload),
-                })
+                }
+                errors.append(error_item)
+                _wms_log(
+                    logging.ERROR,
+                    "attempt_graniot_api_error",
+                    request_id=request_id,
+                    parcel_id=parcel_id,
+                    layer=clean_layer,
+                    time=time,
+                    path=wms_path,
+                    params=safe_payload(params),
+                    error=error_item,
+                )
                 continue
             except Exception as exc:
-                errors.append({
+                elapsed_ms = round((time.perf_counter() - attempt_started) * 1000, 2)
+                error_item = {
                     "variant_index": variant_index,
                     "use_auth": use_auth,
                     "message": str(exc),
                     "exception_type": type(exc).__name__,
-                })
+                    "elapsed_ms": elapsed_ms,
+                }
+                errors.append(error_item)
+                _wms_exception(
+                    "attempt_unhandled_exception",
+                    exc,
+                    request_id=request_id,
+                    parcel_id=parcel_id,
+                    layer=clean_layer,
+                    time=time,
+                    path=wms_path,
+                    variant_index=variant_index,
+                    use_auth=use_auth,
+                    params=safe_payload(params),
+                )
                 continue
 
-    log_event({
-        "event": "dataris.graniot.wms_proxy.failed",
-        "operation": "wms-proxy",
+    total_elapsed_ms = round((time.perf_counter() - endpoint_started) * 1000, 2)
+    failure_payload = {
+        "request_id": request_id,
         "local_parcel_id": parcel_id,
         "layer": clean_layer,
         "time": time,
+        "wms_path": wms_path,
+        "total_elapsed_ms": total_elapsed_ms,
         "has_template": bool(template),
         "recovered_template": bool(recovered_wms_data),
         "layer_candidates": layer_candidates,
-        "errors": safe_payload(errors[-8:]),
+        "variants_count": len(variants),
+        "auth_modes": list(auth_modes),
+        "access_key_info": _wms_access_key_diagnostics(access_key),
+        "template_param_keys": sorted([str(k) for k in template_params.keys()]),
+        "errors": safe_payload(errors[-18:]),
+    }
+    log_event({
+        "event": "dataris.graniot.wms_proxy.failed",
+        "operation": "wms-proxy",
+        **failure_payload,
     })
+    _wms_log(logging.ERROR, "failed_all_attempts", **failure_payload)
 
     hint = (
         "Graniot no devolvió una imagen para esta capa. "
-        "Revisa en la respuesta JSON de esta solicitud los attempts; ahora el proxy intenta primero la forma oficial /api/wms/?access_key=...&layers=..."
+        "Busca en Cloud Run Logs por el request_id para ver la traza completa del proxy WMS."
     )
-    raise HTTPException(status_code=502, detail={"message": hint, "attempts": errors[-8:]})
+    raise HTTPException(status_code=502, detail={
+        "message": hint,
+        "request_id": request_id,
+        "total_elapsed_ms": total_elapsed_ms,
+        "attempts": errors[-18:],
+    })
