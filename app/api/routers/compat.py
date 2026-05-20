@@ -690,7 +690,12 @@ def generate_temporary_password(length: int = 12) -> str:
             return password
 
 
-def send_temporary_password_email(email: str, password: str, first_name: Optional[str] = None) -> Dict[str, Any]:
+def send_temporary_password_email(
+    email: str,
+    password: str,
+    first_name: Optional[str] = None,
+    company_name: Optional[str] = None,
+) -> Dict[str, Any]:
     host = os.getenv("SMTP_HOST", "").strip()
     port = int(os.getenv("SMTP_PORT", "587") or "587")
     username = os.getenv("SMTP_USERNAME", "").strip()
@@ -704,18 +709,94 @@ def send_temporary_password_email(email: str, password: str, first_name: Optiona
         return {"sent": False, "reason": "SMTP no configurado"}
 
     display_name = first_name or "usuario"
+    company_display = company_name or "tu empresa"
+    login_url = f"{frontend_url}/login"
+
     message = EmailMessage()
-    message["Subject"] = "Acceso temporal a Dataris"
+    message["Subject"] = "Tu acceso temporal a Dataris está listo"
     message["From"] = f"{sender_name} <{sender}>" if sender_name else sender
     message["To"] = email
     message.set_content(
         f"Hola {display_name},\n\n"
         "Se creó tu acceso a Dataris.\n\n"
+        f"Empresa: {company_display}\n"
         f"Correo: {email}\n"
         f"Contraseña temporal: {password}\n\n"
-        f"Ingresa en: {frontend_url}/login\n\n"
+        f"Ingresa en: {login_url}\n\n"
         "Por seguridad, cambia tu contraseña al ingresar por primera vez.\n\n"
         "Equipo Dataris"
+    )
+
+    safe_display_name = str(display_name).replace("<", "&lt;").replace(">", "&gt;")
+    safe_company = str(company_display).replace("<", "&lt;").replace(">", "&gt;")
+    safe_email = str(email).replace("<", "&lt;").replace(">", "&gt;")
+    safe_password = str(password).replace("<", "&lt;").replace(">", "&gt;")
+    safe_login_url = str(login_url).replace('"', "%22")
+
+    message.add_alternative(
+        f"""
+        <!doctype html>
+        <html lang="es">
+          <head>
+            <meta charset="utf-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1" />
+            <title>Acceso temporal a Dataris</title>
+          </head>
+          <body style="margin:0;background:#f4f7f6;font-family:Inter,Segoe UI,Arial,sans-serif;color:#0f172a;">
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f4f7f6;padding:32px 12px;">
+              <tr>
+                <td align="center">
+                  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:620px;background:#ffffff;border-radius:24px;overflow:hidden;border:1px solid #e2e8f0;box-shadow:0 18px 48px rgba(15,23,42,.12);">
+                    <tr>
+                      <td style="background:linear-gradient(135deg,#031b1f 0%,#063d36 55%,#0f766e 100%);padding:34px 34px 28px;color:#ffffff;">
+                        <div style="font-size:13px;letter-spacing:.18em;text-transform:uppercase;font-weight:800;color:#b7f7df;">DATARIS</div>
+                        <h1 style="margin:18px 0 8px;font-size:29px;line-height:1.16;font-weight:800;">Tu acceso está listo</h1>
+                        <p style="margin:0;color:#d9fff0;font-size:15px;line-height:1.55;">Se creó una cuenta para que puedas ingresar a la plataforma agrícola de Dataris.</p>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td style="padding:32px 34px;">
+                        <p style="margin:0 0 18px;font-size:16px;line-height:1.6;">Hola <strong>{safe_display_name}</strong>,</p>
+                        <p style="margin:0 0 24px;color:#475569;font-size:15px;line-height:1.65;">Tu administrador creó tu usuario y lo vinculó a <strong>{safe_company}</strong>. Usa la siguiente contraseña temporal para iniciar sesión.</p>
+
+                        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:separate;border-spacing:0 10px;margin:0 0 24px;">
+                          <tr>
+                            <td style="width:150px;color:#64748b;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;">Empresa</td>
+                            <td style="font-size:15px;font-weight:700;color:#0f172a;">{safe_company}</td>
+                          </tr>
+                          <tr>
+                            <td style="width:150px;color:#64748b;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;">Correo</td>
+                            <td style="font-size:15px;font-weight:700;color:#0f172a;">{safe_email}</td>
+                          </tr>
+                        </table>
+
+                        <div style="background:#ecfdf5;border:1px solid #a7f3d0;border-radius:18px;padding:18px 20px;margin:0 0 26px;">
+                          <div style="font-size:12px;font-weight:800;letter-spacing:.11em;text-transform:uppercase;color:#047857;margin-bottom:8px;">Contraseña temporal</div>
+                          <div style="font-family:SFMono-Regular,Consolas,Monaco,monospace;font-size:23px;line-height:1.35;font-weight:800;color:#064e3b;background:#ffffff;border-radius:12px;padding:12px 14px;border:1px solid #bbf7d0;">{safe_password}</div>
+                        </div>
+
+                        <div style="text-align:center;margin:28px 0;">
+                          <a href="{safe_login_url}" style="display:inline-block;background:#0f766e;color:#ffffff;text-decoration:none;border-radius:999px;padding:14px 24px;font-weight:800;font-size:15px;box-shadow:0 10px 22px rgba(15,118,110,.28);">Ingresar a Dataris</a>
+                        </div>
+
+                        <div style="border-top:1px solid #e2e8f0;padding-top:20px;color:#64748b;font-size:13px;line-height:1.6;">
+                          Por seguridad, cambia tu contraseña después de iniciar sesión. Si no esperabas este acceso, contacta al administrador de tu empresa.
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td style="background:#f8fafc;padding:20px 34px;color:#64748b;font-size:12px;line-height:1.5;">
+                        © Dataris · Plataforma agrícola inteligente para análisis, mapas y gestión operativa.
+                      </td>
+                    </tr>
+                  </table>
+                </td>
+              </tr>
+            </table>
+          </body>
+        </html>
+        """,
+        subtype="html",
     )
 
     try:
@@ -728,7 +809,6 @@ def send_temporary_password_email(email: str, password: str, first_name: Optiona
         return {"sent": True, "reason": None}
     except Exception as exc:
         return {"sent": False, "reason": str(exc)}
-
 
 @router.post("/admin/users/manual")
 def create_manual_admin_user(payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
@@ -860,7 +940,7 @@ def create_manual_admin_user(payload: Dict[str, Any] = Body(default_factory=dict
             company["used_hectares"] = float(company.get("used_hectares") or 0) + assigned_hectares
             company["updated_at"] = t
 
-        email_result = send_temporary_password_email(email, temporary_password, first_name)
+        email_result = send_temporary_password_email(email, temporary_password, first_name, company.get("name") if company else None)
         write_db(db)
 
     return {
