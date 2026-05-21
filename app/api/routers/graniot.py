@@ -5,7 +5,7 @@ import json
 import re
 import base64
 import logging
-import time
+import time as time_module
 import uuid
 from io import BytesIO
 from datetime import datetime, timezone
@@ -3411,7 +3411,7 @@ async def wms_proxy(
     east: Optional[float] = Query(default=None),
 ):
     request_id = uuid.uuid4().hex[:12]
-    started = time.perf_counter()
+    started = time_module.perf_counter()
     _wms_cloud_log(
         logging.WARNING,
         "start",
@@ -3500,7 +3500,7 @@ async def wms_proxy(
 
 
 # Alias used so the wrapper above can log every failure with a request_id and full traceback.
-time_module_perf_counter = time.perf_counter
+time_module_perf_counter = time_module.perf_counter
 
 
 async def _wms_proxy_impl(
