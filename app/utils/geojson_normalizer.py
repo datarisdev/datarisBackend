@@ -4,12 +4,116 @@ import json
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from pyproj import CRS, Transformer
-from shapely.geometry import mapping, shape
+from shapely.errors import GEOSException
+from shapely.geometry import GeometryCollection, MultiPolygon, Polygon, mapping, shape
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import transform, unary_union
 
+try:
+    from shapely.validation import make_valid as shapely_make_valid
+except Exception:  # pragma: no cover - fallback for older environments
+    shapely_make_valid = None
+
 MAX_MERCATOR_LATITUDE = 85.051129
 MIN_RING_POINTS = 3
+
+
+
+def _polygonal_parts(geom: BaseGeometry) -> List[BaseGeometry]:
+    if geom is None or geom.is_empty:
+        return []
+    if geom.geom_type == "Polygon":
+        return [geom]
+    if geom.geom_type == "MultiPolygon":
+        return [part for part in geom.geoms if not part.is_empty]
+    if geom.geom_type == "GeometryCollection":
+        parts: List[BaseGeometry] = []
+        for child in geom.geoms:
+            parts.extend(_polygonal_parts(child))
+        return parts
+    return []
+
+
+def _repair_single_polygonal(geom: BaseGeometry) -> Optional[BaseGeometry]:
+    if geom is None or geom.is_empty:
+        return None
+
+    candidates: List[BaseGeometry] = [geom]
+    if shapely_make_valid is not None:
+        try:
+            candidates.append(shapely_make_valid(geom))
+        except Exception:
+            pass
+    try:
+        candidates.append(geom.buffer(0))
+    except Exception:
+        pass
+
+    for candidate in candidates:
+        if candidate is None or candidate.is_empty:
+            continue
+        parts = _polygonal_parts(candidate)
+        if not parts:
+            continue
+        clean_parts: List[BaseGeometry] = []
+        for part in parts:
+            cleaned = part
+            if not cleaned.is_valid:
+                if shapely_make_valid is not None:
+                    try:
+                        cleaned = shapely_make_valid(cleaned)
+                    except Exception:
+                        pass
+                if not getattr(cleaned, "is_valid", False):
+                    try:
+                        cleaned = cleaned.buffer(0)
+                    except Exception:
+                        pass
+            clean_parts.extend([p for p in _polygonal_parts(cleaned) if not p.is_empty])
+        clean_parts = [p for p in clean_parts if p.is_valid and p.area > 0]
+        if not clean_parts:
+            continue
+        if len(clean_parts) == 1:
+            return clean_parts[0]
+        try:
+            merged = unary_union(clean_parts)
+            if not merged.is_empty:
+                if not merged.is_valid and shapely_make_valid is not None:
+                    merged = shapely_make_valid(merged)
+                if not merged.is_valid:
+                    merged = merged.buffer(0)
+                polygonal = _polygonal_parts(merged)
+                if polygonal:
+                    return unary_union(polygonal) if len(polygonal) > 1 else polygonal[0]
+        except Exception:
+            return MultiPolygon([p for p in clean_parts if p.geom_type == "Polygon"])
+    return None
+
+
+def _repair_polygonal_geometry(geom: BaseGeometry) -> Optional[BaseGeometry]:
+    repaired = _repair_single_polygonal(geom)
+    if repaired is None or repaired.is_empty:
+        return None
+    if repaired.geom_type not in {"Polygon", "MultiPolygon"}:
+        parts = _polygonal_parts(repaired)
+        if not parts:
+            return None
+        try:
+            repaired = unary_union(parts) if len(parts) > 1 else parts[0]
+        except Exception:
+            repaired = MultiPolygon([p for p in parts if p.geom_type == "Polygon"])
+    return repaired if not repaired.is_empty else None
+
+
+def _normalize_polygonal_geojson(geom_dict: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    try:
+        geom_obj = shape(geom_dict)
+        repaired = _repair_polygonal_geometry(geom_obj)
+        if repaired is None:
+            return None
+        return mapping(repaired)
+    except Exception:
+        return geom_dict
 
 
 def _jsonable(value: Any) -> Any:
@@ -139,7 +243,9 @@ def _normalize_geometry(geometry: Any) -> Optional[Dict[str, Any]]:
     if gtype == "Polygon":
         rings = [_normalize_ring(ring, "lnglat") for ring in (geom.get("coordinates") or [])]
         rings = [ring for ring in rings if len(ring) >= MIN_RING_POINTS + 1]
-        return {"type": "Polygon", "coordinates": rings} if rings else None
+        if not rings:
+            return None
+        return _normalize_polygonal_geojson({"type": "Polygon", "coordinates": rings})
     if gtype == "MultiPolygon":
         polygons = []
         for polygon in geom.get("coordinates") or []:
@@ -147,7 +253,9 @@ def _normalize_geometry(geometry: Any) -> Optional[Dict[str, Any]]:
             rings = [ring for ring in rings if len(ring) >= MIN_RING_POINTS + 1]
             if rings:
                 polygons.append(rings)
-        return {"type": "MultiPolygon", "coordinates": polygons} if polygons else None
+        if not polygons:
+            return None
+        return _normalize_polygonal_geojson({"type": "MultiPolygon", "coordinates": polygons})
     if gtype in {"LineString", "MultiLineString", "Point", "MultiPoint"}:
         # For flight tracks/points: keep valid GeoJSON order and let the frontend render it.
         try:
@@ -259,11 +367,31 @@ def geometry_area_ha(feature_collection: Optional[Dict[str, Any]]) -> Optional[f
             continue
     if not geoms:
         return None
-    union = unary_union(geoms)
-    metric = _metric_crs_for_geom(union)
-    transformer = Transformer.from_crs(CRS.from_epsg(4326), metric, always_xy=True)
-    metric_geom = transform(transformer.transform, union)
-    return round(float(metric_geom.area / 10000.0), 4)
+    repaired_geoms = []
+    for geom in geoms:
+        repaired = _repair_polygonal_geometry(geom)
+        if repaired is not None and not repaired.is_empty:
+            repaired_geoms.append(repaired)
+    if not repaired_geoms:
+        return None
+
+    try:
+        union = unary_union(repaired_geoms)
+        repaired_union = _repair_polygonal_geometry(union)
+        if repaired_union is not None and not repaired_union.is_empty:
+            union = repaired_union
+        metric = _metric_crs_for_geom(union)
+        transformer = Transformer.from_crs(CRS.from_epsg(4326), metric, always_xy=True)
+        metric_geom = transform(transformer.transform, union)
+        return round(float(metric_geom.area / 10000.0), 4)
+    except (GEOSException, ValueError, Exception):
+        total = 0.0
+        for geom in repaired_geoms:
+            metric = _metric_crs_for_geom(geom)
+            transformer = Transformer.from_crs(CRS.from_epsg(4326), metric, always_xy=True)
+            metric_geom = transform(transformer.transform, geom)
+            total += float(metric_geom.area / 10000.0)
+        return round(total, 4)
 
 
 def summarize_geojson(value: Any) -> Dict[str, Any]:
