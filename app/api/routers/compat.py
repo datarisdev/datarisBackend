@@ -732,15 +732,6 @@ def send_temporary_password_email(email: str, password: str, first_name: Optiona
 
 @router.post("/admin/users/manual")
 def create_manual_admin_user(payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
-    """Crea usuarios desde el panel admin con contraseña temporal generada por backend.
-
-    El frontend ya no crea usuarios con signUp directo. Este endpoint centraliza:
-    - generación de contraseña temporal,
-    - creación de user/profile/admin_user,
-    - asignación de módulos,
-    - actualización de hectáreas,
-    - envío opcional de correo SMTP.
-    """
     with LOCK:
         db = read_db()
         ctx = require_admin_context(authorization, db)
@@ -750,6 +741,10 @@ def create_manual_admin_user(payload: Dict[str, Any] = Body(default_factory=dict
         email = clean_email(payload.get("email"))
         if any(str(u.get("email", "")).lower() == email for u in db.get("users", [])):
             raise HTTPException(status_code=400, detail="Ya existe un usuario con ese correo")
+
+        manual_password = clean_password(payload.get("password"))
+        if len(manual_password) < 8:
+            raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 8 caracteres")
 
         company_id = payload.get("company_id") or current_admin.get("company_id")
         if not is_super_admin and company_id != current_admin.get("company_id"):
@@ -789,19 +784,17 @@ def create_manual_admin_user(payload: Dict[str, Any] = Body(default_factory=dict
 
         t = now()
         user_id = str(uuid.uuid4())
-        temporary_password = generate_temporary_password()
         user = {
             "id": user_id,
             "email": email,
-            "password_hash": password_hash(temporary_password),
+            "password_hash": password_hash(manual_password),
             "is_active": is_active,
             "created_at": t,
             "updated_at": t,
             "user_metadata": {
                 "first_name": first_name,
                 "last_name": last_name,
-                "temporary_password": True,
-                "must_change_password": True,
+                "manual_password": True,
             },
         }
         db.setdefault("users", []).append(user)
@@ -823,7 +816,6 @@ def create_manual_admin_user(payload: Dict[str, Any] = Body(default_factory=dict
             "updated_at": t,
         })
 
-        # Roles del sistema principal: admin para quienes administran empresa/plataforma, user para usuario normal.
         app_role = "admin" if admin_role in {"superadmin", "company_admin"} else "user"
         table(db, "user_roles").append({"id": str(uuid.uuid4()), "user_id": user_id, "role": app_role, "created_at": t})
 
@@ -860,16 +852,15 @@ def create_manual_admin_user(payload: Dict[str, Any] = Body(default_factory=dict
             company["used_hectares"] = float(company.get("used_hectares") or 0) + assigned_hectares
             company["updated_at"] = t
 
-        email_result = send_temporary_password_email(email, temporary_password, first_name)
         write_db(db)
 
     return {
         "data": {
             "user": public_user(user),
             "admin_user": enrich(db, "admin_users", admin_row),
-            "temporary_password": temporary_password,
-            "email_sent": bool(email_result.get("sent")),
-            "email_message": email_result.get("reason"),
+            "manual_password": True,
+            "email_sent": False,
+            "email_message": None,
         },
         "error": None,
     }
