@@ -31,7 +31,6 @@ except Exception:  # pragma: no cover - optional fallback for local/dev environm
 from app.core.config import settings
 from app.services.telemetry.helicopter_processor import process_helicopter_zip
 from app.services.telemetry.aerial_copilot import process_aerial_copilot
-from app.services.telemetry.parcel_upload import parse_parcel_file
 from app.utils.geojson_normalizer import normalize_record_geometries
 
 router = APIRouter(prefix="/compat", tags=["Frontend Compatibility"])
@@ -1066,6 +1065,8 @@ async def upload_parcel_from_satellite(
     try:
         with dest.open("wb") as out:
             shutil.copyfileobj(file.file, out)
+        from app.services.telemetry.parcel_upload import parse_parcel_file
+
         parsed = parse_parcel_file(dest, clean_original)
         t = now()
         public_url = f"/api/compat/storage/public/parcels/{str(storage_path).replace(os.sep, '/') }"
