@@ -9,7 +9,10 @@ from xml.etree import ElementTree as ET
 
 import shapefile  # pyshp
 from pyproj import CRS, Transformer
-from shapely.errors import GEOSException
+try:
+    from shapely.errors import GEOSException
+except Exception:  # Compatibilidad con versiones antiguas de Shapely
+    GEOSException = Exception
 from shapely.geometry import MultiPolygon, Polygon, mapping, shape as shapely_shape
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import transform, unary_union

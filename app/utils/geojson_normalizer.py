@@ -4,7 +4,10 @@ import json
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from pyproj import CRS, Transformer
-from shapely.errors import GEOSException
+try:
+    from shapely.errors import GEOSException
+except Exception:  # Compatibilidad con versiones antiguas de Shapely
+    GEOSException = Exception
 from shapely.geometry import GeometryCollection, MultiPolygon, Polygon, mapping, shape
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import transform, unary_union
