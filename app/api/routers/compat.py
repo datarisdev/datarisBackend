@@ -1102,7 +1102,17 @@ async def upload_parcel_from_satellite(
             dest.unlink(missing_ok=True)
         except Exception:
             pass
-        raise HTTPException(status_code=500, detail=f"Error subiendo parcela: {exc}")
+        raw_message = str(exc)
+        if "TopologyException" in raw_message or "side location conflict" in raw_message:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "El shapefile contiene una geometría inválida o auto-intersectada. "
+                    "Intenta exportarlo nuevamente como ZIP con .shp, .shx, .dbf y .prj; "
+                    "si el problema continúa, corrige/repara la geometría en QGIS antes de subirlo."
+                ),
+            )
+        raise HTTPException(status_code=500, detail=f"Error subiendo parcela: {raw_message}")
 
 
 @router.post("/storage/{bucket}/upload")

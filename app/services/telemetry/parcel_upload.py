@@ -9,11 +9,91 @@ from xml.etree import ElementTree as ET
 
 import shapefile  # pyshp
 from pyproj import CRS, Transformer
-from shapely.geometry import Polygon, mapping, shape as shapely_shape
+from shapely.errors import GEOSException
+from shapely.geometry import MultiPolygon, Polygon, mapping, shape as shapely_shape
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import transform, unary_union
 
+try:
+    from shapely.validation import make_valid as shapely_make_valid
+except Exception:  # pragma: no cover
+    shapely_make_valid = None
+
 from app.utils.geojson_normalizer import summarize_geojson
+
+
+
+def _polygonal_parts(geom: BaseGeometry) -> List[BaseGeometry]:
+    if geom is None or geom.is_empty:
+        return []
+    if geom.geom_type == "Polygon":
+        return [geom]
+    if geom.geom_type == "MultiPolygon":
+        return [part for part in geom.geoms if not part.is_empty]
+    if geom.geom_type == "GeometryCollection":
+        parts: List[BaseGeometry] = []
+        for child in geom.geoms:
+            parts.extend(_polygonal_parts(child))
+        return parts
+    return []
+
+
+def _repair_polygonal_geometry(geom: BaseGeometry) -> Optional[BaseGeometry]:
+    if geom is None or geom.is_empty:
+        return None
+
+    candidates: List[BaseGeometry] = [geom]
+    if shapely_make_valid is not None:
+        try:
+            candidates.append(shapely_make_valid(geom))
+        except Exception:
+            pass
+    try:
+        candidates.append(geom.buffer(0))
+    except Exception:
+        pass
+
+    for candidate in candidates:
+        if candidate is None or candidate.is_empty:
+            continue
+        parts = _polygonal_parts(candidate)
+        if not parts:
+            continue
+
+        clean_parts: List[BaseGeometry] = []
+        for part in parts:
+            cleaned = part
+            if not cleaned.is_valid:
+                if shapely_make_valid is not None:
+                    try:
+                        cleaned = shapely_make_valid(cleaned)
+                    except Exception:
+                        pass
+                if not getattr(cleaned, "is_valid", False):
+                    try:
+                        cleaned = cleaned.buffer(0)
+                    except Exception:
+                        pass
+            clean_parts.extend([p for p in _polygonal_parts(cleaned) if p.is_valid and p.area > 0])
+
+        if not clean_parts:
+            continue
+        if len(clean_parts) == 1:
+            return clean_parts[0]
+        try:
+            merged = unary_union(clean_parts)
+            if not merged.is_empty:
+                if not merged.is_valid and shapely_make_valid is not None:
+                    merged = shapely_make_valid(merged)
+                if not merged.is_valid:
+                    merged = merged.buffer(0)
+                polygonal = _polygonal_parts(merged)
+                if polygonal:
+                    return unary_union(polygonal) if len(polygonal) > 1 else polygonal[0]
+        except Exception:
+            polygons = [p for p in clean_parts if p.geom_type == "Polygon"]
+            return MultiPolygon(polygons) if polygons else None
+    return None
 
 
 def _safe_extract(zip_file: zipfile.ZipFile, destination: Path) -> None:
@@ -82,11 +162,31 @@ def _area_ha_wgs(features: List[Dict[str, Any]]) -> float:
             continue
     if not geoms:
         return 0.0
-    union = unary_union(geoms)
-    c = union.centroid
-    metric = _utm_crs_from_lonlat(c.x, c.y)
-    metric_geom = _to_crs(union, CRS.from_epsg(4326), metric)
-    return float(metric_geom.area / 10000.0)
+    repaired_geoms = []
+    for geom in geoms:
+        repaired = _repair_polygonal_geometry(geom)
+        if repaired is not None and not repaired.is_empty:
+            repaired_geoms.append(repaired)
+    if not repaired_geoms:
+        return 0.0
+
+    try:
+        union = unary_union(repaired_geoms)
+        repaired_union = _repair_polygonal_geometry(union)
+        if repaired_union is not None and not repaired_union.is_empty:
+            union = repaired_union
+        c = union.centroid
+        metric = _utm_crs_from_lonlat(c.x, c.y)
+        metric_geom = _to_crs(union, CRS.from_epsg(4326), metric)
+        return float(metric_geom.area / 10000.0)
+    except (GEOSException, ValueError, Exception):
+        total = 0.0
+        for geom in repaired_geoms:
+            c = geom.centroid
+            metric = _utm_crs_from_lonlat(c.x, c.y)
+            metric_geom = _to_crs(geom, CRS.from_epsg(4326), metric)
+            total += float(metric_geom.area / 10000.0)
+        return total
 
 
 def _record_props(reader: shapefile.Reader, record: Any) -> Dict[str, Any]:
@@ -112,8 +212,11 @@ def _read_shapefile(shp_path: Path) -> Dict[str, Any]:
         if geom.is_empty:
             continue
         geom_wgs = _to_crs(geom, src_crs, CRS.from_epsg(4326))
-        # Parcelas/lotes deben ser polígonos. Si viene multiparte, se respeta.
-        if geom_wgs.geom_type not in {"Polygon", "MultiPolygon"}:
+        # Parcelas/lotes deben ser polígonos. Se reparan geometrías SHP
+        # comunes con auto-intersecciones, anillos abiertos o multipartes
+        # problemáticas para evitar errores TopologyException al guardar.
+        geom_wgs = _repair_polygonal_geometry(geom_wgs)
+        if geom_wgs is None or geom_wgs.geom_type not in {"Polygon", "MultiPolygon"}:
             continue
         features.append({
             "type": "Feature",
@@ -163,8 +266,8 @@ def _parse_kml_text(text: str) -> Dict[str, Any]:
                 continue
             if coords[0] != coords[-1]:
                 coords.append(coords[0])
-            geom = Polygon(coords)
-            if geom.is_valid and not geom.is_empty:
+            geom = _repair_polygonal_geometry(Polygon(coords))
+            if geom is not None and geom.is_valid and not geom.is_empty:
                 features.append({
                     "type": "Feature",
                     "properties": {"name": name, "Name": name},
