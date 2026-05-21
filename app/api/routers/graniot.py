@@ -3558,8 +3558,15 @@ async def _wms_proxy_impl(
 
     # Rows synchronized before this fix can have a template with Geometry/BBOX
     # but no signed WMS token, or can receive the UUID-like parcel key from the
-    # frontend. In both cases /api/wms/ returns {"Invalid access key."}. Recover
-    # the current properties.image_url from Graniot and use its signed token.
+    # frontend. In both cases /api/wms/ returns {"Invalid access key."}.
+    #
+    # Important: Graniot signed WMS access_key values can also expire even when
+    # they still look structurally valid. The browser URL may therefore contain
+    # a signed token that decodes correctly but Graniot rejects with
+    # "Invalid access key.". To avoid leaving the satellite layer broken, refresh
+    # the WMS metadata from Graniot once per proxy request when a local parcel is
+    # available, then prefer the freshly recovered signed key over the key that
+    # came from the frontend/local cache.
     incoming_parcel_key_from_signed = _parcel_key_from_signed_wms_access_key(access_key)
     template_parcel_key_from_signed = _parcel_key_from_signed_wms_access_key(signed_template_access_key)
     template_mismatch = bool(
@@ -3567,12 +3574,30 @@ async def _wms_proxy_impl(
         and template_parcel_key_from_signed
         and _normalized_token(incoming_parcel_key_from_signed) != _normalized_token(template_parcel_key_from_signed)
     )
-    needs_signed_recovery = bool(local) and (
-        (not signed_template_access_key)
-        or template_mismatch
-        or _is_uuid_like(access_key)
-    ) and (bool(access_key) or bool(local_graniot_parcel_id))
+
+    recovery_reasons: List[str] = []
+    if not signed_template_access_key:
+        recovery_reasons.append("missing_signed_template_key")
+    if template_mismatch:
+        recovery_reasons.append("template_signed_key_mismatch")
+    if _is_uuid_like(access_key):
+        recovery_reasons.append("uuid_like_access_key")
+    if signed_template_access_key and not _is_uuid_like(access_key):
+        recovery_reasons.append("refresh_possible_expired_signed_key")
+
+    needs_signed_recovery = bool(local) and bool(recovery_reasons) and (bool(access_key) or bool(local_graniot_parcel_id))
     if needs_signed_recovery:
+        _wms_cloud_log(
+            logging.WARNING,
+            "refresh_wms_metadata",
+            parcel_id=parcel_id,
+            layer=clean_layer,
+            time=time,
+            reasons=recovery_reasons,
+            local_graniot_parcel_id=local_graniot_parcel_id,
+            request_access_key=_wms_token_info(access_key),
+            template_access_key=_wms_token_info(signed_template_access_key),
+        )
         recovered_wms_data = await _recover_wms_data_from_graniot(
             client,
             access_key=access_key,
@@ -3589,12 +3614,35 @@ async def _wms_proxy_impl(
                 if recovered_key and not _is_uuid_like(recovered_key):
                     signed_template_access_key = str(recovered_key).strip()
             _store_recovered_wms_data(local, recovered_wms_data)
+            _wms_cloud_log(
+                logging.WARNING,
+                "refresh_wms_metadata_success",
+                parcel_id=parcel_id,
+                layer=clean_layer,
+                time=time,
+                recovered_template=bool(recovered_template),
+                recovered_access_key=_wms_token_info(signed_template_access_key),
+                recovered_parcel_id=recovered_wms_data.get("graniot_parcel_id"),
+                recovered_parcel_key=recovered_wms_data.get("graniot_parcel_key"),
+            )
+        else:
+            _wms_cloud_log(
+                logging.WARNING,
+                "refresh_wms_metadata_empty",
+                parcel_id=parcel_id,
+                layer=clean_layer,
+                time=time,
+                reasons=recovery_reasons,
+                local_graniot_parcel_id=local_graniot_parcel_id,
+            )
 
-    # Keep the signed access_key requested by the frontend when present. This
-    # is critical for split parcels: each subparcel has its own signed token.
-    # Only use the template token when the request contains an old UUID-like key
-    # or no signed key at all.
-    access_key = _choose_wms_access_key(access_key, signed_template_access_key)
+    # Prefer a freshly recovered signed key because the access_key sent by the
+    # frontend can be expired even if it still has a valid-looking signed format.
+    # If recovery did not find a new key, keep the previous behavior.
+    if recovered_wms_data and signed_template_access_key:
+        access_key = _choose_wms_access_key(signed_template_access_key, access_key)
+    else:
+        access_key = _choose_wms_access_key(access_key, signed_template_access_key)
     wms_path = _wms_path_from_template(template)
 
     bbox_values = _bbox_values_from_bounds(south, west, north, east)
