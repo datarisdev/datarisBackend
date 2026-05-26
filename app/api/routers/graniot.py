@@ -117,7 +117,7 @@ def _wms_cache_public_key(
     stable = str(cache_key or "").strip()
     fallback_key = hashlib.sha256(str(access_key or "").encode("utf-8")).hexdigest()[:16] if access_key else "no-key"
     payload = {
-        "version": 5,
+        "version": 6,
         "stable": stable or None,
         "parcel_id": parcel_id or None,
         "access_hash": None if stable else fallback_key,
@@ -3252,8 +3252,8 @@ def _source_to_map_overlay(
     # background prefetch endpoint. It intentionally avoids signed Graniot
     # tokens because those can rotate/expire while the parcel/layer/date image
     # is still the same visual product.
-    query["cache_key"] = f"visual-v5:parcel:{local_parcel_id}:layer:{layer_name}:time:{date or 'latest'}"
-    query["cache_v"] = "visual-v5"
+    query["cache_key"] = f"visual-v6:parcel:{local_parcel_id}:layer:{layer_name}:time:{date or 'latest'}"
+    query["cache_v"] = "visual-v6"
 
     return {
         "id": str(source.get("graniot_parcel_id") or source.get("graniot_parcel_key") or source.get("graniot_access_key") or local_parcel_id),
@@ -4120,7 +4120,26 @@ async def _wms_proxy_impl(
             bbox_latlon=bbox_latlon,
             bbox_lonlat=bbox_lonlat,
         ))
-    variants = _dedupe_wms_variants(variants)[:18]
+
+    # Si el usuario eligió una fecha que Graniot todavía no tiene para ese lote,
+    # primero intentamos la fecha solicitada y luego agregamos variantes sin
+    # `time` como respaldo. Así la vista nunca queda en blanco/estancada: si la
+    # fecha exacta existe se usa, y si no existe se muestra la última imagen
+    # disponible mientras el cache queda caliente.
+    if time:
+        for candidate_layer in layer_candidates:
+            variants.extend(_build_wms_param_variants(
+                template_params=template_params,
+                access_key=access_key,
+                layer=candidate_layer,
+                time=None,
+                width=width,
+                height=height,
+                bbox_latlon=bbox_latlon,
+                bbox_lonlat=bbox_lonlat,
+            ))
+
+    variants = _dedupe_wms_variants(variants)[:32]
 
     if not variants:
         raise HTTPException(status_code=400, detail="No se pudo construir la solicitud WMS para Graniot")
@@ -4214,27 +4233,13 @@ async def _wms_proxy_impl(
                     })
                     continue
 
-                bad_raster, raster_info = _looks_like_bad_solid_index_raster(raw.content, media_type)
-                if bad_raster:
-                    errors.append({
-                        "variant_index": variant_index,
-                        "use_auth": use_auth,
-                        "status_code": raw.status_code,
-                        "content_type": media_type,
-                        "message": "solid_red_index_raster_skipped",
-                        "raster_info": safe_payload(raster_info),
-                    })
-                    _wms_cloud_log(
-                        logging.WARNING,
-                        "skip_solid_red_index_raster",
-                        parcel_id=parcel_id,
-                        layer=clean_layer,
-                        time=time,
-                        variant_index=variant_index,
-                        use_auth=use_auth,
-                        raster_info=safe_payload(raster_info),
-                    )
-                    continue
+                # No descartamos imágenes válidas por color. En algunos lotes el
+                # índice NDVI/GNDVI puede ser predominantemente rojo por datos reales
+                # o por la paleta de Graniot. Rechazarlo aquí provocaba que el
+                # navegador se quedara esperando y mostrara "Cargando imagen
+                # satelital" sin terminar. La corrección visual se hace evitando
+                # pintar overlays de map-layer transformados como fuente principal,
+                # no bloqueando PNGs válidos de Graniot.
 
                 request_bounds = _bounds_from_wms_params(params)
                 clip_bounds = request_bounds or bbox_values or _clip_bounds_from_context(template, bbox_values, local)
