@@ -7,9 +7,13 @@ import base64
 import logging
 import time as time_module
 import uuid
+import asyncio
+import hashlib
+import tempfile
+from pathlib import Path
 from io import BytesIO
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, parse_qsl, quote, urlencode, urlparse, urlunparse
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Response
@@ -30,6 +34,180 @@ from app.services.graniot_debug import clear_logs, get_log_file_path, log_event,
 router = APIRouter(prefix="/graniot", tags=["Graniot"])
 
 _wms_cloud_logger = logging.getLogger("uvicorn.error")
+
+
+# ---------------------------------------------------------------------------
+# Graniot performance cache
+# ---------------------------------------------------------------------------
+# Cloud Run instances are ephemeral, but keeping a small /tmp cache still helps a
+# lot because the same satellite layer/date is usually requested many times by
+# the same customer during a work session. The cache is intentionally local to
+# the running instance: no Redis/Memorystore is required, so the MVP remains
+# cheap.
+GRANIOT_CATALOG_CACHE_TTL_SECONDS = int(os.getenv("GRANIOT_CATALOG_CACHE_TTL_SECONDS", str(60 * 60 * 24 * 30)))
+GRANIOT_DATE_CACHE_TTL_SECONDS = int(os.getenv("GRANIOT_DATE_CACHE_TTL_SECONDS", str(60 * 60 * 12)))
+GRANIOT_STATS_CACHE_TTL_SECONDS = int(os.getenv("GRANIOT_STATS_CACHE_TTL_SECONDS", str(60 * 30)))
+GRANIOT_MAP_LAYER_CACHE_TTL_SECONDS = int(os.getenv("GRANIOT_MAP_LAYER_CACHE_TTL_SECONDS", str(60 * 30)))
+GRANIOT_WMS_CACHE_TTL_SECONDS = int(os.getenv("GRANIOT_WMS_CACHE_TTL_SECONDS", str(60 * 60 * 24 * 7)))
+GRANIOT_WMS_CACHE_MAX_MB = int(os.getenv("GRANIOT_WMS_CACHE_MAX_MB", "256"))
+GRANIOT_WMS_PREFETCH_CONCURRENCY = int(os.getenv("GRANIOT_WMS_PREFETCH_CONCURRENCY", "3"))
+
+_RUNTIME_CACHE: Dict[str, Tuple[float, Any]] = {}
+_WMS_CACHE_DIR = Path(os.getenv("GRANIOT_WMS_CACHE_DIR", str(Path(tempfile.gettempdir()) / "dataris_graniot_wms_cache")))
+
+
+def _cache_get(key: str) -> Optional[Any]:
+    item = _RUNTIME_CACHE.get(key)
+    if not item:
+        return None
+    expires_at, value = item
+    if expires_at <= time_module.time():
+        _RUNTIME_CACHE.pop(key, None)
+        return None
+    return value
+
+
+def _cache_set(key: str, value: Any, ttl_seconds: int) -> Any:
+    if ttl_seconds <= 0:
+        return value
+    # Keep the in-memory cache bounded. This is not an LRU, but it prevents an
+    # accidentally large satellite session from growing without limits.
+    if len(_RUNTIME_CACHE) > 750:
+        now_ts = time_module.time()
+        for stale_key, (expires_at, _) in list(_RUNTIME_CACHE.items()):
+            if expires_at <= now_ts:
+                _RUNTIME_CACHE.pop(stale_key, None)
+        if len(_RUNTIME_CACHE) > 750:
+            for stale_key in list(_RUNTIME_CACHE.keys())[:150]:
+                _RUNTIME_CACHE.pop(stale_key, None)
+    _RUNTIME_CACHE[key] = (time_module.time() + ttl_seconds, value)
+    return value
+
+
+def _cache_delete_prefix(prefix: str) -> None:
+    for key in list(_RUNTIME_CACHE.keys()):
+        if key.startswith(prefix):
+            _RUNTIME_CACHE.pop(key, None)
+
+
+def _stable_hash(value: Any) -> str:
+    text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _wms_cache_public_key(
+    *,
+    cache_key: Optional[str],
+    parcel_id: Optional[str],
+    access_key: Optional[str],
+    layer: str,
+    time: Optional[str],
+    width: int,
+    height: int,
+    bbox: Optional[str],
+    south: Optional[float],
+    west: Optional[float],
+    north: Optional[float],
+    east: Optional[float],
+) -> str:
+    # Prefer a caller-provided stable key that does not include expiring signed
+    # Graniot tokens. If it is not available, include a hash of the access key as
+    # a fallback so unrelated parcels cannot collide.
+    stable = str(cache_key or "").strip()
+    fallback_key = hashlib.sha256(str(access_key or "").encode("utf-8")).hexdigest()[:16] if access_key else "no-key"
+    payload = {
+        "version": 3,
+        "stable": stable or None,
+        "parcel_id": parcel_id or None,
+        "access_hash": None if stable else fallback_key,
+        "layer": layer,
+        "time": time or "latest",
+        "width": width,
+        "height": height,
+        "bbox": bbox or None,
+        "south": None if south is None else round(float(south), 7),
+        "west": None if west is None else round(float(west), 7),
+        "north": None if north is None else round(float(north), 7),
+        "east": None if east is None else round(float(east), 7),
+    }
+    return _stable_hash(payload)
+
+
+def _wms_cache_paths(key: str) -> Tuple[Path, Path]:
+    safe_key = re.sub(r"[^a-f0-9]", "", key.lower())[:64]
+    return _WMS_CACHE_DIR / f"{safe_key}.bin", _WMS_CACHE_DIR / f"{safe_key}.json"
+
+
+def _read_wms_disk_cache(key: str) -> Optional[Response]:
+    if GRANIOT_WMS_CACHE_TTL_SECONDS <= 0:
+        return None
+    try:
+        data_path, meta_path = _wms_cache_paths(key)
+        if not data_path.exists() or not meta_path.exists():
+            return None
+        age = time_module.time() - data_path.stat().st_mtime
+        if age > GRANIOT_WMS_CACHE_TTL_SECONDS:
+            data_path.unlink(missing_ok=True)
+            meta_path.unlink(missing_ok=True)
+            return None
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        content = data_path.read_bytes()
+        media_type = str(meta.get("media_type") or "image/png")
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={
+                "Cache-Control": "public, max-age=86400, stale-while-revalidate=604800",
+                "X-Dataris-WMS-Cache": "HIT",
+            },
+        )
+    except Exception as exc:
+        log_event({"event": "dataris.graniot.wms_cache.read_failed", "key": key, "message": str(exc)})
+        return None
+
+
+def _write_wms_disk_cache(key: str, content: bytes, media_type: str) -> None:
+    if GRANIOT_WMS_CACHE_TTL_SECONDS <= 0 or not content:
+        return
+    try:
+        _WMS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        data_path, meta_path = _wms_cache_paths(key)
+        tmp_path = data_path.with_suffix(".tmp")
+        tmp_path.write_bytes(content)
+        tmp_path.replace(data_path)
+        meta_path.write_text(json.dumps({"media_type": media_type, "saved_at": time_module.time()}), encoding="utf-8")
+        _prune_wms_disk_cache()
+    except Exception as exc:
+        log_event({"event": "dataris.graniot.wms_cache.write_failed", "key": key, "message": str(exc)})
+
+
+def _prune_wms_disk_cache() -> None:
+    try:
+        max_bytes = max(16, GRANIOT_WMS_CACHE_MAX_MB) * 1024 * 1024
+        files = [path for path in _WMS_CACHE_DIR.glob("*.bin") if path.is_file()]
+        total = sum(path.stat().st_size for path in files)
+        if total <= max_bytes:
+            return
+        files.sort(key=lambda path: path.stat().st_mtime)
+        for path in files:
+            if total <= max_bytes:
+                break
+            size = path.stat().st_size
+            meta = path.with_suffix(".json")
+            path.unlink(missing_ok=True)
+            meta.unlink(missing_ok=True)
+            total -= size
+    except Exception as exc:
+        log_event({"event": "dataris.graniot.wms_cache.prune_failed", "message": str(exc)})
+
+
+def _response_with_cache_headers(response: Response, cache_value: str = "MISS") -> Response:
+    try:
+        response.headers["Cache-Control"] = "public, max-age=86400, stale-while-revalidate=604800"
+        response.headers["X-Dataris-WMS-Cache"] = cache_value
+    except Exception:
+        pass
+    return response
 
 
 def _wms_json_safe(value: Any) -> Any:
@@ -2274,9 +2452,21 @@ async def list_layers(
     resolution_id: Optional[int] = Query(default=None),
     resolution_name: Optional[str] = Query(default=None),
     platform: bool = Query(default=True),
+    refresh: bool = Query(default=False),
     authorization: Optional[str] = Header(default=None),
 ):
     _require_user(authorization)
+    cache_key = _stable_hash({
+        "scope": "graniot-layers",
+        "resolution_id": resolution_id,
+        "resolution_name": resolution_name,
+        "platform": platform,
+    })
+    if not refresh:
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached
+
     client = GraniotClient()
     try:
         # Confirmed Graniot catalog behavior:
@@ -2331,7 +2521,7 @@ async def list_layers(
                         str(x.get("displayed_name") or ""),
                         str(x.get("name") or ""),
                     ))
-                    return {
+                    return _cache_set(cache_key, {
                         "data": layers,
                         "raw": raw,
                         "wms_raw": wms_raw,
@@ -2339,7 +2529,8 @@ async def list_layers(
                         "count": len(layers),
                         "source_path": path,
                         "wms_layer_names": sorted(wms_names),
-                    }
+                        "cache": {"status": "MISS", "ttl_seconds": GRANIOT_CATALOG_CACHE_TTL_SECONDS},
+                    }, GRANIOT_CATALOG_CACHE_TTL_SECONDS)
             except Exception as exc:
                 last_error = exc
                 continue
@@ -2348,18 +2539,19 @@ async def list_layers(
         # provide statistics/json-index UUIDs. Prefer this over demo layers.
         if wms_raw is not None:
             wms_layers = [_normalize_layer(item, wms_names=wms_names) for item in _layer_items(wms_raw)]
-            return {
+            return _cache_set(cache_key, {
                 "data": wms_layers,
                 "raw": wms_raw,
                 "error": None,
                 "count": len(wms_layers),
                 "source_path": "/api/layers/get_wms_layers/",
                 "wms_layer_names": sorted(wms_names),
-            }
+                "cache": {"status": "MISS", "ttl_seconds": GRANIOT_CATALOG_CACHE_TTL_SECONDS},
+            }, GRANIOT_CATALOG_CACHE_TTL_SECONDS)
 
         if last_error:
             raise last_error
-        return {"data": [], "raw": raw, "error": None, "count": 0}
+        return _cache_set(cache_key, {"data": [], "raw": raw, "error": None, "count": 0, "cache": {"status": "MISS", "ttl_seconds": GRANIOT_CATALOG_CACHE_TTL_SECONDS}}, max(60, GRANIOT_CATALOG_CACHE_TTL_SECONDS // 24))
     except Exception as exc:
         _raise_graniot_error(exc)
 
@@ -2367,14 +2559,21 @@ async def list_layers(
 @router.get("/layers/resolutions")
 async def list_resolutions(
     search: Optional[str] = Query(default=None),
+    refresh: bool = Query(default=False),
     authorization: Optional[str] = Header(default=None),
 ):
     _require_user(authorization)
+    cache_key = _stable_hash({"scope": "graniot-resolutions", "search": search})
+    if not refresh:
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached
+
     client = GraniotClient()
     try:
         raw = await client.get("/api/layersresolution/", params={"search": search})
         resolutions = [_normalize_resolution(item) for item in _items(raw)]
-        return {"data": resolutions, "raw": raw, "error": None, "count": len(resolutions)}
+        return _cache_set(cache_key, {"data": resolutions, "raw": raw, "error": None, "count": len(resolutions), "cache": {"status": "MISS", "ttl_seconds": GRANIOT_CATALOG_CACHE_TTL_SECONDS}}, GRANIOT_CATALOG_CACHE_TTL_SECONDS)
     except Exception as exc:
         _raise_graniot_error(exc)
 
@@ -2992,6 +3191,20 @@ def _source_to_map_overlay(
     }
     if date:
         query["time"] = date
+    query["cache_key"] = _wms_cache_public_key(
+        cache_key=f"{local_parcel_id}:{source.get('graniot_parcel_id') or source.get('graniot_parcel_key') or source.get('graniot_access_key') or 'main'}",
+        parcel_id=local_parcel_id,
+        access_key=access_key,
+        layer=layer_name,
+        time=date,
+        width=width,
+        height=height,
+        bbox=None,
+        south=bounds["south"],
+        west=bounds["west"],
+        north=bounds["north"],
+        east=bounds["east"],
+    )
 
     return {
         "id": str(source.get("graniot_parcel_id") or source.get("graniot_parcel_key") or source.get("graniot_access_key") or local_parcel_id),
@@ -3174,6 +3387,28 @@ async def get_local_parcel_ndvi_map_layer(
     client = GraniotClient()
     warnings: List[str] = []
 
+    map_cache_key = _stable_hash({
+        "scope": "graniot-map-layer",
+        "user_id": user.get("id"),
+        "local_parcel_id": local_parcel_id,
+        "layer_key": layer_key,
+        "wms_layer": wms_layer,
+        "resolution_id": resolution_id,
+        "resolution_key": resolution_key,
+        "date": date or "latest",
+        "width": width,
+        "height": height,
+        "maxcc": maxcc,
+        "include_statistics": include_statistics,
+        "local_updated_at": local.get("updated_at"),
+        "graniot_synced_at": local.get("graniot_synced_at"),
+    })
+    cached_map_layer = _cache_get(map_cache_key)
+    if cached_map_layer is not None:
+        cached_copy = json.loads(json.dumps(cached_map_layer, default=str))
+        cached_copy.setdefault("data", {}).setdefault("cache", {})["status"] = "HIT"
+        return cached_copy
+
     # Start with locally stored Graniot WMS sources. If none exist, recover by
     # matching the local polygon against /api/parcels/ FeatureCollection.
     sources: List[Dict[str, Any]] = _sources_from_local_row(local)
@@ -3202,16 +3437,17 @@ async def get_local_parcel_ndvi_map_layer(
         )
 
     if not sources:
-        return {
+        return _cache_set(map_cache_key, {
             "data": {
                 "available": False,
                 "reason": "Este lote todavía no tiene WMS real de Graniot. No está sincronizado en Graniot o Graniot aún no ha generado image_url/wms_url para esa geometría.",
                 "requires_sync": True,
                 "overlays": [],
                 "warnings": warnings,
+                "cache": {"status": "MISS", "ttl_seconds": min(120, GRANIOT_MAP_LAYER_CACHE_TTL_SECONDS)},
             },
             "error": None,
-        }
+        }, min(120, GRANIOT_MAP_LAYER_CACHE_TTL_SECONDS))
 
     resolved_layer = _resolve_requested_graniot_layer(
         layer_key=layer_key or DEFAULT_NDVI_LAYER_KEY,
@@ -3263,7 +3499,7 @@ async def get_local_parcel_ndvi_map_layer(
     if not overlays:
         warnings.append("Graniot devolvió el lote, pero no hay access_key o bounds válidos para construir la imagen WMS.")
 
-    return {
+    response_payload = {
         "data": {
             "available": bool(overlays),
             "date": resolved_date,
@@ -3282,9 +3518,11 @@ async def get_local_parcel_ndvi_map_layer(
             "warnings": warnings,
             "source_count": len(render_sources),
             "available_resolution_ids": sorted(_available_resolution_ids_with_images(sources)),
+            "cache": {"status": "MISS", "ttl_seconds": GRANIOT_MAP_LAYER_CACHE_TTL_SECONDS},
         },
         "error": None,
     }
+    return _cache_set(map_cache_key, response_payload, GRANIOT_MAP_LAYER_CACHE_TTL_SECONDS)
 
 
 @router.get("/parcels/{parcel_id}/resolutions/{resolution_key}/dates")
@@ -3294,16 +3532,21 @@ async def get_dates(
     authorization: Optional[str] = Header(default=None),
 ):
     _require_user(authorization)
+    cache_key = _stable_hash({"scope": "graniot-dates", "parcel_id": parcel_id, "resolution_key": resolution_key})
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     client = GraniotClient()
     try:
         raw = await client.get(f"/api/parcels/{parcel_id}/resolutions/{resolution_key}/dates/")
-        return {"data": raw, "error": None}
+        return _cache_set(cache_key, {"data": raw, "error": None, "cache": {"status": "MISS", "ttl_seconds": GRANIOT_DATE_CACHE_TTL_SECONDS}}, GRANIOT_DATE_CACHE_TTL_SECONDS)
     except GraniotAPIError as exc:
         # Some Graniot layers/resolutions simply do not expose a date catalog.
         # Returning 200 with an empty list avoids noisy browser 404/500 errors;
         # the frontend will render the layer with the latest image instead.
         if exc.status_code in {400, 404, 500, 502}:
-            return {"data": [], "error": str(exc), "warning": True}
+            return _cache_set(cache_key, {"data": [], "error": str(exc), "warning": True, "cache": {"status": "MISS", "ttl_seconds": min(900, GRANIOT_DATE_CACHE_TTL_SECONDS)}}, min(900, GRANIOT_DATE_CACHE_TTL_SECONDS))
         _raise_graniot_error(exc)
     except Exception as exc:
         _raise_graniot_error(exc)
@@ -3339,21 +3582,150 @@ async def get_layer_statistics(
     authorization: Optional[str] = Header(default=None),
 ):
     _require_user(authorization)
+    cache_key = _stable_hash({"scope": "graniot-statistics", "parcel_id": parcel_id, "layer_key": layer_key, "from_date": from_date, "to_date": to_date, "maxcc": maxcc})
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     client = GraniotClient()
     try:
         raw = await client.get(
             f"/api/parcels/{parcel_id}/layers/{layer_key}/statistics/",
             params={"from_date": from_date, "to_date": to_date, "maxcc": maxcc},
         )
-        return {"data": raw, "error": None}
+        return _cache_set(cache_key, {"data": raw, "error": None, "cache": {"status": "MISS", "ttl_seconds": GRANIOT_STATS_CACHE_TTL_SECONDS}}, GRANIOT_STATS_CACHE_TTL_SECONDS)
     except GraniotAPIError as exc:
         # Statistics are optional in Graniot and can fail for layers that still
         # render correctly as WMS. Do not block the satellite map for this.
         if exc.status_code in {400, 404, 500, 502}:
-            return {"data": {"status": "unavailable", "data": []}, "error": str(exc), "warning": True}
+            return _cache_set(cache_key, {"data": {"status": "unavailable", "data": []}, "error": str(exc), "warning": True, "cache": {"status": "MISS", "ttl_seconds": min(900, GRANIOT_STATS_CACHE_TTL_SECONDS)}}, min(900, GRANIOT_STATS_CACHE_TTL_SECONDS))
         _raise_graniot_error(exc)
     except Exception as exc:
         _raise_graniot_error(exc)
+
+
+
+
+def _query_first(params: Dict[str, List[str]], key: str, default: Optional[str] = None) -> Optional[str]:
+    values = params.get(key)
+    if not values:
+        return default
+    return values[0]
+
+
+async def _warm_wms_overlay_from_url(image_url: str) -> Dict[str, Any]:
+    parsed = urlparse(image_url)
+    params = parse_qs(parsed.query)
+    started = time_module.perf_counter()
+    await _wms_proxy_impl(
+        parcel_id=_query_first(params, "parcel_id"),
+        access_key=_query_first(params, "access_key"),
+        layer=_query_first(params, "layer", DEFAULT_NDVI_WMS_LAYER) or DEFAULT_NDVI_WMS_LAYER,
+        time=_query_first(params, "time"),
+        width=int(_query_first(params, "width", "1024") or 1024),
+        height=int(_query_first(params, "height", "1024") or 1024),
+        bbox=_query_first(params, "bbox"),
+        south=float(_query_first(params, "south")) if _query_first(params, "south") else None,
+        west=float(_query_first(params, "west")) if _query_first(params, "west") else None,
+        north=float(_query_first(params, "north")) if _query_first(params, "north") else None,
+        east=float(_query_first(params, "east")) if _query_first(params, "east") else None,
+        cache_key=_query_first(params, "cache_key"),
+    )
+    return {"ok": True, "duration_ms": round((time_module.perf_counter() - started) * 1000, 2)}
+
+
+@router.post("/satellite/prefetch")
+async def prefetch_satellite_cache(
+    payload: Dict[str, Any] = Body(default_factory=dict),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Warm Graniot metadata and WMS image cache without blocking the map UI.
+
+    The frontend calls this endpoint in the background. It resolves the same
+    map-layer payload used by the UI and then asks the local WMS proxy to fetch
+    each raster once. Subsequent ImageOverlay requests are served from /tmp cache
+    on the Cloud Run instance instead of hitting Graniot again.
+    """
+    user = _require_user(authorization)
+    requested_ids = payload.get("parcel_ids") or payload.get("parcelIds") or []
+    if isinstance(requested_ids, str):
+        requested_ids = [requested_ids]
+    requested_ids = [str(value) for value in requested_ids if value]
+
+    max_parcels = max(1, min(int(payload.get("max_parcels") or payload.get("maxParcels") or 8), 24))
+    layer_key = str(payload.get("layer_key") or payload.get("layerKey") or DEFAULT_NDVI_LAYER_KEY)
+    wms_layer = str(payload.get("wms_layer") or payload.get("wmsLayer") or DEFAULT_NDVI_WMS_LAYER)
+    resolution_id = int(payload.get("resolution_id") or payload.get("resolutionId") or DEFAULT_NDVI_RESOLUTION_ID)
+    resolution_key = str(payload.get("resolution_key") or payload.get("resolutionKey") or DEFAULT_NDVI_RESOLUTION_KEY)
+    date = payload.get("date") or None
+    width = max(128, min(int(payload.get("width") or 1024), 2048))
+    height = max(128, min(int(payload.get("height") or 1024), 2048))
+
+    with LOCK:
+        db = read_db()
+        user_parcels = [p for p in table(db, "parcels") if p.get("user_id") == user["id"]]
+
+    if requested_ids:
+        selected = [p for p in user_parcels if str(p.get("id")) in set(requested_ids)]
+    else:
+        selected = [p for p in user_parcels if _sources_from_local_row(p)]
+
+    selected = selected[:max_parcels]
+    if not selected:
+        return {"data": {"queued": False, "parcel_count": 0, "image_count": 0, "results": []}, "error": None}
+
+    semaphore = asyncio.Semaphore(max(1, GRANIOT_WMS_PREFETCH_CONCURRENCY))
+    results: List[Dict[str, Any]] = []
+
+    async def warm_parcel(parcel: Dict[str, Any]) -> Dict[str, Any]:
+        parcel_id = str(parcel.get("id"))
+        try:
+            layer_payload = await get_local_parcel_ndvi_map_layer(
+                parcel_id,
+                layer_key=layer_key,
+                wms_layer=wms_layer,
+                resolution_id=resolution_id,
+                resolution_key=resolution_key,
+                date=str(date) if date else None,
+                width=width,
+                height=height,
+                maxcc=100,
+                include_statistics=False,
+                auto_sync=False,
+                authorization=authorization,
+            )
+            data = layer_payload.get("data") if isinstance(layer_payload, dict) else {}
+            overlays = data.get("overlays") if isinstance(data, dict) else []
+            overlays = overlays if isinstance(overlays, list) else []
+            warmed: List[Dict[str, Any]] = []
+            for overlay in overlays[:4]:
+                image_url = overlay.get("image_url") if isinstance(overlay, dict) else None
+                if not image_url:
+                    continue
+                async with semaphore:
+                    try:
+                        warmed.append(await _warm_wms_overlay_from_url(str(image_url)))
+                    except Exception as exc:
+                        warmed.append({"ok": False, "message": str(exc), "exception_type": type(exc).__name__})
+            return {"parcel_id": parcel_id, "available": bool(data.get("available")), "image_count": len(warmed), "images": warmed}
+        except Exception as exc:
+            return {"parcel_id": parcel_id, "available": False, "image_count": 0, "error": str(exc), "exception_type": type(exc).__name__}
+
+    # Warm a handful of parcels concurrently. The frontend does not wait for this
+    # request, but keeping it real work instead of a detached task avoids relying
+    # on Cloud Run CPU after response.
+    results = await asyncio.gather(*(warm_parcel(parcel) for parcel in selected))
+    image_count = sum(int(item.get("image_count") or 0) for item in results if isinstance(item, dict))
+    return {
+        "data": {
+            "queued": False,
+            "parcel_count": len(selected),
+            "image_count": image_count,
+            "results": results,
+            "cache_dir": str(_WMS_CACHE_DIR),
+        },
+        "error": None,
+    }
 
 
 @router.get("/wms-url")
@@ -3409,6 +3781,7 @@ async def wms_proxy(
     north: Optional[float] = Query(default=None),
     west: Optional[float] = Query(default=None),
     east: Optional[float] = Query(default=None),
+    cache_key: Optional[str] = Query(default=None),
 ):
     request_id = uuid.uuid4().hex[:12]
     started = time_module.perf_counter()
@@ -3438,6 +3811,7 @@ async def wms_proxy(
             north=north,
             west=west,
             east=east,
+            cache_key=cache_key,
         )
         duration_ms = round((time_module_perf_counter() - started) * 1000, 2)
         _wms_cloud_log(
@@ -3515,6 +3889,7 @@ async def _wms_proxy_impl(
     north: Optional[float] = None,
     west: Optional[float] = None,
     east: Optional[float] = None,
+    cache_key: Optional[str] = None,
 ):
     """Proxy WMS for Leaflet ImageOverlay.
 
@@ -3531,6 +3906,25 @@ async def _wms_proxy_impl(
     # make the browser look like the layer is broken.
     width = max(128, min(int(width or 768), 2048))
     height = max(128, min(int(height or 768), 2048))
+
+    stable_wms_cache_key = _wms_cache_public_key(
+        cache_key=cache_key,
+        parcel_id=parcel_id,
+        access_key=access_key,
+        layer=clean_layer,
+        time=time,
+        width=width,
+        height=height,
+        bbox=bbox,
+        south=south,
+        west=west,
+        north=north,
+        east=east,
+    )
+    cached_wms = _read_wms_disk_cache(stable_wms_cache_key)
+    if cached_wms is not None:
+        _wms_cloud_log(logging.WARNING, "cache_hit", parcel_id=parcel_id, layer=clean_layer, time=time, cache_key=stable_wms_cache_key)
+        return cached_wms
 
     local: Optional[Dict[str, Any]] = None
     if parcel_id:
@@ -3814,11 +4208,11 @@ async def _wms_proxy_impl(
                         "source_media_type": media_type,
                     })
 
-                return Response(
+                _write_wms_disk_cache(stable_wms_cache_key, content, final_media_type)
+                return _response_with_cache_headers(Response(
                     content=content,
                     media_type=final_media_type,
-                    headers={"Cache-Control": "public, max-age=300"},
-                )
+                ), "MISS")
             except GraniotAPIError as exc:
                 error_item = {
                     "variant_index": variant_index,
