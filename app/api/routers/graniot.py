@@ -117,7 +117,7 @@ def _wms_cache_public_key(
     stable = str(cache_key or "").strip()
     fallback_key = hashlib.sha256(str(access_key or "").encode("utf-8")).hexdigest()[:16] if access_key else "no-key"
     payload = {
-        "version": 3,
+        "version": 5,
         "stable": stable or None,
         "parcel_id": parcel_id or None,
         "access_hash": None if stable else fallback_key,
@@ -180,6 +180,62 @@ def _write_wms_disk_cache(key: str, content: bytes, media_type: str) -> None:
         _prune_wms_disk_cache()
     except Exception as exc:
         log_event({"event": "dataris.graniot.wms_cache.write_failed", "key": key, "message": str(exc)})
+
+
+def _looks_like_bad_solid_index_raster(content: bytes, media_type: str) -> Tuple[bool, Dict[str, Any]]:
+    """Detect Graniot WMS responses that are technically PNGs but visually wrong.
+
+    Some Graniot attempts can return a nearly single-color red raster. Because it
+    is still a valid image/png, the proxy used to accept it as successful and the
+    UI showed a solid red polygon. This heuristic is intentionally conservative:
+    it only skips rasters that are both very flat and clearly red-dominant.
+    """
+    if not content or "image" not in str(media_type or "").lower():
+        return False, {"reason": "not_image"}
+    try:
+        image = Image.open(BytesIO(content)).convert("RGBA")
+        if max(image.size) > 128:
+            try:
+                resampling = Image.Resampling.BILINEAR
+            except AttributeError:
+                resampling = Image.BILINEAR
+            image.thumbnail((128, 128), resampling)
+
+        pixels = [px for px in image.getdata() if px[3] > 16]
+        total = len(pixels)
+        if total < 200:
+            return False, {"reason": "too_few_visible_pixels", "visible_pixels": total}
+
+        counts: Dict[Tuple[int, int, int], int] = {}
+        r_sum = g_sum = b_sum = 0
+        for r, g, b, _a in pixels:
+            # Quantize slightly so JPEG/antialiasing noise does not hide a flat raster.
+            key = (int(r) // 8 * 8, int(g) // 8 * 8, int(b) // 8 * 8)
+            counts[key] = counts.get(key, 0) + 1
+            r_sum += int(r)
+            g_sum += int(g)
+            b_sum += int(b)
+
+        dominant = max(counts.values()) if counts else 0
+        dominant_ratio = dominant / max(total, 1)
+        unique_colors = len(counts)
+        r_avg = r_sum / total
+        g_avg = g_sum / total
+        b_avg = b_sum / total
+
+        red_dominant = r_avg > 140 and r_avg > g_avg + 35 and r_avg > b_avg + 35
+        visually_flat = dominant_ratio >= 0.88 or unique_colors <= 8
+        is_bad = bool(red_dominant and visually_flat)
+        return is_bad, {
+            "visible_pixels": total,
+            "unique_colors": unique_colors,
+            "dominant_ratio": round(dominant_ratio, 4),
+            "avg_rgb": [round(r_avg, 2), round(g_avg, 2), round(b_avg, 2)],
+            "red_dominant": red_dominant,
+            "visually_flat": visually_flat,
+        }
+    except Exception as exc:
+        return False, {"reason": "analysis_failed", "message": str(exc)}
 
 
 def _prune_wms_disk_cache() -> None:
@@ -3196,7 +3252,8 @@ def _source_to_map_overlay(
     # background prefetch endpoint. It intentionally avoids signed Graniot
     # tokens because those can rotate/expire while the parcel/layer/date image
     # is still the same visual product.
-    query["cache_key"] = f"parcel:{local_parcel_id}:layer:{layer_name}:time:{date or 'latest'}"
+    query["cache_key"] = f"visual-v5:parcel:{local_parcel_id}:layer:{layer_name}:time:{date or 'latest'}"
+    query["cache_v"] = "visual-v5"
 
     return {
         "id": str(source.get("graniot_parcel_id") or source.get("graniot_parcel_key") or source.get("graniot_access_key") or local_parcel_id),
@@ -3455,7 +3512,10 @@ async def get_local_parcel_ndvi_map_layer(
     # resolution. This avoids asking WMS for the UI calendar date when no image
     # exists there, which can produce misleading single-color rasters.
     graniot_latest_date = _date_from_graniot_sources(sources, resolved_resolution_id)
-    resolved_date = graniot_latest_date or date
+    # Si el frontend manda una fecha explícita desde el calendario, se respeta.
+    # Antes se reemplazaba por la última fecha reportada por Graniot, por eso
+    # cambiar fecha podía no cambiar el raster visible.
+    resolved_date = date or graniot_latest_date
 
     render_sources = [source for source in sources if _source_has_image_for_resolution(source, resolved_resolution_id)]
     if not render_sources:
@@ -4152,6 +4212,28 @@ async def _wms_proxy_impl(
                         "content_type": media_type,
                         "preview": preview,
                     })
+                    continue
+
+                bad_raster, raster_info = _looks_like_bad_solid_index_raster(raw.content, media_type)
+                if bad_raster:
+                    errors.append({
+                        "variant_index": variant_index,
+                        "use_auth": use_auth,
+                        "status_code": raw.status_code,
+                        "content_type": media_type,
+                        "message": "solid_red_index_raster_skipped",
+                        "raster_info": safe_payload(raster_info),
+                    })
+                    _wms_cloud_log(
+                        logging.WARNING,
+                        "skip_solid_red_index_raster",
+                        parcel_id=parcel_id,
+                        layer=clean_layer,
+                        time=time,
+                        variant_index=variant_index,
+                        use_auth=use_auth,
+                        raster_info=safe_payload(raster_info),
+                    )
                     continue
 
                 request_bounds = _bounds_from_wms_params(params)
