@@ -51,6 +51,7 @@ GRANIOT_MAP_LAYER_CACHE_TTL_SECONDS = int(os.getenv("GRANIOT_MAP_LAYER_CACHE_TTL
 GRANIOT_WMS_CACHE_TTL_SECONDS = int(os.getenv("GRANIOT_WMS_CACHE_TTL_SECONDS", str(60 * 60 * 24 * 7)))
 GRANIOT_WMS_CACHE_MAX_MB = int(os.getenv("GRANIOT_WMS_CACHE_MAX_MB", "256"))
 GRANIOT_WMS_PREFETCH_CONCURRENCY = int(os.getenv("GRANIOT_WMS_PREFETCH_CONCURRENCY", "3"))
+GRANIOT_WMS_BACKEND_MASK_ENABLED = str(os.getenv("GRANIOT_WMS_BACKEND_MASK_ENABLED", "false")).strip().lower() in {"1", "true", "yes", "on"}
 
 _RUNTIME_CACHE: Dict[str, Tuple[float, Any]] = {}
 _WMS_CACHE_DIR = Path(os.getenv("GRANIOT_WMS_CACHE_DIR", str(Path(tempfile.gettempdir()) / "dataris_graniot_wms_cache")))
@@ -3191,20 +3192,11 @@ def _source_to_map_overlay(
     }
     if date:
         query["time"] = date
-    query["cache_key"] = _wms_cache_public_key(
-        cache_key=f"{local_parcel_id}:{source.get('graniot_parcel_id') or source.get('graniot_parcel_key') or source.get('graniot_access_key') or 'main'}",
-        parcel_id=local_parcel_id,
-        access_key=access_key,
-        layer=layer_name,
-        time=date,
-        width=width,
-        height=height,
-        bbox=None,
-        south=bounds["south"],
-        west=bounds["west"],
-        north=bounds["north"],
-        east=bounds["east"],
-    )
+    # Stable cache key shared with the frontend's classic WMS URLs and the
+    # background prefetch endpoint. It intentionally avoids signed Graniot
+    # tokens because those can rotate/expire while the parcel/layer/date image
+    # is still the same visual product.
+    query["cache_key"] = f"parcel:{local_parcel_id}:layer:{layer_name}:time:{date or 'latest'}"
 
     return {
         "id": str(source.get("graniot_parcel_id") or source.get("graniot_parcel_key") or source.get("graniot_access_key") or local_parcel_id),
@@ -4164,49 +4156,47 @@ async def _wms_proxy_impl(
 
                 request_bounds = _bounds_from_wms_params(params)
                 clip_bounds = request_bounds or bbox_values or _clip_bounds_from_context(template, bbox_values, local)
-                clip_geometry, clip_geometry_source = _clip_geometry_from_payload(
-                    local,
-                    template_params,
-                    recovered_wms_data,
-                    access_key=access_key,
-                    graniot_parcel_id=local_graniot_parcel_id,
-                )
-                content, final_media_type, backend_clip_applied, clip_info = _apply_backend_polygon_mask(
-                    raw.content,
-                    media_type=media_type,
-                    bounds=clip_bounds,
-                    geometry=clip_geometry,
-                )
 
-                if backend_clip_applied:
-                    log_event({
-                        "event": "dataris.graniot.wms_proxy.backend_clip_applied",
-                        "operation": "wms-proxy",
-                        "local_parcel_id": parcel_id,
-                        "layer": clean_layer,
-                        "time": time,
-                        "variant_index": variant_index,
-                        "bounds": clip_bounds,
-                        "request_bounds": request_bounds,
-                        "geometry_source": clip_geometry_source,
-                        "clip_info": safe_payload(clip_info),
-                        "source_media_type": media_type,
-                        "output_media_type": final_media_type,
-                    })
+                # La optimización debe cachear y precargar la misma imagen que
+                # Graniot mostraba antes, no transformar el raster en una máscara
+                # sólida del polígono. Por eso el recorte backend queda apagado
+                # por defecto. Si en algún despliegue se necesita, puede activarse
+                # explícitamente con GRANIOT_WMS_BACKEND_MASK_ENABLED=true.
+                if GRANIOT_WMS_BACKEND_MASK_ENABLED:
+                    clip_geometry, clip_geometry_source = _clip_geometry_from_payload(
+                        local,
+                        template_params,
+                        recovered_wms_data,
+                        access_key=access_key,
+                        graniot_parcel_id=local_graniot_parcel_id,
+                    )
+                    content, final_media_type, backend_clip_applied, clip_info = _apply_backend_polygon_mask(
+                        raw.content,
+                        media_type=media_type,
+                        bounds=clip_bounds,
+                        geometry=clip_geometry,
+                    )
                 else:
-                    log_event({
-                        "event": "dataris.graniot.wms_proxy.backend_clip_skipped",
-                        "operation": "wms-proxy",
-                        "local_parcel_id": parcel_id,
-                        "layer": clean_layer,
-                        "time": time,
-                        "variant_index": variant_index,
-                        "bounds": clip_bounds,
-                        "request_bounds": request_bounds,
-                        "geometry_source": clip_geometry_source,
-                        "clip_info": safe_payload(clip_info),
-                        "source_media_type": media_type,
-                    })
+                    clip_geometry_source = "disabled"
+                    content = raw.content
+                    final_media_type = media_type
+                    backend_clip_applied = False
+                    clip_info = {"reason": "backend_mask_disabled_preserve_original_graniot_raster"}
+
+                log_event({
+                    "event": "dataris.graniot.wms_proxy.backend_clip_applied" if backend_clip_applied else "dataris.graniot.wms_proxy.backend_clip_skipped",
+                    "operation": "wms-proxy",
+                    "local_parcel_id": parcel_id,
+                    "layer": clean_layer,
+                    "time": time,
+                    "variant_index": variant_index,
+                    "bounds": clip_bounds,
+                    "request_bounds": request_bounds,
+                    "geometry_source": clip_geometry_source,
+                    "clip_info": safe_payload(clip_info),
+                    "source_media_type": media_type,
+                    "output_media_type": final_media_type,
+                })
 
                 _write_wms_disk_cache(stable_wms_cache_key, content, final_media_type)
                 return _response_with_cache_headers(Response(
