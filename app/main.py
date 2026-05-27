@@ -1,10 +1,15 @@
 from __future__ import annotations
 
-from fastapi import FastAPI
+import logging
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 from app.api.routers import (
     admin_user,
     auth,
@@ -74,6 +79,15 @@ fastapi_app.include_router(sentinel2.router, prefix=settings.API_V1_STR)
 @fastapi_app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@fastapi_app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled API error on %s", request.url.path)
+    detail = "Error interno del servidor"
+    if request.url.path.startswith(f"{settings.API_V1_STR}/satellite-free"):
+        detail = str(exc) or exc.__class__.__name__
+    return JSONResponse(status_code=500, content={"detail": detail})
 
 
 # Global CORS enforcement: wrapping the entire ASGI app ensures CORS headers are

@@ -5,8 +5,19 @@ import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Iterable
+from urllib.parse import quote
 
 from pystac_client import Client
+
+# Earth Search usually exposes public COGs through s3:// hrefs. In Cloud Run,
+# unsigned S3 reads can fail unless GDAL receives these flags. We also normalize
+# s3:// hrefs to HTTPS in the raster service, which avoids AWS credentials.
+os.environ.setdefault("AWS_NO_SIGN_REQUEST", "YES")
+os.environ.setdefault("AWS_REGION", os.getenv("SENTINEL_AWS_REGION", "us-west-2"))
+os.environ.setdefault("GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR")
+os.environ.setdefault("CPL_VSIL_CURL_USE_HEAD", "NO")
+os.environ.setdefault("GDAL_HTTP_MAX_RETRY", "2")
+os.environ.setdefault("GDAL_HTTP_RETRY_DELAY", "1")
 
 _RUNTIME_CACHE: dict[str, tuple[float, Any]] = {}
 
@@ -57,6 +68,32 @@ def _normalize_datetime(value: str | None) -> datetime:
 
 def open_stac_client() -> Client:
     return Client.open(DEFAULT_STAC_URL)
+
+
+def normalize_asset_href(href: str) -> str:
+    """Return a rasterio/GDAL friendly URL for public STAC assets.
+
+    Earth Search may return s3://sentinel-cogs/... hrefs. Those are public, but
+    Cloud Run containers usually do not have AWS credentials and GDAL may try to
+    sign S3 requests. Converting to HTTPS makes the request anonymous and avoids
+    the common 500 generated while opening the raster.
+    """
+    raw = str(href or "").strip()
+    if not raw.lower().startswith("s3://"):
+        return raw
+
+    remainder = raw[5:]
+    if "/" not in remainder:
+        return raw
+    bucket, key = remainder.split("/", 1)
+    safe_key = "/".join(quote(part) for part in key.split("/"))
+
+    # The public Sentinel COG bucket used by Earth Search is in us-west-2.
+    # For unknown buckets the generic endpoint normally redirects correctly.
+    region = os.getenv("SENTINEL_AWS_REGION", "us-west-2").strip() or "us-west-2"
+    if bucket in {"sentinel-cogs", "sentinel-s2-l2a-cogs"}:
+        return f"https://{bucket}.s3.{region}.amazonaws.com/{safe_key}"
+    return f"https://{bucket}.s3.amazonaws.com/{safe_key}"
 
 
 def sign_item_if_needed(item: Any) -> Any:
