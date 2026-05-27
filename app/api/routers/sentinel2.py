@@ -128,16 +128,21 @@ def layers(
     return {"data": data, "count": len(data)}
 
 
-@router.get("/parcels/{parcel_id}/resolutions/{resolution_key}/dates")
-def dates(
-    parcel_id: UUID,
+def _dates_response(
+    *,
+    db: Session,
+    parcel: dict[str, Any],
+    current_user: dict[str, Any],
     resolution_key: str,
-    maxcc: float = Query(DEFAULT_MAX_CLOUD),
-    db: Session = Depends(get_db),
-    current_user: dict[str, Any] = Depends(get_current_user),
+    maxcc: float,
 ) -> dict[str, Any]:
-    parcel = _get_owned_parcel(db, parcel_id, current_user)
+    """Return only real Sentinel-2 catalog dates for this lot.
 
+    This endpoint is what the frontend uses to enable/disable the calendar.
+    We do one STAC catalog search for the lot bounding box and return only the
+    dates that actually have Sentinel-2 scenes, instead of letting the user pick
+    arbitrary calendar days that would generate slow/no-data requests.
+    """
     db_dates: list[dict[str, Any]] = []
     if DB_CACHE_ENABLED:
         try:
@@ -171,7 +176,39 @@ def dates(
         by_date[item["date"]] = {**(existing or {}), **item, "isLoaded": True}
 
     data = sorted(by_date.values(), key=lambda item: item["date"], reverse=True)
-    return {"data": data, "count": len(data), "resolution": resolution_key}
+    return {"data": data, "count": len(data), "resolution": resolution_key, "sentinel_dates_only": True}
+
+
+@router.get("/parcels/{parcel_id}/resolutions/{resolution_key}/dates")
+def dates(
+    parcel_id: UUID,
+    resolution_key: str,
+    maxcc: float = Query(DEFAULT_MAX_CLOUD),
+    db: Session = Depends(get_db),
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    parcel = _get_owned_parcel(db, parcel_id, current_user)
+    return _dates_response(db=db, parcel=parcel, current_user=current_user, resolution_key=resolution_key, maxcc=maxcc)
+
+
+@router.post("/parcels/{parcel_id}/resolutions/{resolution_key}/dates")
+def dates_from_geometry(
+    parcel_id: UUID,
+    resolution_key: str,
+    payload: dict[str, Any],
+    maxcc: float = Query(DEFAULT_MAX_CLOUD),
+    db: Session = Depends(get_db),
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    parcel = _get_owned_parcel(db, parcel_id, current_user)
+    geometry_override = _resolve_parcel_geometry_override(payload)
+    if geometry_override:
+        parcel["geometry"] = geometry_override
+    try:
+        max_cloud = float(payload.get("maxcc") if payload.get("maxcc") is not None else maxcc)
+    except Exception:
+        max_cloud = maxcc
+    return _dates_response(db=db, parcel=parcel, current_user=current_user, resolution_key=resolution_key, maxcc=max_cloud)
 
 
 @router.get("/parcels/{parcel_id}/layers/{layer_key}/statistics")
