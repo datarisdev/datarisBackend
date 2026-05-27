@@ -10,8 +10,8 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
-from app.models.parcel import Parcel
 from app.models.satellite_image import ProcessingStatus, SatelliteImage
+from app.api.routers import compat as compat_store
 from app.services.sentinel2.indices import INDEX_DEFINITIONS, normalize_index_key
 from app.services.sentinel2.service import (
     DEFAULT_MAX_CLOUD,
@@ -32,14 +32,56 @@ def _user_id(current_user: dict[str, Any]) -> str:
     return str(current_user.get("id"))
 
 
-def _get_owned_parcel(db: Session, parcel_id: UUID | str, current_user: dict[str, Any]) -> Parcel:
-    parcel = db.query(Parcel).filter(
-        Parcel.id == parcel_id,
-        Parcel.user_id == _user_id(current_user),
-    ).first()
+def _get_owned_parcel(db: Session, parcel_id: UUID | str, current_user: dict[str, Any]) -> dict[str, Any]:
+    """Return a parcel from the real Dataris storage used by this project.
+
+    The production app stores frontend-compatible data in the compat JSON state
+    table (dataris_compat_state), not in a normalized SQL table named
+    `parcels`. The previous Sentinel-2 router queried the ORM Parcel model and
+    failed in Cloud Run with: relation "parcels" does not exist.
+
+    Reading from compat storage keeps this endpoint aligned with the parcels the
+    user sees in the current frontend. The SQLAlchemy session is intentionally
+    unused here; it is kept only so existing dependency injection and future DB
+    cache support remain compatible.
+    """
+    _ = db
+    wanted_id = str(parcel_id)
+    user_id = _user_id(current_user)
+    try:
+        compat_db = compat_store.read_db()
+        parcels = compat_store.table(compat_db, "parcels")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"No se pudieron leer los lotes guardados: {exc}") from exc
+
+    parcel = next(
+        (
+            row
+            for row in parcels
+            if str(row.get("id")) == wanted_id
+            and (not row.get("user_id") or str(row.get("user_id")) == user_id)
+        ),
+        None,
+    )
     if not parcel:
         raise HTTPException(status_code=404, detail="Lote no encontrado o sin acceso")
-    return parcel
+
+    geometry = _parcel_geometry(parcel)
+    if not geometry:
+        raise HTTPException(status_code=422, detail="El lote no tiene geometría GeoJSON válida para Sentinel-2")
+
+    normalized = dict(parcel)
+    normalized["geometry"] = geometry
+    return normalized
+
+
+def _parcel_geometry(parcel: dict[str, Any]) -> Any:
+    """Resolve all geometry keys produced by upload/import flows."""
+    for key in ("geometry", "geometry_geojson", "geojson", "feature_collection", "featureCollection"):
+        value = parcel.get(key)
+        if value:
+            return value
+    return None
 
 
 def _parse_target_date(raw: str | None) -> date | None:
@@ -99,7 +141,7 @@ def dates(
         try:
             rows = db.query(SatelliteImage).filter(
                 SatelliteImage.user_id == _user_id(current_user),
-                SatelliteImage.parcel_id == parcel.id,
+                SatelliteImage.parcel_id == parcel["id"],
                 SatelliteImage.processing_status == ProcessingStatus.completed,
             ).order_by(SatelliteImage.image_date.desc()).limit(60).all()
             for row in rows:
@@ -115,7 +157,7 @@ def dates(
             db_dates = []
 
     try:
-        catalog_dates = catalog_dates_for_geometry(parcel.geometry, max_cloud=maxcc)
+        catalog_dates = catalog_dates_for_geometry(parcel["geometry"], max_cloud=maxcc)
     except Exception as exc:
         if db_dates:
             return {"data": db_dates, "warning": f"Catálogo Sentinel-2 no disponible: {exc}"}
@@ -148,7 +190,7 @@ def statistics(
     cached = get_cached_db_image(
         db,
         user_id=_user_id(current_user),
-        parcel_id=str(parcel.id),
+        parcel_id=str(parcel["id"]),
         index_key=index_key,
         target_date=target_date,
     )
@@ -169,9 +211,9 @@ def statistics(
 
     result = generate_or_get_layer(
         db,
-        parcel_geometry=parcel.geometry,
+        parcel_geometry=parcel["geometry"],
         user_id=_user_id(current_user),
-        parcel_id=str(parcel.id),
+        parcel_id=str(parcel["id"]),
         index_key=index_key,
         target_date=target_date,
         max_cloud=maxcc,
@@ -221,9 +263,9 @@ def map_layer(
     try:
         result = generate_or_get_layer(
             db,
-            parcel_geometry=parcel.geometry,
+            parcel_geometry=parcel["geometry"],
             user_id=_user_id(current_user),
-            parcel_id=str(parcel.id),
+            parcel_id=str(parcel["id"]),
             index_key=index_key,
             target_date=target_date,
             max_cloud=maxcc,
@@ -250,7 +292,7 @@ def map_layer(
         }
 
     overlay = {
-        "id": f"sentinel2-{parcel.id}-{index_key}-{result.get('date')}",
+        "id": f"sentinel2-{parcel["id"]}-{index_key}-{result.get('date')}",
         "graniot_parcel_id": None,
         "image_url": result["image_url"],
         "bounds": result["bounds"],
@@ -306,12 +348,18 @@ def prefetch(
     height = int(payload.get("height") or 1024)
 
     try:
-        query = db.query(Parcel).filter(Parcel.user_id == _user_id(current_user))
-        if parcel_ids:
-            query = query.filter(Parcel.id.in_(parcel_ids))
-        parcels = query.limit(max_parcels).all()
+        compat_db = compat_store.read_db()
+        all_parcels = compat_store.table(compat_db, "parcels")
+        user_id = _user_id(current_user)
+        requested_ids = {str(item) for item in parcel_ids if item}
+        parcels = [
+            dict(row, geometry=_parcel_geometry(row))
+            for row in all_parcels
+            if (not row.get("user_id") or str(row.get("user_id")) == user_id)
+            and (not requested_ids or str(row.get("id")) in requested_ids)
+            and _parcel_geometry(row)
+        ][:max_parcels]
     except Exception as exc:
-        db.rollback()
         raise HTTPException(status_code=502, detail=f"No se pudieron consultar lotes para precache Sentinel-2: {exc}") from exc
 
     results: list[dict[str, Any]] = []
@@ -319,17 +367,17 @@ def prefetch(
         try:
             result = generate_or_get_layer(
                 db,
-                parcel_geometry=parcel.geometry,
+                parcel_geometry=parcel["geometry"],
                 user_id=_user_id(current_user),
-                parcel_id=str(parcel.id),
+                parcel_id=str(parcel["id"]),
                 index_key=layer_key,
                 target_date=target_date,
                 width=width,
                 height=height,
             )
-            results.append({"parcel_id": str(parcel.id), "available": bool(result.get("available")), "date": result.get("date")})
+            results.append({"parcel_id": str(parcel["id"]), "available": bool(result.get("available")), "date": result.get("date")})
         except Exception as exc:
-            results.append({"parcel_id": str(parcel.id), "available": False, "error": str(exc)})
+            results.append({"parcel_id": str(parcel["id"]), "available": False, "error": str(exc)})
 
     return _json_safe({
         "data": {
