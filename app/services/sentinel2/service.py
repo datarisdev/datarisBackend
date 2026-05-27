@@ -15,7 +15,9 @@ from rasterio.enums import Resampling
 from rasterio.mask import mask
 from rasterio.transform import array_bounds
 from rasterio.warp import reproject, transform_bounds
-from shapely.geometry import mapping
+from shapely.geometry import mapping, shape
+from shapely.geometry.base import BaseGeometry
+from shapely.ops import unary_union
 
 from app.models.satellite_image import ProcessingStatus, SatelliteImage
 from app.services.satellite.utils import featurecollection_to_geometry
@@ -71,8 +73,42 @@ def list_index_layers() -> list[dict[str, Any]]:
     ]
 
 
+def _parcel_geometry_to_shape(parcel_geometry: Any) -> BaseGeometry:
+    """Accept all geometry shapes used by Dataris parcels.
+
+    Existing projects may store geometry as FeatureCollection, Feature, raw
+    Polygon/MultiPolygon, GeoJSON string, or even a single-item features array.
+    The first Sentinel-2 release only accepted FeatureCollection and could raise
+    a 500 for valid lots saved in another GeoJSON format.
+    """
+    if isinstance(parcel_geometry, str):
+        parcel_geometry = json.loads(parcel_geometry)
+    if not isinstance(parcel_geometry, dict):
+        raise ValueError("La geometría del lote no es un GeoJSON válido")
+
+    geo_type = str(parcel_geometry.get("type") or "").lower()
+    if geo_type == "featurecollection":
+        features = parcel_geometry.get("features") or []
+        geometries = [shape(feature.get("geometry")) for feature in features if feature.get("geometry")]
+        if not geometries:
+            raise ValueError("El lote no contiene geometrías válidas")
+        return geometries[0] if len(geometries) == 1 else unary_union(geometries)
+    if geo_type == "feature":
+        geometry = parcel_geometry.get("geometry")
+        if not geometry:
+            raise ValueError("El Feature del lote no contiene geometry")
+        return shape(geometry)
+    if geo_type in {"polygon", "multipolygon", "geometrycollection"}:
+        return shape(parcel_geometry)
+
+    # Backwards compatibility with the previous utility.
+    return featurecollection_to_geometry(parcel_geometry)
+
+
 def geometry_to_gdf(parcel_geometry: dict) -> gpd.GeoDataFrame:
-    geom = featurecollection_to_geometry(parcel_geometry)
+    geom = _parcel_geometry_to_shape(parcel_geometry)
+    if geom.is_empty:
+        raise ValueError("La geometría del lote está vacía")
     return gpd.GeoDataFrame(geometry=[geom], crs="EPSG:4326")
 
 
