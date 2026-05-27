@@ -1,0 +1,159 @@
+from __future__ import annotations
+
+import os
+import time
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from typing import Any, Iterable
+
+from pystac_client import Client
+
+_RUNTIME_CACHE: dict[str, tuple[float, Any]] = {}
+
+DEFAULT_STAC_URL = os.getenv("SENTINEL_STAC_URL", "https://earth-search.aws.element84.com/v1")
+DEFAULT_COLLECTION = os.getenv("SENTINEL_STAC_COLLECTION", "sentinel-2-l2a")
+DEFAULT_COLLECTIONS = [c.strip() for c in os.getenv("SENTINEL_STAC_COLLECTIONS", DEFAULT_COLLECTION).split(",") if c.strip()]
+DEFAULT_PROVIDER = os.getenv("SENTINEL_STAC_PROVIDER", "earthsearch").lower()
+CATALOG_TTL_SECONDS = int(os.getenv("SENTINEL_CATALOG_CACHE_TTL_SECONDS", str(60 * 60 * 6)))
+
+
+def _cache_get(key: str) -> Any | None:
+    item = _RUNTIME_CACHE.get(key)
+    if not item:
+        return None
+    expires_at, value = item
+    if expires_at <= time.time():
+        _RUNTIME_CACHE.pop(key, None)
+        return None
+    return value
+
+
+def _cache_set(key: str, value: Any, ttl: int = CATALOG_TTL_SECONDS) -> Any:
+    if len(_RUNTIME_CACHE) > 500:
+        now = time.time()
+        for stale_key, (expires_at, _) in list(_RUNTIME_CACHE.items()):
+            if expires_at <= now:
+                _RUNTIME_CACHE.pop(stale_key, None)
+        if len(_RUNTIME_CACHE) > 500:
+            for stale_key in list(_RUNTIME_CACHE.keys())[:100]:
+                _RUNTIME_CACHE.pop(stale_key, None)
+    _RUNTIME_CACHE[key] = (time.time() + max(ttl, 1), value)
+    return value
+
+
+@dataclass(frozen=True)
+class SentinelScene:
+    id: str
+    datetime: datetime
+    cloud_cover: float | None
+    item: Any
+
+
+def _normalize_datetime(value: str | None) -> datetime:
+    if not value:
+        return datetime.utcnow()
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+
+
+def open_stac_client() -> Client:
+    return Client.open(DEFAULT_STAC_URL)
+
+
+def sign_item_if_needed(item: Any) -> Any:
+    # Microsoft Planetary Computer requires SAS signing. Earth Search and CDSE
+    # STAC do not use planetary_computer signing. Keeping this optional makes the
+    # service provider-switchable by environment variables.
+    if DEFAULT_PROVIDER in {"planetary", "planetary_computer", "microsoft"}:
+        import planetary_computer
+        return planetary_computer.sign(item)
+    return item
+
+
+def search_scenes(
+    *,
+    bbox: Iterable[float],
+    start_date: date,
+    end_date: date,
+    max_cloud: float | None = 80.0,
+    limit: int = 40,
+) -> list[SentinelScene]:
+    bbox_list = [float(v) for v in bbox]
+    cache_key = f"scenes:{DEFAULT_STAC_URL}:{','.join(DEFAULT_COLLECTIONS)}:{bbox_list}:{start_date}:{end_date}:{max_cloud}:{limit}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    client = open_stac_client()
+    query: dict[str, Any] = {
+        "collections": DEFAULT_COLLECTIONS,
+        "bbox": bbox_list,
+        "datetime": f"{start_date.isoformat()}/{(end_date + timedelta(days=1)).isoformat()}",
+        "limit": limit,
+    }
+    if max_cloud is not None:
+        query["query"] = {"eo:cloud_cover": {"lte": float(max_cloud)}}
+
+    items = list(client.search(**query).items())
+    scenes: list[SentinelScene] = []
+    for item in items:
+        props = item.properties or {}
+        dt = _normalize_datetime(props.get("datetime"))
+        cloud = props.get("eo:cloud_cover")
+        try:
+            cloud_value = None if cloud is None else float(cloud)
+        except Exception:
+            cloud_value = None
+        scenes.append(SentinelScene(id=item.id, datetime=dt, cloud_cover=cloud_value, item=item))
+
+    scenes.sort(key=lambda scene: (scene.datetime, -(scene.cloud_cover or 0)), reverse=True)
+    return _cache_set(cache_key, scenes)
+
+
+def available_dates(
+    *,
+    bbox: Iterable[float],
+    start_date: date,
+    end_date: date,
+    max_cloud: float | None = 80.0,
+    limit: int = 120,
+) -> list[dict[str, Any]]:
+    scenes = search_scenes(bbox=bbox, start_date=start_date, end_date=end_date, max_cloud=max_cloud, limit=limit)
+    by_date: dict[str, dict[str, Any]] = {}
+    for scene in scenes:
+        key = scene.datetime.date().isoformat()
+        current = by_date.get(key)
+        if current is None or (scene.cloud_cover or 999) < (current.get("cloudCoverage") or 999):
+            by_date[key] = {
+                "date": key,
+                "cloudCoverage": scene.cloud_cover,
+                "cloud_coverage": scene.cloud_cover,
+                "scene_id": scene.id,
+                "source": "Sentinel-2 L2A",
+            }
+    return sorted(by_date.values(), key=lambda item: item["date"], reverse=True)
+
+
+def best_scene_for_date(
+    *,
+    bbox: Iterable[float],
+    target_date: date | None,
+    max_cloud: float | None = 80.0,
+    lookback_days: int = 90,
+) -> SentinelScene | None:
+    end = target_date or date.today()
+    start = end if target_date else end - timedelta(days=lookback_days)
+    # For a manually selected date, search a small window around that date to
+    # handle catalog/provider date-time edge cases while still returning the date
+    # the user selected when it exists.
+    if target_date:
+        start = target_date - timedelta(days=1)
+        end = target_date + timedelta(days=1)
+
+    scenes = search_scenes(bbox=bbox, start_date=start, end_date=end, max_cloud=max_cloud, limit=30)
+    if target_date:
+        same_day = [s for s in scenes if s.datetime.date() == target_date]
+        if same_day:
+            return sorted(same_day, key=lambda s: (s.cloud_cover if s.cloud_cover is not None else 999))[0]
+    if not scenes:
+        return None
+    return sorted(scenes, key=lambda s: (abs(((target_date or date.today()) - s.datetime.date()).days), s.cloud_cover if s.cloud_cover is not None else 999))[0]
