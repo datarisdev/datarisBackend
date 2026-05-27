@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import math
 import os
 import tempfile
 from datetime import date, datetime, timedelta
@@ -21,7 +23,7 @@ from shapely.ops import unary_union
 
 from app.models.satellite_image import ProcessingStatus, SatelliteImage
 from app.services.satellite.utils import featurecollection_to_geometry
-from app.services.sentinel2.catalog import available_dates, best_scene_for_date, sign_item_if_needed
+from app.services.sentinel2.catalog import available_dates, best_scene_for_date, normalize_asset_href, sign_item_if_needed
 from app.services.sentinel2.indices import (
     BAND_ASSET_ALIASES,
     INDEX_DEFINITIONS,
@@ -33,12 +35,38 @@ from PIL import Image
 from io import BytesIO
 from app.utils.storage_satellite import generate_signed_satellite_url, upload_satellite_png_bytes
 
+logger = logging.getLogger(__name__)
+
 CACHE_DIR = Path(os.getenv("SENTINEL_LOCAL_CACHE_DIR", str(Path(tempfile.gettempdir()) / "dataris_sentinel2_cache")))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_MAX_CLOUD = float(os.getenv("SENTINEL_DEFAULT_MAX_CLOUD", "80"))
 DATE_LOOKBACK_DAYS = int(os.getenv("SENTINEL_DATE_LOOKBACK_DAYS", "180"))
 MAP_LOOKBACK_DAYS = int(os.getenv("SENTINEL_MAP_LOOKBACK_DAYS", "90"))
+DB_CACHE_ENABLED = os.getenv("SENTINEL_DB_CACHE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+RASTERIO_ENV = {
+    "AWS_NO_SIGN_REQUEST": os.getenv("AWS_NO_SIGN_REQUEST", "YES"),
+    "AWS_REGION": os.getenv("SENTINEL_AWS_REGION", os.getenv("AWS_REGION", "us-west-2")),
+    "GDAL_DISABLE_READDIR_ON_OPEN": os.getenv("GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR"),
+    "CPL_VSIL_CURL_USE_HEAD": os.getenv("CPL_VSIL_CURL_USE_HEAD", "NO"),
+    "GDAL_HTTP_MAX_RETRY": os.getenv("GDAL_HTTP_MAX_RETRY", "2"),
+    "GDAL_HTTP_RETRY_DELAY": os.getenv("GDAL_HTTP_RETRY_DELAY", "1"),
+    "VSI_CACHE": os.getenv("VSI_CACHE", "TRUE"),
+    "VSI_CACHE_SIZE": os.getenv("VSI_CACHE_SIZE", "50000000"),
+}
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    return value
 
 
 def list_index_layers() -> list[dict[str, Any]]:
@@ -135,28 +163,30 @@ def _asset_href(item: Any, canonical_band: str) -> str:
     for alias in aliases:
         asset = item.assets.get(alias)
         if asset is not None and getattr(asset, "href", None):
-            return asset.href
+            return normalize_asset_href(asset.href)
     available = ", ".join(sorted(item.assets.keys()))
     raise ValueError(f"No se encontró la banda {canonical_band}. Assets disponibles: {available}")
 
 
 def _clip_asset(href: str, shapes: list[dict[str, Any]]) -> tuple[np.ndarray, dict[str, Any]]:
-    with rasterio.open(href) as src:
-        out_img, out_transform = mask(src, shapes=shapes, crop=True, filled=False)
-        raw = out_img[0].astype("float32")
-        arr = raw.filled(np.nan) if hasattr(raw, "filled") else raw
-        meta = src.meta.copy()
-        meta.update(
-            {
-                "height": arr.shape[0],
-                "width": arr.shape[1],
-                "transform": out_transform,
-                "count": 1,
-                "dtype": "float32",
-                "nodata": np.nan,
-            }
-        )
-        return arr.astype("float32"), meta
+    normalized_href = normalize_asset_href(href)
+    with rasterio.Env(**RASTERIO_ENV):
+        with rasterio.open(normalized_href) as src:
+            out_img, out_transform = mask(src, shapes=shapes, crop=True, filled=False)
+            raw = out_img[0].astype("float32")
+            arr = raw.filled(np.nan) if hasattr(raw, "filled") else raw
+            meta = src.meta.copy()
+            meta.update(
+                {
+                    "height": arr.shape[0],
+                    "width": arr.shape[1],
+                    "transform": out_transform,
+                    "count": 1,
+                    "dtype": "float32",
+                    "nodata": np.nan,
+                }
+            )
+            return arr.astype("float32"), meta
 
 
 def _bounds_from_raster_meta(meta: dict[str, Any]) -> dict[str, float]:
@@ -189,9 +219,10 @@ def _load_required_bands(item: Any, parcel_geometry: dict, bands: tuple[str, ...
     gdf = geometry_to_gdf(parcel_geometry)
     ref_href = _asset_href(signed_item, "red" if "red" in bands else bands[0])
 
-    with rasterio.open(ref_href) as src:
-        gdf_proj = gdf.to_crs(src.crs)
-        shapes = [mapping(geom) for geom in gdf_proj.geometry]
+    with rasterio.Env(**RASTERIO_ENV):
+        with rasterio.open(normalize_asset_href(ref_href)) as src:
+            gdf_proj = gdf.to_crs(src.crs)
+            shapes = [mapping(geom) for geom in gdf_proj.geometry]
 
     loaded: dict[str, np.ndarray] = {}
     metas: dict[str, dict[str, Any]] = {}
@@ -249,6 +280,8 @@ def local_png_url(cache_key: str) -> str:
 
 
 def get_cached_db_image(db_session, *, user_id: str, parcel_id: str, index_key: str, target_date: date | None) -> SatelliteImage | None:
+    if not DB_CACHE_ENABLED:
+        return None
     query = db_session.query(SatelliteImage).filter(
         SatelliteImage.user_id == user_id,
         SatelliteImage.parcel_id == parcel_id,
@@ -301,15 +334,24 @@ def generate_or_get_layer(
     if not definition:
         raise ValueError(f"Índice no soportado: {index_key}")
 
-    cached = None if force_refresh else get_cached_db_image(
-        db_session,
-        user_id=user_id,
-        parcel_id=parcel_id,
-        index_key=index_key,
-        target_date=target_date,
-    )
+    cached = None
+    if not force_refresh and DB_CACHE_ENABLED:
+        try:
+            cached = get_cached_db_image(
+                db_session,
+                user_id=user_id,
+                parcel_id=parcel_id,
+                index_key=index_key,
+                target_date=target_date,
+            )
+        except Exception:
+            logger.exception("No se pudo leer cache DB Sentinel-2; se continúa sin cache DB")
+            try:
+                db_session.rollback()
+            except Exception:
+                pass
     if cached and cached.image_object_path:
-        return {
+        return _json_safe({
             "available": True,
             "date": cached.image_date.date().isoformat(),
             "cloud_coverage": cached.cloud_coverage,
@@ -318,7 +360,7 @@ def generate_or_get_layer(
             "image_url": image_url_from_object_path(cached.image_object_path),
             "object_path": cached.image_object_path,
             "source": "cache",
-        }
+        })
 
     bbox = bbox_from_geometry(parcel_geometry)
     scene = best_scene_for_date(bbox=bbox, target_date=target_date, max_cloud=max_cloud, lookback_days=MAP_LOOKBACK_DAYS)
@@ -329,6 +371,28 @@ def generate_or_get_layer(
         }
 
     image_date = scene.datetime.date()
+    cache_key = _cache_key(
+        user_id=user_id,
+        parcel_id=parcel_id,
+        index_key=index_key,
+        image_date=image_date.isoformat(),
+        width=width,
+        height=height,
+    )
+    local_path = local_png_path(cache_key)
+    if not force_refresh and local_path.exists():
+        return _json_safe({
+            "available": True,
+            "date": image_date.isoformat(),
+            "cloud_coverage": scene.cloud_cover,
+            "bounds": bounds_from_gdf(geometry_to_gdf(parcel_geometry)),
+            "statistics": {},
+            "image_url": local_png_url(cache_key),
+            "object_path": f"local://{cache_key}",
+            "source": "local-cache",
+            "scene_id": scene.id,
+        })
+
     bands, _meta, bounds = _load_required_bands(scene.item, parcel_geometry, definition.bands)
     arr = definition.compute(bands)
     stats = compute_statistics(arr)
@@ -343,37 +407,45 @@ def generate_or_get_layer(
         height=height,
     )
 
-    start_dt = datetime.combine(image_date, datetime.min.time())
-    end_dt = start_dt + timedelta(days=1)
-    db_obj = db_session.query(SatelliteImage).filter(
-        SatelliteImage.user_id == user_id,
-        SatelliteImage.parcel_id == parcel_id,
-        SatelliteImage.index_type == index_key,
-        SatelliteImage.image_date >= start_dt,
-        SatelliteImage.image_date < end_dt,
-    ).first()
-    if not db_obj:
-        db_obj = SatelliteImage(
-            user_id=user_id,
-            parcel_id=parcel_id,
-            image_date=start_dt,
-            index_type=index_key,
-            image_object_path=object_path,
-            processing_status=ProcessingStatus.completed,
-            cloud_coverage=scene.cloud_cover,
-            bounds=bounds,
-            statistics=stats,
-        )
-        db_session.add(db_obj)
-    else:
-        db_obj.image_object_path = object_path
-        db_obj.processing_status = ProcessingStatus.completed
-        db_obj.cloud_coverage = scene.cloud_cover
-        db_obj.bounds = bounds
-        db_obj.statistics = stats
-    db_session.commit()
+    if DB_CACHE_ENABLED:
+        try:
+            start_dt = datetime.combine(image_date, datetime.min.time())
+            end_dt = start_dt + timedelta(days=1)
+            db_obj = db_session.query(SatelliteImage).filter(
+                SatelliteImage.user_id == user_id,
+                SatelliteImage.parcel_id == parcel_id,
+                SatelliteImage.index_type == index_key,
+                SatelliteImage.image_date >= start_dt,
+                SatelliteImage.image_date < end_dt,
+            ).first()
+            if not db_obj:
+                db_obj = SatelliteImage(
+                    user_id=user_id,
+                    parcel_id=parcel_id,
+                    image_date=start_dt,
+                    index_type=index_key,
+                    image_object_path=object_path,
+                    processing_status=ProcessingStatus.completed,
+                    cloud_coverage=scene.cloud_cover,
+                    bounds=_json_safe(bounds),
+                    statistics=_json_safe(stats),
+                )
+                db_session.add(db_obj)
+            else:
+                db_obj.image_object_path = object_path
+                db_obj.processing_status = ProcessingStatus.completed
+                db_obj.cloud_coverage = scene.cloud_cover
+                db_obj.bounds = _json_safe(bounds)
+                db_obj.statistics = _json_safe(stats)
+            db_session.commit()
+        except Exception:
+            logger.exception("No se pudo guardar cache DB Sentinel-2; la imagen se devolverá igual")
+            try:
+                db_session.rollback()
+            except Exception:
+                pass
 
-    return {
+    return _json_safe({
         "available": True,
         "date": image_date.isoformat(),
         "cloud_coverage": scene.cloud_cover,
@@ -383,4 +455,4 @@ def generate_or_get_layer(
         "object_path": object_path,
         "source": "sentinel-2-l2a",
         "scene_id": scene.id,
-    }
+    })

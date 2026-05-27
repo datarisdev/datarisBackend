@@ -72,3 +72,28 @@ SENTINEL_MAP_LOOKBACK_DAYS=90
 - No se agregó una migración porque se reutiliza la tabla existente `satellite_images`.
 - El primer cálculo de una capa puede tardar según tamaño del lote y velocidad del STAC. Después queda en cache y carga como PNG.
 - El frontend llama primero al cache de memoria/localStorage y luego al backend.
+
+## Fix producción Cloud Run 500 en map-layer
+
+Si el navegador muestra `HTTP/2 500` en `/api/satellite-free/.../ndvi/map-layer`, esta versión corrige los dos casos más comunes:
+
+1. **Earth Search devuelve assets `s3://...`**. En Cloud Run, GDAL/Rasterio puede intentar leerlos con firma AWS y fallar si no hay credenciales. Ahora los assets `s3://sentinel-cogs/...` se normalizan a HTTPS público y se fuerza lectura anónima.
+2. **Cache DB incompatible**. Si la tabla `satellite_images` no tiene exactamente las columnas esperadas o no tienes migraciones al día, el nuevo motor no bloquea la imagen. Por defecto `SENTINEL_DB_CACHE_ENABLED=false` y se usa cache local/GCS.
+
+Variables recomendadas:
+
+```env
+SENTINEL_STAC_URL=https://earth-search.aws.element84.com/v1
+SENTINEL_STAC_COLLECTIONS=sentinel-2-l2a
+SENTINEL_STAC_PROVIDER=earthsearch
+SENTINEL_DEFAULT_MAX_CLOUD=100
+SENTINEL_DATE_LOOKBACK_DAYS=180
+SENTINEL_MAP_LOOKBACK_DAYS=120
+SENTINEL_DB_CACHE_ENABLED=false
+AWS_NO_SIGN_REQUEST=YES
+SENTINEL_AWS_REGION=us-west-2
+GDAL_DISABLE_READDIR_ON_OPEN=EMPTY_DIR
+CPL_VSIL_CURL_USE_HEAD=NO
+```
+
+Para cache persistente en producción, configura `GCS_SATELLITE_BUCKET_NAME` y credenciales de Google Cloud Storage. Si no configuras GCS, funciona con cache local, pero Cloud Run puede perderlo al reiniciar instancia.

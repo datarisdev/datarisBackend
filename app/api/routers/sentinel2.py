@@ -15,6 +15,8 @@ from app.models.satellite_image import ProcessingStatus, SatelliteImage
 from app.services.sentinel2.indices import INDEX_DEFINITIONS, normalize_index_key
 from app.services.sentinel2.service import (
     DEFAULT_MAX_CLOUD,
+    DB_CACHE_ENABLED,
+    _json_safe,
     catalog_dates_for_geometry,
     generate_or_get_layer,
     get_cached_db_image,
@@ -93,19 +95,24 @@ def dates(
     parcel = _get_owned_parcel(db, parcel_id, current_user)
 
     db_dates: list[dict[str, Any]] = []
-    rows = db.query(SatelliteImage).filter(
-        SatelliteImage.user_id == _user_id(current_user),
-        SatelliteImage.parcel_id == parcel.id,
-        SatelliteImage.processing_status == ProcessingStatus.completed,
-    ).order_by(SatelliteImage.image_date.desc()).limit(60).all()
-    for row in rows:
-        db_dates.append({
-            "date": row.image_date.date().isoformat(),
-            "cloudCoverage": row.cloud_coverage,
-            "cloud_coverage": row.cloud_coverage,
-            "isLoaded": True,
-            "source": "cache",
-        })
+    if DB_CACHE_ENABLED:
+        try:
+            rows = db.query(SatelliteImage).filter(
+                SatelliteImage.user_id == _user_id(current_user),
+                SatelliteImage.parcel_id == parcel.id,
+                SatelliteImage.processing_status == ProcessingStatus.completed,
+            ).order_by(SatelliteImage.image_date.desc()).limit(60).all()
+            for row in rows:
+                db_dates.append({
+                    "date": row.image_date.date().isoformat(),
+                    "cloudCoverage": row.cloud_coverage,
+                    "cloud_coverage": row.cloud_coverage,
+                    "isLoaded": True,
+                    "source": "cache",
+                })
+        except Exception:
+            db.rollback()
+            db_dates = []
 
     try:
         catalog_dates = catalog_dates_for_geometry(parcel.geometry, max_cloud=maxcc)
@@ -251,7 +258,7 @@ def map_layer(
         "layer": index_key,
         "source": result.get("source", "sentinel-2-l2a"),
     }
-    return {
+    return _json_safe({
         "data": {
             "available": True,
             "reason": None,
@@ -281,7 +288,7 @@ def map_layer(
             "warnings": [],
             "source_count": 1,
         }
-    }
+    })
 
 
 @router.post("/satellite/prefetch")
@@ -298,10 +305,14 @@ def prefetch(
     width = int(payload.get("width") or 1024)
     height = int(payload.get("height") or 1024)
 
-    query = db.query(Parcel).filter(Parcel.user_id == _user_id(current_user))
-    if parcel_ids:
-        query = query.filter(Parcel.id.in_(parcel_ids))
-    parcels = query.limit(max_parcels).all()
+    try:
+        query = db.query(Parcel).filter(Parcel.user_id == _user_id(current_user))
+        if parcel_ids:
+            query = query.filter(Parcel.id.in_(parcel_ids))
+        parcels = query.limit(max_parcels).all()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=502, detail=f"No se pudieron consultar lotes para precache Sentinel-2: {exc}") from exc
 
     results: list[dict[str, Any]] = []
     for parcel in parcels:
@@ -320,14 +331,14 @@ def prefetch(
         except Exception as exc:
             results.append({"parcel_id": str(parcel.id), "available": False, "error": str(exc)})
 
-    return {
+    return _json_safe({
         "data": {
             "queued": False,
             "parcel_count": len(parcels),
             "image_count": sum(1 for item in results if item.get("available")),
             "results": results,
         }
-    }
+    })
 
 
 @router.get("/cache/{cache_key}.png")
