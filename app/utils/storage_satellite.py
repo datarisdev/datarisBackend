@@ -60,6 +60,25 @@ def upload_satellite_tif(
     return object_path
 
 
+def upload_satellite_png_bytes(
+    content: bytes,
+    user_id: str,
+    parcel_id: str,
+    index_type: str,
+    image_date: str,
+) -> str:
+    bucket = _bucket()
+    object_path = (
+        f"satellite/{user_id}/"
+        f"{parcel_id}/"
+        f"{index_type}/"
+        f"{image_date}.png"
+    )
+    blob = bucket.blob(object_path)
+    blob.upload_from_string(content, content_type="image/png")
+    return object_path
+
+
 def generate_signed_satellite_url(object_path: str) -> str:
     bucket = _bucket()
     blob = bucket.blob(object_path)
