@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     # The SQLite fallback exists so the app can boot and the /api/compat layer can work.
     DATABASE_URL: str = _default_sqlite_url()
     BACKEND_CORS_ORIGINS: str = "*"
+    # Optional regex. Useful in Cloud Run when the frontend domain changes or
+    # when BACKEND_CORS_ORIGINS is left as "*" with credentials enabled.
+    BACKEND_CORS_ORIGIN_REGEX: str | None = None
 
     # Optional Google Cloud Storage config.
     GCS_BUCKET_NAME: str = "dataris-user-avatars"
