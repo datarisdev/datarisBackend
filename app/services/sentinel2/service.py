@@ -14,11 +14,16 @@ import geopandas as gpd
 import numpy as np
 import rasterio
 from rasterio.enums import Resampling
+from rasterio.features import geometry_mask
 from rasterio.mask import mask
 from rasterio.transform import array_bounds
 from rasterio.warp import reproject, transform_bounds
 from shapely.geometry import mapping, shape
 from shapely.geometry.base import BaseGeometry
+try:
+    from shapely.validation import make_valid as _shapely_make_valid
+except Exception:  # Shapely < 2 fallback
+    _shapely_make_valid = None
 from shapely.ops import unary_union
 
 from app.models.satellite_image import ProcessingStatus, SatelliteImage
@@ -44,6 +49,7 @@ DEFAULT_MAX_CLOUD = float(os.getenv("SENTINEL_DEFAULT_MAX_CLOUD", "80"))
 DATE_LOOKBACK_DAYS = int(os.getenv("SENTINEL_DATE_LOOKBACK_DAYS", "180"))
 MAP_LOOKBACK_DAYS = int(os.getenv("SENTINEL_MAP_LOOKBACK_DAYS", "90"))
 DB_CACHE_ENABLED = os.getenv("SENTINEL_DB_CACHE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+MASK_ALL_TOUCHED = os.getenv("SENTINEL_MASK_ALL_TOUCHED", "true").strip().lower() not in {"0", "false", "no", "off"}
 
 RASTERIO_ENV = {
     "AWS_NO_SIGN_REQUEST": os.getenv("AWS_NO_SIGN_REQUEST", "YES"),
@@ -101,36 +107,62 @@ def list_index_layers() -> list[dict[str, Any]]:
     ]
 
 
+def _clean_geometry(geom: BaseGeometry) -> BaseGeometry:
+    """Repair common invalid rings without changing the intended lot outline."""
+    if geom.is_empty:
+        return geom
+    try:
+        if not geom.is_valid:
+            if _shapely_make_valid is not None:
+                geom = _shapely_make_valid(geom)
+            else:
+                geom = geom.buffer(0)
+    except Exception:
+        # Keep the original geometry; rasterio will raise a clear error if it is unusable.
+        pass
+    return geom
+
+
 def _parcel_geometry_to_shape(parcel_geometry: Any) -> BaseGeometry:
     """Accept all geometry shapes used by Dataris parcels.
 
-    Existing projects may store geometry as FeatureCollection, Feature, raw
-    Polygon/MultiPolygon, GeoJSON string, or even a single-item features array.
-    The first Sentinel-2 release only accepted FeatureCollection and could raise
-    a 500 for valid lots saved in another GeoJSON format.
+    Supports FeatureCollection, Feature, Polygon, MultiPolygon and GeometryCollection,
+    including holes/rings and multiple divisions. FeatureCollections are dissolved
+    into one mask so every valid subpolygon is retained while internal boundaries
+    do not leak raster pixels outside the real lot geometry.
     """
     if isinstance(parcel_geometry, str):
         parcel_geometry = json.loads(parcel_geometry)
+    if isinstance(parcel_geometry, list):
+        geometries = [_parcel_geometry_to_shape(item) for item in parcel_geometry if item]
+        if not geometries:
+            raise ValueError("El lote no contiene geometrías válidas")
+        return _clean_geometry(unary_union(geometries))
     if not isinstance(parcel_geometry, dict):
         raise ValueError("La geometría del lote no es un GeoJSON válido")
 
     geo_type = str(parcel_geometry.get("type") or "").lower()
     if geo_type == "featurecollection":
         features = parcel_geometry.get("features") or []
-        geometries = [shape(feature.get("geometry")) for feature in features if feature.get("geometry")]
+        geometries = [
+            _clean_geometry(shape(feature.get("geometry")))
+            for feature in features
+            if isinstance(feature, dict) and feature.get("geometry")
+        ]
+        geometries = [geom for geom in geometries if not geom.is_empty]
         if not geometries:
             raise ValueError("El lote no contiene geometrías válidas")
-        return geometries[0] if len(geometries) == 1 else unary_union(geometries)
+        return _clean_geometry(geometries[0] if len(geometries) == 1 else unary_union(geometries))
     if geo_type == "feature":
         geometry = parcel_geometry.get("geometry")
         if not geometry:
             raise ValueError("El Feature del lote no contiene geometry")
-        return shape(geometry)
+        return _clean_geometry(shape(geometry))
     if geo_type in {"polygon", "multipolygon", "geometrycollection"}:
-        return shape(parcel_geometry)
+        return _clean_geometry(shape(parcel_geometry))
 
     # Backwards compatibility with the previous utility.
-    return featurecollection_to_geometry(parcel_geometry)
+    return _clean_geometry(featurecollection_to_geometry(parcel_geometry))
 
 
 def geometry_to_gdf(parcel_geometry: dict) -> gpd.GeoDataFrame:
@@ -172,7 +204,7 @@ def _clip_asset(href: str, shapes: list[dict[str, Any]]) -> tuple[np.ndarray, di
     normalized_href = normalize_asset_href(href)
     with rasterio.Env(**RASTERIO_ENV):
         with rasterio.open(normalized_href) as src:
-            out_img, out_transform = mask(src, shapes=shapes, crop=True, filled=False)
+            out_img, out_transform = mask(src, shapes=shapes, crop=True, filled=False, all_touched=MASK_ALL_TOUCHED)
             raw = out_img[0].astype("float32")
             arr = raw.filled(np.nan) if hasattr(raw, "filled") else raw
             meta = src.meta.copy()
@@ -212,6 +244,50 @@ def _resize_png_if_needed(png_bytes: bytes, max_width: int, max_height: int) -> 
         buffer = BytesIO()
         image.save(buffer, format="PNG", optimize=True)
         return buffer.getvalue()
+
+
+def _geometry_hash(parcel_geometry: Any) -> str:
+    try:
+        geom = mapping(_parcel_geometry_to_shape(parcel_geometry))
+        payload = json.dumps(geom, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        payload = json.dumps(parcel_geometry, sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _geometry_shapes_for_meta(parcel_geometry: Any, meta: dict[str, Any]) -> list[dict[str, Any]]:
+    gdf = geometry_to_gdf(parcel_geometry)
+    crs = meta.get("crs")
+    if crs:
+        gdf = gdf.to_crs(crs)
+    return [mapping(geom) for geom in gdf.geometry if geom and not geom.is_empty]
+
+
+def _apply_precise_geometry_mask(arr: np.ndarray, meta: dict[str, Any], parcel_geometry: Any) -> np.ndarray:
+    """Force transparent pixels outside the exact lot geometry after all resampling.
+
+    rasterio.mask is applied when reading every band, but mixed-resolution indices
+    such as NDRE/NDMI resample 20m/10m bands and can reintroduce tiny edge pixels.
+    This final mask uses the selected lot geometry on the output grid so the PNG
+    alpha always follows the lote, including holes, rings and MultiPolygons.
+    """
+    shapes = _geometry_shapes_for_meta(parcel_geometry, meta)
+    if not shapes:
+        return arr
+    inside = geometry_mask(
+        shapes,
+        out_shape=(int(meta["height"]), int(meta["width"])),
+        transform=meta["transform"],
+        invert=True,
+        all_touched=MASK_ALL_TOUCHED,
+    )
+    if arr.ndim == 3:
+        masked = arr.astype("float32", copy=True)
+        masked[:, ~inside] = np.nan
+        return masked
+    masked = arr.astype("float32", copy=True)
+    masked[~inside] = np.nan
+    return masked
 
 
 def _load_required_bands(item: Any, parcel_geometry: dict, bands: tuple[str, ...]) -> tuple[dict[str, np.ndarray], dict[str, Any], dict[str, float]]:
@@ -257,9 +333,10 @@ def _load_required_bands(item: Any, parcel_geometry: dict, bands: tuple[str, ...
     return normalize_band_values(loaded), ref_meta, _bounds_from_raster_meta(ref_meta)
 
 
-def _cache_key(*, user_id: str, parcel_id: str, index_key: str, image_date: str, width: int, height: int) -> str:
+def _cache_key(*, user_id: str, parcel_id: str, index_key: str, image_date: str, width: int, height: int, geometry_hash: str = "") -> str:
     payload = {
-        "v": 2,
+        "v": 3,
+        "geometry_hash": geometry_hash,
         "user_id": user_id,
         "parcel_id": parcel_id,
         "index_key": index_key,
@@ -270,9 +347,33 @@ def _cache_key(*, user_id: str, parcel_id: str, index_key: str, image_date: str,
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
+def _safe_cache_key(cache_key: str) -> str:
+    return "".join(ch for ch in cache_key.lower() if ch in "0123456789abcdef")[:80]
+
+
 def local_png_path(cache_key: str) -> Path:
-    safe_key = "".join(ch for ch in cache_key.lower() if ch in "0123456789abcdef")[:80]
-    return CACHE_DIR / f"{safe_key}.png"
+    return CACHE_DIR / f"{_safe_cache_key(cache_key)}.png"
+
+
+def local_meta_path(cache_key: str) -> Path:
+    return CACHE_DIR / f"{_safe_cache_key(cache_key)}.json"
+
+
+def _read_local_metadata(cache_key: str) -> dict[str, Any]:
+    path = local_meta_path(cache_key)
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+
+def _write_local_metadata(cache_key: str, metadata: dict[str, Any]) -> None:
+    try:
+        local_meta_path(cache_key).write_text(json.dumps(_json_safe(metadata), sort_keys=True))
+    except Exception:
+        logger.exception("No se pudo escribir metadata local Sentinel-2")
 
 
 def local_png_url(cache_key: str) -> str:
@@ -302,13 +403,15 @@ def image_url_from_object_path(object_path: str) -> str:
     return generate_signed_satellite_url(object_path)
 
 
-def _store_png(png_bytes: bytes, *, user_id: str, parcel_id: str, index_key: str, image_date: str, width: int, height: int) -> tuple[str, str]:
-    cache_key = _cache_key(user_id=user_id, parcel_id=parcel_id, index_key=index_key, image_date=image_date, width=width, height=height)
+def _store_png(png_bytes: bytes, *, user_id: str, parcel_id: str, index_key: str, image_date: str, width: int, height: int, geometry_hash: str = "", metadata: dict[str, Any] | None = None) -> tuple[str, str]:
+    cache_key = _cache_key(user_id=user_id, parcel_id=parcel_id, index_key=index_key, image_date=image_date, width=width, height=height, geometry_hash=geometry_hash)
     path = local_png_path(cache_key)
     path.write_bytes(png_bytes)
+    if metadata is not None:
+        _write_local_metadata(cache_key, metadata)
 
     try:
-        object_path = upload_satellite_png_bytes(png_bytes, user_id, parcel_id, index_key, image_date)
+        object_path = upload_satellite_png_bytes(png_bytes, user_id, parcel_id, index_key, f"{image_date}-{geometry_hash or cache_key[:12]}")
         return object_path, generate_signed_satellite_url(object_path)
     except Exception:
         # GCS is optional for local/dev. The frontend can load the public cache
@@ -330,6 +433,7 @@ def generate_or_get_layer(
     force_refresh: bool = False,
 ) -> dict[str, Any]:
     index_key = normalize_index_key(index_key)
+    geometry_fingerprint = _geometry_hash(parcel_geometry)
     definition = INDEX_DEFINITIONS.get(index_key)
     if not definition:
         raise ValueError(f"Índice no soportado: {index_key}")
@@ -378,25 +482,38 @@ def generate_or_get_layer(
         image_date=image_date.isoformat(),
         width=width,
         height=height,
+        geometry_hash=geometry_fingerprint,
     )
     local_path = local_png_path(cache_key)
     if not force_refresh and local_path.exists():
+        cached_meta = _read_local_metadata(cache_key)
         return _json_safe({
             "available": True,
-            "date": image_date.isoformat(),
-            "cloud_coverage": scene.cloud_cover,
-            "bounds": bounds_from_gdf(geometry_to_gdf(parcel_geometry)),
-            "statistics": {},
+            "date": cached_meta.get("date") or image_date.isoformat(),
+            "cloud_coverage": cached_meta.get("cloud_coverage", scene.cloud_cover),
+            "bounds": cached_meta.get("bounds") or bounds_from_gdf(geometry_to_gdf(parcel_geometry)),
+            "statistics": cached_meta.get("statistics") or {},
             "image_url": local_png_url(cache_key),
             "object_path": f"local://{cache_key}",
             "source": "local-cache",
-            "scene_id": scene.id,
+            "scene_id": cached_meta.get("scene_id") or scene.id,
         })
 
     bands, _meta, bounds = _load_required_bands(scene.item, parcel_geometry, definition.bands)
     arr = definition.compute(bands)
+    arr = _apply_precise_geometry_mask(arr, _meta, parcel_geometry)
     stats = compute_statistics(arr)
     png_bytes = _resize_png_if_needed(render_index_png(index_key, arr), width, height)
+    local_metadata = {
+        "available": True,
+        "date": image_date.isoformat(),
+        "cloud_coverage": scene.cloud_cover,
+        "bounds": bounds,
+        "statistics": stats,
+        "source": "sentinel-2-l2a",
+        "scene_id": scene.id,
+        "geometry_hash": geometry_fingerprint,
+    }
     object_path, image_url = _store_png(
         png_bytes,
         user_id=user_id,
@@ -405,6 +522,8 @@ def generate_or_get_layer(
         image_date=image_date.isoformat(),
         width=width,
         height=height,
+        geometry_hash=geometry_fingerprint,
+        metadata=local_metadata,
     )
 
     if DB_CACHE_ENABLED:

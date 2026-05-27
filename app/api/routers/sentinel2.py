@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from time import sleep
 from typing import Any, Optional
 from uuid import UUID
 
@@ -10,6 +11,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
+from app.db.session import SessionLocal
 from app.models.satellite_image import ProcessingStatus, SatelliteImage
 from app.api.routers import compat as compat_store
 from app.services.sentinel2.indices import INDEX_DEFINITIONS, normalize_index_key
@@ -238,23 +240,35 @@ def statistics(
     }
 
 
-@router.get("/parcels/{parcel_id}/ndvi/map-layer")
-def map_layer(
-    parcel_id: UUID,
-    layer_key: Optional[str] = Query(None),
-    wms_layer: Optional[str] = Query(None),
-    date_param: Optional[str] = Query(None, alias="date"),
-    width: int = Query(1024, ge=128, le=2048),
-    height: int = Query(1024, ge=128, le=2048),
-    maxcc: float = Query(DEFAULT_MAX_CLOUD),
-    include_statistics: bool = Query(True),
-    auto_sync: bool = Query(True),
-    force_refresh: bool = Query(False),
-    db: Session = Depends(get_db),
-    current_user: dict[str, Any] = Depends(get_current_user),
+def _resolve_parcel_geometry_override(payload: dict[str, Any] | None) -> Any:
+    if not payload:
+        return None
+    for key in ("geometry", "parcel_geometry", "geometry_geojson", "geojson", "feature_collection", "featureCollection"):
+        value = payload.get(key)
+        if value:
+            return value
+    parcel = payload.get("parcel")
+    if isinstance(parcel, dict):
+        return _parcel_geometry(parcel)
+    return None
+
+
+def _build_map_layer_response(
+    *,
+    db: Session,
+    parcel: dict[str, Any],
+    current_user: dict[str, Any],
+    layer_key: Optional[str],
+    wms_layer: Optional[str],
+    date_param: Optional[str],
+    width: int,
+    height: int,
+    maxcc: float,
+    include_statistics: bool,
+    auto_sync: bool,
+    force_refresh: bool,
 ) -> dict[str, Any]:
     _ = include_statistics, auto_sync
-    parcel = _get_owned_parcel(db, parcel_id, current_user)
     index_key = normalize_index_key(layer_key or wms_layer or "NDVI")
     if index_key not in INDEX_DEFINITIONS:
         raise HTTPException(status_code=422, detail=f"Índice no soportado: {index_key}")
@@ -292,7 +306,7 @@ def map_layer(
         }
 
     overlay = {
-        "id": f"sentinel2-{parcel["id"]}-{index_key}-{result.get('date')}",
+        "id": f"sentinel2-{parcel.get('id')}-{index_key}-{result.get('date')}",
         "graniot_parcel_id": None,
         "image_url": result["image_url"],
         "bounds": result["bounds"],
@@ -333,57 +347,228 @@ def map_layer(
     })
 
 
+@router.get("/parcels/{parcel_id}/ndvi/map-layer")
+def map_layer(
+    parcel_id: UUID,
+    layer_key: Optional[str] = Query(None),
+    wms_layer: Optional[str] = Query(None),
+    date_param: Optional[str] = Query(None, alias="date"),
+    width: int = Query(1024, ge=128, le=2048),
+    height: int = Query(1024, ge=128, le=2048),
+    maxcc: float = Query(DEFAULT_MAX_CLOUD),
+    include_statistics: bool = Query(True),
+    auto_sync: bool = Query(True),
+    force_refresh: bool = Query(False),
+    db: Session = Depends(get_db),
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    parcel = _get_owned_parcel(db, parcel_id, current_user)
+    return _build_map_layer_response(
+        db=db,
+        parcel=parcel,
+        current_user=current_user,
+        layer_key=layer_key,
+        wms_layer=wms_layer,
+        date_param=date_param,
+        width=width,
+        height=height,
+        maxcc=maxcc,
+        include_statistics=include_statistics,
+        auto_sync=auto_sync,
+        force_refresh=force_refresh,
+    )
+
+
+@router.post("/parcels/{parcel_id}/ndvi/map-layer")
+def map_layer_from_geometry(
+    parcel_id: UUID,
+    payload: dict[str, Any],
+    db: Session = Depends(get_db),
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    parcel = _get_owned_parcel(db, parcel_id, current_user)
+    geometry_override = _resolve_parcel_geometry_override(payload)
+    if geometry_override:
+        # The frontend sends the exact currently selected geometry. This prevents
+        # stale compat-storage geometries from generating a larger raster that
+        # covers other lots.
+        parcel["geometry"] = geometry_override
+
+    return _build_map_layer_response(
+        db=db,
+        parcel=parcel,
+        current_user=current_user,
+        layer_key=payload.get("layer_key"),
+        wms_layer=payload.get("wms_layer"),
+        date_param=payload.get("date"),
+        width=max(128, min(int(payload.get("width") or 1024), 2048)),
+        height=max(128, min(int(payload.get("height") or 1024), 2048)),
+        maxcc=float(payload.get("maxcc") or DEFAULT_MAX_CLOUD),
+        include_statistics=bool(payload.get("include_statistics", True)),
+        auto_sync=bool(payload.get("auto_sync", True)),
+        force_refresh=bool(payload.get("force_refresh", False)),
+    )
+
+
+def _normalize_prefetch_layers(payload: dict[str, Any]) -> list[str]:
+    raw_layers = payload.get("layers")
+    if not isinstance(raw_layers, list) or not raw_layers:
+        raw_layers = [payload.get("layer_key") or payload.get("wms_layer") or "NDVI"]
+    normalized: list[str] = []
+    for value in ["NDVI", *raw_layers]:
+        key = normalize_index_key(value)
+        if key in INDEX_DEFINITIONS and key not in normalized:
+            normalized.append(key)
+    return normalized[: int(payload.get("max_layers") or 4)]
+
+
+def _collect_prefetch_parcels(payload: dict[str, Any], current_user: dict[str, Any], max_parcels: int) -> list[dict[str, Any]]:
+    user_id = _user_id(current_user)
+    parcel_payloads = payload.get("parcels") or payload.get("parcel_geometries") or []
+    collected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    if isinstance(parcel_payloads, list):
+        for item in parcel_payloads:
+            if not isinstance(item, dict):
+                continue
+            parcel_id = str(item.get("id") or item.get("parcel_id") or "").strip()
+            geometry = _resolve_parcel_geometry_override(item)
+            if not parcel_id or not geometry or parcel_id in seen:
+                continue
+            collected.append({"id": parcel_id, "geometry": geometry})
+            seen.add(parcel_id)
+            if len(collected) >= max_parcels:
+                return collected
+
+    requested_ids = {str(item) for item in (payload.get("parcel_ids") or []) if item}
+    try:
+        compat_db = compat_store.read_db()
+        all_parcels = compat_store.table(compat_db, "parcels")
+        for row in all_parcels:
+            parcel_id = str(row.get("id") or "")
+            if not parcel_id or parcel_id in seen:
+                continue
+            if row.get("user_id") and str(row.get("user_id")) != user_id:
+                continue
+            if requested_ids and parcel_id not in requested_ids:
+                continue
+            geometry = _parcel_geometry(row)
+            if not geometry:
+                continue
+            collected.append(dict(row, geometry=geometry))
+            seen.add(parcel_id)
+            if len(collected) >= max_parcels:
+                break
+    except Exception as exc:
+        if not collected:
+            raise HTTPException(status_code=502, detail=f"No se pudieron consultar lotes para precache Sentinel-2: {exc}") from exc
+
+    return collected
+
+
+def _run_prefetch_job(
+    *,
+    parcels: list[dict[str, Any]],
+    layers: list[str],
+    user_id: str,
+    target_date: date | None,
+    width: int,
+    height: int,
+    max_cloud: float,
+    delay_seconds: float,
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    db = SessionLocal()
+    try:
+        for parcel in parcels:
+            for layer_key in layers:
+                try:
+                    result = generate_or_get_layer(
+                        db,
+                        parcel_geometry=parcel["geometry"],
+                        user_id=user_id,
+                        parcel_id=str(parcel["id"]),
+                        index_key=layer_key,
+                        target_date=target_date,
+                        max_cloud=max_cloud,
+                        width=width,
+                        height=height,
+                    )
+                    results.append({
+                        "parcel_id": str(parcel["id"]),
+                        "layer_key": layer_key,
+                        "available": bool(result.get("available")),
+                        "date": result.get("date"),
+                    })
+                except Exception as exc:
+                    results.append({"parcel_id": str(parcel.get("id")), "layer_key": layer_key, "available": False, "error": str(exc)})
+                if delay_seconds > 0:
+                    sleep(delay_seconds)
+    finally:
+        db.close()
+    return results
+
+
 @router.post("/satellite/prefetch")
 def prefetch(
     payload: dict[str, Any],
     background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
     current_user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
-    parcel_ids = payload.get("parcel_ids") or []
-    max_parcels = int(payload.get("max_parcels") or 8)
-    layer_key = normalize_index_key(payload.get("layer_key") or payload.get("wms_layer") or "NDVI")
+    max_parcels = max(1, min(int(payload.get("max_parcels") or 8), 40))
+    width = max(128, min(int(payload.get("width") or 1024), 2048))
+    height = max(128, min(int(payload.get("height") or 1024), 2048))
     target_date = _parse_target_date(payload.get("date"))
-    width = int(payload.get("width") or 1024)
-    height = int(payload.get("height") or 1024)
+    max_cloud = float(payload.get("maxcc") or DEFAULT_MAX_CLOUD)
+    delay_seconds = max(0.0, min(float(payload.get("delay_seconds") or 0.35), 5.0))
+    layers = _normalize_prefetch_layers(payload)
+    parcels = _collect_prefetch_parcels(payload, current_user, max_parcels)
+    background = bool(payload.get("background", True))
 
-    try:
-        compat_db = compat_store.read_db()
-        all_parcels = compat_store.table(compat_db, "parcels")
-        user_id = _user_id(current_user)
-        requested_ids = {str(item) for item in parcel_ids if item}
-        parcels = [
-            dict(row, geometry=_parcel_geometry(row))
-            for row in all_parcels
-            if (not row.get("user_id") or str(row.get("user_id")) == user_id)
-            and (not requested_ids or str(row.get("id")) in requested_ids)
-            and _parcel_geometry(row)
-        ][:max_parcels]
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"No se pudieron consultar lotes para precache Sentinel-2: {exc}") from exc
+    if not parcels:
+        return {"data": {"queued": False, "parcel_count": 0, "image_count": 0, "results": []}}
 
-    results: list[dict[str, Any]] = []
-    for parcel in parcels:
-        try:
-            result = generate_or_get_layer(
-                db,
-                parcel_geometry=parcel["geometry"],
-                user_id=_user_id(current_user),
-                parcel_id=str(parcel["id"]),
-                index_key=layer_key,
-                target_date=target_date,
-                width=width,
-                height=height,
-            )
-            results.append({"parcel_id": str(parcel["id"]), "available": bool(result.get("available")), "date": result.get("date")})
-        except Exception as exc:
-            results.append({"parcel_id": str(parcel["id"]), "available": False, "error": str(exc)})
+    if background:
+        background_tasks.add_task(
+            _run_prefetch_job,
+            parcels=parcels,
+            layers=layers,
+            user_id=_user_id(current_user),
+            target_date=target_date,
+            width=width,
+            height=height,
+            max_cloud=max_cloud,
+            delay_seconds=delay_seconds,
+        )
+        return _json_safe({
+            "data": {
+                "queued": True,
+                "parcel_count": len(parcels),
+                "layer_count": len(layers),
+                "image_count": len(parcels) * len(layers),
+                "layers": layers,
+                "results": [],
+            }
+        })
 
+    results = _run_prefetch_job(
+        parcels=parcels,
+        layers=layers,
+        user_id=_user_id(current_user),
+        target_date=target_date,
+        width=width,
+        height=height,
+        max_cloud=max_cloud,
+        delay_seconds=delay_seconds,
+    )
     return _json_safe({
         "data": {
             "queued": False,
             "parcel_count": len(parcels),
+            "layer_count": len(layers),
             "image_count": sum(1 for item in results if item.get("available")),
+            "layers": layers,
             "results": results,
         }
     })
