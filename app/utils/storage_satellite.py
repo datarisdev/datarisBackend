@@ -28,6 +28,31 @@ def _bucket():
     return client.bucket(os.getenv("GCS_SATELLITE_BUCKET_NAME") or BUCKET_NAME)
 
 
+def safe_satellite_cache_key(cache_key: str) -> str:
+    """Keep cache aliases deterministic and safe for both local disk and GCS."""
+    return "".join(ch for ch in str(cache_key).lower() if ch in "0123456789abcdef")[:80]
+
+
+def satellite_cache_object_path(cache_key: str) -> str:
+    safe_key = safe_satellite_cache_key(cache_key)
+    if not safe_key:
+        raise ValueError("Invalid Sentinel-2 cache key")
+    return f"cache/{safe_key}.png"
+
+
+def download_satellite_cache_png_bytes(cache_key: str) -> bytes:
+    """Read the public Sentinel-2 cache alias from GCS.
+
+    The UI loads /api/satellite-free/cache/<hash>.png. Cloud Run can run with
+    several instances, so the endpoint cannot rely only on /tmp. This alias makes
+    every instance able to serve the same PNG.
+    """
+    blob = _bucket().blob(satellite_cache_object_path(cache_key))
+    if not blob.exists():
+        raise FileNotFoundError(satellite_cache_object_path(cache_key))
+    return blob.download_as_bytes()
+
+
 def upload_satellite_tif(
     raster: np.ndarray,
     meta: dict,
@@ -66,6 +91,7 @@ def upload_satellite_png_bytes(
     parcel_id: str,
     index_type: str,
     image_date: str,
+    cache_key: str | None = None,
 ) -> str:
     bucket = _bucket()
     object_path = (
@@ -75,7 +101,17 @@ def upload_satellite_png_bytes(
         f"{image_date}.png"
     )
     blob = bucket.blob(object_path)
+    blob.cache_control = "public, max-age=3600"
     blob.upload_from_string(content, content_type="image/png")
+
+    # Also store by the hash exposed by /api/satellite-free/cache/<hash>.png.
+    # Without this, a PNG generated in one Cloud Run instance may not be found
+    # by another instance when the browser loads the image overlay.
+    if cache_key:
+        alias_blob = bucket.blob(satellite_cache_object_path(cache_key))
+        alias_blob.cache_control = "no-store, max-age=0"
+        alias_blob.upload_from_string(content, content_type="image/png")
+
     return object_path
 
 

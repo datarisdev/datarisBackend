@@ -44,6 +44,8 @@ logger = logging.getLogger(__name__)
 
 CACHE_DIR = Path(os.getenv("SENTINEL_LOCAL_CACHE_DIR", str(Path(tempfile.gettempdir()) / "dataris_sentinel2_cache")))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+SENTINEL_CACHE_URL_VERSION = os.getenv("SENTINEL_CACHE_URL_VERSION", "sentinel-gcs-20260528-1")
+
 
 DEFAULT_MAX_CLOUD = float(os.getenv("SENTINEL_DEFAULT_MAX_CLOUD", "80"))
 DATE_LOOKBACK_DAYS = int(os.getenv("SENTINEL_DATE_LOOKBACK_DAYS", "180"))
@@ -377,7 +379,9 @@ def _write_local_metadata(cache_key: str, metadata: dict[str, Any]) -> None:
 
 
 def local_png_url(cache_key: str) -> str:
-    return f"/api/satellite-free/cache/{cache_key}.png"
+    version = os.getenv("SENTINEL_CACHE_URL_VERSION", SENTINEL_CACHE_URL_VERSION)
+    safe_version = "".join(ch for ch in str(version) if ch.isalnum() or ch in "-_.")[:80] or "v1"
+    return f"/api/satellite-free/cache/{cache_key}.png?v={safe_version}"
 
 
 def get_cached_db_image(db_session, *, user_id: str, parcel_id: str, index_key: str, target_date: date | None) -> SatelliteImage | None:
@@ -411,8 +415,17 @@ def _store_png(png_bytes: bytes, *, user_id: str, parcel_id: str, index_key: str
         _write_local_metadata(cache_key, metadata)
 
     try:
-        object_path = upload_satellite_png_bytes(png_bytes, user_id, parcel_id, index_key, f"{image_date}-{geometry_hash or cache_key[:12]}")
-        return object_path, generate_signed_satellite_url(object_path)
+        object_path = upload_satellite_png_bytes(
+            png_bytes,
+            user_id,
+            parcel_id,
+            index_key,
+            f"{image_date}-{geometry_hash or cache_key[:12]}",
+            cache_key=cache_key,
+        )
+        # Return the app cache endpoint instead of a signed GCS URL so CORS,
+        # cache busting and auth-free <img> loading stay under our control.
+        return object_path, local_png_url(cache_key)
     except Exception:
         # GCS is optional for local/dev. The frontend can load the public cache
         # route without Authorization headers, which is required for imageOverlay.
@@ -487,6 +500,20 @@ def generate_or_get_layer(
     local_path = local_png_path(cache_key)
     if not force_refresh and local_path.exists():
         cached_meta = _read_local_metadata(cache_key)
+        # Backfill the GCS hash alias for local-cache hits. This is important
+        # after enabling GCS in production because older /tmp files may exist on
+        # one Cloud Run instance while other instances need cache/<hash>.png.
+        try:
+            upload_satellite_png_bytes(
+                local_path.read_bytes(),
+                user_id,
+                parcel_id,
+                index_key,
+                f"{image_date.isoformat()}-{geometry_fingerprint or cache_key[:12]}",
+                cache_key=cache_key,
+            )
+        except Exception:
+            logger.info("No se pudo respaldar local-cache Sentinel-2 en GCS; se usará cache local", exc_info=True)
         return _json_safe({
             "available": True,
             "date": cached_meta.get("date") or image_date.isoformat(),
