@@ -6,7 +6,7 @@ from time import sleep
 from typing import Any, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
@@ -15,6 +15,7 @@ from app.db.session import SessionLocal
 from app.models.satellite_image import ProcessingStatus, SatelliteImage
 from app.api.routers import compat as compat_store
 from app.services.sentinel2.indices import INDEX_DEFINITIONS, normalize_index_key
+from app.utils.storage_satellite import download_satellite_cache_png_bytes
 from app.services.sentinel2.service import (
     DEFAULT_MAX_CLOUD,
     DB_CACHE_ENABLED,
@@ -128,21 +129,16 @@ def layers(
     return {"data": data, "count": len(data)}
 
 
-def _dates_response(
-    *,
-    db: Session,
-    parcel: dict[str, Any],
-    current_user: dict[str, Any],
+@router.get("/parcels/{parcel_id}/resolutions/{resolution_key}/dates")
+def dates(
+    parcel_id: UUID,
     resolution_key: str,
-    maxcc: float,
+    maxcc: float = Query(DEFAULT_MAX_CLOUD),
+    db: Session = Depends(get_db),
+    current_user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
-    """Return only real Sentinel-2 catalog dates for this lot.
+    parcel = _get_owned_parcel(db, parcel_id, current_user)
 
-    This endpoint is what the frontend uses to enable/disable the calendar.
-    We do one STAC catalog search for the lot bounding box and return only the
-    dates that actually have Sentinel-2 scenes, instead of letting the user pick
-    arbitrary calendar days that would generate slow/no-data requests.
-    """
     db_dates: list[dict[str, Any]] = []
     if DB_CACHE_ENABLED:
         try:
@@ -176,39 +172,7 @@ def _dates_response(
         by_date[item["date"]] = {**(existing or {}), **item, "isLoaded": True}
 
     data = sorted(by_date.values(), key=lambda item: item["date"], reverse=True)
-    return {"data": data, "count": len(data), "resolution": resolution_key, "sentinel_dates_only": True}
-
-
-@router.get("/parcels/{parcel_id}/resolutions/{resolution_key}/dates")
-def dates(
-    parcel_id: UUID,
-    resolution_key: str,
-    maxcc: float = Query(DEFAULT_MAX_CLOUD),
-    db: Session = Depends(get_db),
-    current_user: dict[str, Any] = Depends(get_current_user),
-) -> dict[str, Any]:
-    parcel = _get_owned_parcel(db, parcel_id, current_user)
-    return _dates_response(db=db, parcel=parcel, current_user=current_user, resolution_key=resolution_key, maxcc=maxcc)
-
-
-@router.post("/parcels/{parcel_id}/resolutions/{resolution_key}/dates")
-def dates_from_geometry(
-    parcel_id: UUID,
-    resolution_key: str,
-    payload: dict[str, Any],
-    maxcc: float = Query(DEFAULT_MAX_CLOUD),
-    db: Session = Depends(get_db),
-    current_user: dict[str, Any] = Depends(get_current_user),
-) -> dict[str, Any]:
-    parcel = _get_owned_parcel(db, parcel_id, current_user)
-    geometry_override = _resolve_parcel_geometry_override(payload)
-    if geometry_override:
-        parcel["geometry"] = geometry_override
-    try:
-        max_cloud = float(payload.get("maxcc") if payload.get("maxcc") is not None else maxcc)
-    except Exception:
-        max_cloud = maxcc
-    return _dates_response(db=db, parcel=parcel, current_user=current_user, resolution_key=resolution_key, maxcc=max_cloud)
+    return {"data": data, "count": len(data), "resolution": resolution_key}
 
 
 @router.get("/parcels/{parcel_id}/layers/{layer_key}/statistics")
@@ -611,9 +575,46 @@ def prefetch(
     })
 
 
-@router.get("/cache/{cache_key}.png")
-def cache_png(cache_key: str) -> Response:
+def _satellite_png_headers(origin: str | None = None) -> dict[str, str]:
+    allowed_origin = origin if origin == "https://app.dataris.es" else "https://app.dataris.es"
+    return {
+        "Cache-Control": "no-store, max-age=0",
+        "Access-Control-Allow-Origin": allowed_origin,
+        "Access-Control-Allow-Credentials": "true",
+        "Access-Control-Expose-Headers": "*",
+        "Vary": "Origin",
+        "Cross-Origin-Resource-Policy": "cross-origin",
+        "X-Content-Type-Options": "nosniff",
+    }
+
+
+def _cache_png_response(cache_key: str, request: Request, *, head_only: bool = False) -> Response:
+    headers = _satellite_png_headers(request.headers.get("origin"))
     path = local_png_path(cache_key)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Imagen no encontrada en cache local")
-    return FileResponse(path, media_type="image/png", headers={"Cache-Control": "public, max-age=604800, immutable"})
+    if path.exists():
+        if head_only:
+            headers["Content-Length"] = str(path.stat().st_size)
+            return Response(status_code=200, media_type="image/png", headers=headers)
+        return FileResponse(path, media_type="image/png", headers=headers)
+
+    try:
+        content = download_satellite_cache_png_bytes(cache_key)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Imagen no encontrada en cache Sentinel-2/GCS") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"No se pudo leer cache Sentinel-2/GCS: {exc}") from exc
+
+    headers["Content-Length"] = str(len(content))
+    if head_only:
+        return Response(status_code=200, media_type="image/png", headers=headers)
+    return Response(content=content, media_type="image/png", headers=headers)
+
+
+@router.get("/cache/{cache_key}.png")
+def cache_png(cache_key: str, request: Request) -> Response:
+    return _cache_png_response(cache_key, request)
+
+
+@router.head("/cache/{cache_key}.png")
+def cache_png_head(cache_key: str, request: Request) -> Response:
+    return _cache_png_response(cache_key, request, head_only=True)
