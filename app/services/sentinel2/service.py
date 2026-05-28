@@ -16,7 +16,7 @@ import rasterio
 from rasterio.enums import Resampling
 from rasterio.features import geometry_mask
 from rasterio.mask import mask
-from rasterio.transform import array_bounds
+from rasterio.transform import array_bounds, from_bounds
 from rasterio.warp import reproject, transform_bounds
 from shapely.geometry import mapping, shape
 from shapely.geometry.base import BaseGeometry
@@ -52,6 +52,11 @@ DATE_LOOKBACK_DAYS = int(os.getenv("SENTINEL_DATE_LOOKBACK_DAYS", "180"))
 MAP_LOOKBACK_DAYS = int(os.getenv("SENTINEL_MAP_LOOKBACK_DAYS", "90"))
 DB_CACHE_ENABLED = os.getenv("SENTINEL_DB_CACHE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 MASK_ALL_TOUCHED = os.getenv("SENTINEL_MASK_ALL_TOUCHED", "true").strip().lower() not in {"0", "false", "no", "off"}
+# The read-time mask may include touched pixels so edge data is available for
+# interpolation, but the final PNG alpha mask must be strict so the image never
+# bleeds outside the lot outline. Keep this disabled by default for an exact
+# visual cut, including holes/rings and multipart lots.
+FINAL_MASK_ALL_TOUCHED = os.getenv("SENTINEL_FINAL_MASK_ALL_TOUCHED", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 RASTERIO_ENV = {
     "AWS_NO_SIGN_REQUEST": os.getenv("AWS_NO_SIGN_REQUEST", "YES"),
@@ -109,8 +114,41 @@ def list_index_layers() -> list[dict[str, Any]]:
     ]
 
 
+def _polygonal_parts(geom: BaseGeometry) -> list[BaseGeometry]:
+    """Extract only polygonal pieces from any geometry returned by Shapely.
+
+    make_valid() can legitimately return GeometryCollections containing
+    polygons, rings and line artifacts when it repairs self-intersections. For
+    lot clipping we must keep only the surface geometries because raster masks
+    are area based. Holes/rings inside each Polygon are preserved by Shapely and
+    rasterio when we later call mapping().
+    """
+    if geom.is_empty:
+        return []
+    geom_type = getattr(geom, "geom_type", "")
+    if geom_type == "Polygon":
+        return [geom]
+    if geom_type == "MultiPolygon":
+        return [part for part in getattr(geom, "geoms", []) if not part.is_empty]
+    if geom_type == "GeometryCollection":
+        parts: list[BaseGeometry] = []
+        for part in getattr(geom, "geoms", []):
+            parts.extend(_polygonal_parts(part))
+        return parts
+    return []
+
+
+def _polygonal_union(geometries: list[BaseGeometry]) -> BaseGeometry:
+    parts: list[BaseGeometry] = []
+    for geom in geometries:
+        parts.extend(_polygonal_parts(geom))
+    if not parts:
+        raise ValueError("El lote no contiene polígonos válidos para recortar la imagen satelital")
+    return parts[0] if len(parts) == 1 else unary_union(parts)
+
+
 def _clean_geometry(geom: BaseGeometry) -> BaseGeometry:
-    """Repair common invalid rings without changing the intended lot outline."""
+    """Repair common invalid rings and keep the exact polygonal lot outline."""
     if geom.is_empty:
         return geom
     try:
@@ -119,6 +157,12 @@ def _clean_geometry(geom: BaseGeometry) -> BaseGeometry:
                 geom = _shapely_make_valid(geom)
             else:
                 geom = geom.buffer(0)
+        # Keep only polygonal surfaces. This preserves holes/rings and multipart
+        # lots, but removes line artifacts created by geometry repair.
+        geom = _polygonal_union([geom])
+        if not geom.is_valid:
+            geom = geom.buffer(0)
+            geom = _polygonal_union([geom])
     except Exception:
         # Keep the original geometry; rasterio will raise a clear error if it is unusable.
         pass
@@ -139,7 +183,7 @@ def _parcel_geometry_to_shape(parcel_geometry: Any) -> BaseGeometry:
         geometries = [_parcel_geometry_to_shape(item) for item in parcel_geometry if item]
         if not geometries:
             raise ValueError("El lote no contiene geometrías válidas")
-        return _clean_geometry(unary_union(geometries))
+        return _clean_geometry(_polygonal_union(geometries))
     if not isinstance(parcel_geometry, dict):
         raise ValueError("La geometría del lote no es un GeoJSON válido")
 
@@ -154,7 +198,7 @@ def _parcel_geometry_to_shape(parcel_geometry: Any) -> BaseGeometry:
         geometries = [geom for geom in geometries if not geom.is_empty]
         if not geometries:
             raise ValueError("El lote no contiene geometrías válidas")
-        return _clean_geometry(geometries[0] if len(geometries) == 1 else unary_union(geometries))
+        return _clean_geometry(_polygonal_union(geometries))
     if geo_type == "feature":
         geometry = parcel_geometry.get("geometry")
         if not geometry:
@@ -265,13 +309,19 @@ def _geometry_shapes_for_meta(parcel_geometry: Any, meta: dict[str, Any]) -> lis
     return [mapping(geom) for geom in gdf.geometry if geom and not geom.is_empty]
 
 
-def _apply_precise_geometry_mask(arr: np.ndarray, meta: dict[str, Any], parcel_geometry: Any) -> np.ndarray:
-    """Force transparent pixels outside the exact lot geometry after all resampling.
+def _apply_precise_geometry_mask(
+    arr: np.ndarray,
+    meta: dict[str, Any],
+    parcel_geometry: Any,
+    *,
+    all_touched: bool = FINAL_MASK_ALL_TOUCHED,
+) -> np.ndarray:
+    """Force transparent pixels outside the exact lot geometry.
 
-    rasterio.mask is applied when reading every band, but mixed-resolution indices
-    such as NDRE/NDMI resample 20m/10m bands and can reintroduce tiny edge pixels.
-    This final mask uses the selected lot geometry on the output grid so the PNG
-    alpha always follows the lote, including holes, rings and MultiPolygons.
+    The final visual cut intentionally uses a strict mask by default
+    (all_touched=False). This avoids the common raster "halo" where pixels that
+    merely touch the boundary remain visible outside irregular vertices, holes
+    or multipart rings.
     """
     shapes = _geometry_shapes_for_meta(parcel_geometry, meta)
     if not shapes:
@@ -281,7 +331,7 @@ def _apply_precise_geometry_mask(arr: np.ndarray, meta: dict[str, Any], parcel_g
         out_shape=(int(meta["height"]), int(meta["width"])),
         transform=meta["transform"],
         invert=True,
-        all_touched=MASK_ALL_TOUCHED,
+        all_touched=all_touched,
     )
     if arr.ndim == 3:
         masked = arr.astype("float32", copy=True)
@@ -290,6 +340,94 @@ def _apply_precise_geometry_mask(arr: np.ndarray, meta: dict[str, Any], parcel_g
     masked = arr.astype("float32", copy=True)
     masked[~inside] = np.nan
     return masked
+
+
+def _display_meta_for_geometry(parcel_geometry: Any, source_meta: dict[str, Any], width: int, height: int) -> dict[str, Any]:
+    """Build a display grid using the exact lot bbox in the source CRS.
+
+    Rendering on this requested-size grid lets the final alpha mask follow the
+    parcel outline at the PNG resolution instead of only at the native Sentinel
+    pixel grid. This is what makes small/irregular lots, holes and multipart
+    divisions look correctly clipped in the map overlay.
+    """
+    safe_width = max(64, min(int(width or 1024), 4096))
+    safe_height = max(64, min(int(height or 1024), 4096))
+    gdf = geometry_to_gdf(parcel_geometry)
+    crs = source_meta.get("crs") or "EPSG:4326"
+    gdf_proj = gdf.to_crs(crs) if crs else gdf
+    left, bottom, right, top = [float(v) for v in gdf_proj.total_bounds]
+
+    # Protect against degenerate bounds caused by malformed imports.
+    if right <= left:
+        pad = max(abs(left) * 1e-9, 1e-6)
+        left -= pad
+        right += pad
+    if top <= bottom:
+        pad = max(abs(bottom) * 1e-9, 1e-6)
+        bottom -= pad
+        top += pad
+
+    return {
+        "height": safe_height,
+        "width": safe_width,
+        "transform": from_bounds(left, bottom, right, top, safe_width, safe_height),
+        "crs": crs,
+        "count": 1 if source_meta.get("count") != 3 else int(source_meta.get("count") or 1),
+        "dtype": "float32",
+        "nodata": np.nan,
+    }
+
+
+def _reproject_to_display_grid(arr: np.ndarray, src_meta: dict[str, Any], dst_meta: dict[str, Any]) -> np.ndarray:
+    dst_shape = (int(dst_meta["height"]), int(dst_meta["width"]))
+    if arr.ndim == 3:
+        out = np.full((arr.shape[0], *dst_shape), np.nan, dtype="float32")
+        for idx, band in enumerate(arr):
+            reproject(
+                band.astype("float32", copy=False),
+                out[idx],
+                src_transform=src_meta["transform"],
+                src_crs=src_meta["crs"],
+                dst_transform=dst_meta["transform"],
+                dst_crs=dst_meta["crs"],
+                resampling=Resampling.bilinear,
+                src_nodata=np.nan,
+                dst_nodata=np.nan,
+            )
+        return out
+
+    out = np.full(dst_shape, np.nan, dtype="float32")
+    reproject(
+        arr.astype("float32", copy=False),
+        out,
+        src_transform=src_meta["transform"],
+        src_crs=src_meta["crs"],
+        dst_transform=dst_meta["transform"],
+        dst_crs=dst_meta["crs"],
+        resampling=Resampling.bilinear,
+        src_nodata=np.nan,
+        dst_nodata=np.nan,
+    )
+    return out
+
+
+def _prepare_display_array(
+    arr: np.ndarray,
+    src_meta: dict[str, Any],
+    parcel_geometry: Any,
+    *,
+    width: int,
+    height: int,
+) -> tuple[np.ndarray, dict[str, Any], dict[str, float]]:
+    display_meta = _display_meta_for_geometry(parcel_geometry, src_meta, width, height)
+    display_arr = _reproject_to_display_grid(arr, src_meta, display_meta)
+    display_arr = _apply_precise_geometry_mask(
+        display_arr,
+        display_meta,
+        parcel_geometry,
+        all_touched=FINAL_MASK_ALL_TOUCHED,
+    )
+    return display_arr, display_meta, _bounds_from_raster_meta(display_meta)
 
 
 def _load_required_bands(item: Any, parcel_geometry: dict, bands: tuple[str, ...]) -> tuple[dict[str, np.ndarray], dict[str, Any], dict[str, float]]:
@@ -337,7 +475,7 @@ def _load_required_bands(item: Any, parcel_geometry: dict, bands: tuple[str, ...
 
 def _cache_key(*, user_id: str, parcel_id: str, index_key: str, image_date: str, width: int, height: int, geometry_hash: str = "") -> str:
     payload = {
-        "v": 3,
+        "v": 4,
         "geometry_hash": geometry_hash,
         "user_id": user_id,
         "parcel_id": parcel_id,
@@ -526,11 +664,20 @@ def generate_or_get_layer(
             "scene_id": cached_meta.get("scene_id") or scene.id,
         })
 
-    bands, _meta, bounds = _load_required_bands(scene.item, parcel_geometry, definition.bands)
+    bands, _meta, _source_bounds = _load_required_bands(scene.item, parcel_geometry, definition.bands)
     arr = definition.compute(bands)
-    arr = _apply_precise_geometry_mask(arr, _meta, parcel_geometry)
+    # Source-grid mask keeps stats honest; display-grid mask below creates the
+    # exact transparent PNG cut at the requested overlay resolution.
+    arr = _apply_precise_geometry_mask(arr, _meta, parcel_geometry, all_touched=FINAL_MASK_ALL_TOUCHED)
     stats = compute_statistics(arr)
-    png_bytes = _resize_png_if_needed(render_index_png(index_key, arr), width, height)
+    display_arr, display_meta, bounds = _prepare_display_array(
+        arr,
+        _meta,
+        parcel_geometry,
+        width=width,
+        height=height,
+    )
+    png_bytes = render_index_png(index_key, display_arr)
     local_metadata = {
         "available": True,
         "date": image_date.isoformat(),
@@ -540,6 +687,9 @@ def generate_or_get_layer(
         "source": "sentinel-2-l2a",
         "scene_id": scene.id,
         "geometry_hash": geometry_fingerprint,
+        "clip_mode": "display-grid-strict-polygon-mask",
+        "display_width": int(display_meta.get("width", width)),
+        "display_height": int(display_meta.get("height", height)),
     }
     object_path, image_url = _store_png(
         png_bytes,
