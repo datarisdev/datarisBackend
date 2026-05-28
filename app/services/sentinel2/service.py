@@ -17,7 +17,7 @@ from rasterio.enums import Resampling
 from rasterio.features import geometry_mask
 from rasterio.mask import mask
 from rasterio.transform import array_bounds
-from rasterio.warp import reproject, transform_bounds
+from rasterio.warp import calculate_default_transform, reproject, transform_bounds
 from shapely.geometry import GeometryCollection, MultiPolygon, Polygon, mapping, shape
 from shapely.geometry.base import BaseGeometry
 try:
@@ -263,6 +263,84 @@ def _bounds_from_raster_meta(meta: dict[str, Any]) -> dict[str, float]:
     return {"south": south, "north": north, "west": west, "east": east}
 
 
+
+def _reproject_array_to_web_mercator(arr: np.ndarray, meta: dict[str, Any]) -> tuple[np.ndarray, dict[str, Any], dict[str, float]]:
+    """Reproject the computed index to EPSG:3857 before rendering.
+
+    Leaflet/Mapbox displays image overlays in Web Mercator. If we render a
+    Sentinel-2 crop in the native UTM grid and only attach WGS84 corner bounds,
+    the image can look slightly shifted or scaled compared with parcel polygons.
+    This normalizes the raster to the same projection used by the map, then the
+    final geometry mask is applied on that output grid.
+    """
+    src_crs = meta.get("crs")
+    src_transform = meta.get("transform")
+    if not src_crs or src_transform is None:
+        return arr, meta, _bounds_from_raster_meta(meta)
+
+    try:
+        src_crs_text = str(src_crs).upper()
+        if src_crs_text in {"EPSG:3857", "EPSG:900913"}:
+            return arr, meta, _bounds_from_raster_meta(meta)
+
+        height = int(meta["height"])
+        width = int(meta["width"])
+        left, bottom, right, top = array_bounds(height, width, src_transform)
+        dst_transform, dst_width, dst_height = calculate_default_transform(
+            src_crs,
+            "EPSG:3857",
+            width,
+            height,
+            left,
+            bottom,
+            right,
+            top,
+        )
+        if dst_width <= 0 or dst_height <= 0:
+            return arr, meta, _bounds_from_raster_meta(meta)
+
+        if arr.ndim == 3:
+            dst_arr = np.full((arr.shape[0], dst_height, dst_width), np.nan, dtype="float32")
+            for band_idx in range(arr.shape[0]):
+                reproject(
+                    arr[band_idx].astype("float32", copy=False),
+                    dst_arr[band_idx],
+                    src_transform=src_transform,
+                    src_crs=src_crs,
+                    dst_transform=dst_transform,
+                    dst_crs="EPSG:3857",
+                    resampling=Resampling.bilinear,
+                    src_nodata=np.nan,
+                    dst_nodata=np.nan,
+                )
+        else:
+            dst_arr = np.full((dst_height, dst_width), np.nan, dtype="float32")
+            reproject(
+                arr.astype("float32", copy=False),
+                dst_arr,
+                src_transform=src_transform,
+                src_crs=src_crs,
+                dst_transform=dst_transform,
+                dst_crs="EPSG:3857",
+                resampling=Resampling.bilinear,
+                src_nodata=np.nan,
+                dst_nodata=np.nan,
+            )
+
+        dst_meta = meta.copy()
+        dst_meta.update({
+            "crs": "EPSG:3857",
+            "transform": dst_transform,
+            "width": int(dst_width),
+            "height": int(dst_height),
+            "dtype": "float32",
+            "nodata": np.nan,
+        })
+        return dst_arr.astype("float32", copy=False), dst_meta, _bounds_from_raster_meta(dst_meta)
+    except Exception:
+        logger.exception("No se pudo reproyectar Sentinel-2 a EPSG:3857; se usará el grid original")
+        return arr, meta, _bounds_from_raster_meta(meta)
+
 def _resize_png_if_needed(png_bytes: bytes, max_width: int, max_height: int) -> bytes:
     if max_width <= 0 or max_height <= 0:
         return png_bytes
@@ -367,7 +445,7 @@ def _load_required_bands(item: Any, parcel_geometry: dict, bands: tuple[str, ...
 
 def _cache_key(*, user_id: str, parcel_id: str, index_key: str, image_date: str, width: int, height: int, geometry_hash: str = "") -> str:
     payload = {
-        "v": 4,
+        "v": 6,
         "geometry_hash": geometry_hash,
         "user_id": user_id,
         "parcel_id": parcel_id,
@@ -556,9 +634,13 @@ def generate_or_get_layer(
             "scene_id": cached_meta.get("scene_id") or scene.id,
         })
 
-    bands, _meta, bounds = _load_required_bands(scene.item, parcel_geometry, definition.bands)
+    bands, _meta, _source_bounds = _load_required_bands(scene.item, parcel_geometry, definition.bands)
     arr = definition.compute(bands)
-    arr = _apply_precise_geometry_mask(arr, _meta, parcel_geometry)
+    # Normalize the computed index to Web Mercator, the projection used by the
+    # map renderer. This removes the small but visible shift/scale difference
+    # caused by displaying a native UTM Sentinel crop as a Leaflet image overlay.
+    arr, output_meta, bounds = _reproject_array_to_web_mercator(arr, _meta)
+    arr = _apply_precise_geometry_mask(arr, output_meta, parcel_geometry)
     stats = compute_statistics(arr)
     png_bytes = _resize_png_if_needed(render_index_png(index_key, arr), width, height)
     local_metadata = {
