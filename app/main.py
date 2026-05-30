@@ -7,29 +7,10 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
+from app.api.router_registry import include_api_routers
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
-from app.api.routers import (
-    admin_user,
-    analysis_history,
-    auth,
-    compat,
-    compat_extensions,
-    dashboard,
-    field_notes,
-    graniot,
-    me_access,
-    parcel_crops,
-    parcels,
-    platform_modules,
-    profiles,
-    satellite_image,
-    sentinel2,
-    user_roles,
-    users,
-    weather,
-)
 
 
 def _parse_cors_origins(raw: str | None) -> tuple[list[str], str | None]:
@@ -57,26 +38,7 @@ fastapi_app = FastAPI(title=settings.PROJECT_NAME)
 # GeoJSON puede ser pesado. GZip reduce mucho el tiempo de transferencia al frontend.
 fastapi_app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-# Include routers
-fastapi_app.include_router(auth.router, prefix=settings.API_V1_STR)
-fastapi_app.include_router(users.router, prefix=settings.API_V1_STR)
-fastapi_app.include_router(profiles.router, prefix=settings.API_V1_STR)
-fastapi_app.include_router(user_roles.router, prefix=settings.API_V1_STR)
-fastapi_app.include_router(admin_user.router, prefix=settings.API_V1_STR)
-fastapi_app.include_router(analysis_history.router, prefix=settings.API_V1_STR)
-fastapi_app.include_router(analysis_history.legacy_router, prefix=settings.API_V1_STR)
-fastapi_app.include_router(platform_modules.router, prefix=settings.API_V1_STR)
-fastapi_app.include_router(parcels.router, prefix=settings.API_V1_STR)
-fastapi_app.include_router(satellite_image.router, prefix=settings.API_V1_STR)
-fastapi_app.include_router(field_notes.router, prefix=settings.API_V1_STR)
-fastapi_app.include_router(parcel_crops.router, prefix=settings.API_V1_STR)
-fastapi_app.include_router(weather.router, prefix=settings.API_V1_STR)
-fastapi_app.include_router(compat.router, prefix=settings.API_V1_STR)
-fastapi_app.include_router(compat_extensions.router, prefix=settings.API_V1_STR)
-fastapi_app.include_router(graniot.router, prefix=settings.API_V1_STR)
-fastapi_app.include_router(me_access.router, prefix=settings.API_V1_STR)
-fastapi_app.include_router(dashboard.router, prefix=settings.API_V1_STR)
-fastapi_app.include_router(sentinel2.router, prefix=settings.API_V1_STR)
+include_api_routers(fastapi_app)
 
 
 @fastapi_app.get("/health")
