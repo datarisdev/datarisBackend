@@ -21,7 +21,8 @@ from app.api.routers.dashboard import (
     _status,
 )
 
-router = APIRouter(prefix="/analysis-history", tags=["Analysis History"])
+router = APIRouter(prefix="/work-area", tags=["Zona de trabajo"])
+legacy_router = APIRouter(prefix="/analysis-history", tags=["Zona de trabajo"])
 
 
 def _user_id_from_current(current_user: Any) -> str:
@@ -261,7 +262,8 @@ def _satellite_layers(rows: List[Dict[str, Any]], parcels: Dict[str, Dict[str, A
 
 
 @router.get("/layers")
-def analysis_history_layers(
+@legacy_router.get("/layers", include_in_schema=False)
+def work_area_layers(
     sources: Optional[str] = Query(None, description="Comma-separated sources: aerial,mapeo,satellite"),
     limit: int = Query(80, ge=1, le=300),
     max_points_per_layer: int = Query(900, ge=50, le=5000),
