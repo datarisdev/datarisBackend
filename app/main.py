@@ -12,6 +12,7 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 from app.api.routers import (
     admin_user,
+    analysis_history,
     auth,
     compat,
     compat_extensions,
@@ -62,6 +63,7 @@ fastapi_app.include_router(users.router, prefix=settings.API_V1_STR)
 fastapi_app.include_router(profiles.router, prefix=settings.API_V1_STR)
 fastapi_app.include_router(user_roles.router, prefix=settings.API_V1_STR)
 fastapi_app.include_router(admin_user.router, prefix=settings.API_V1_STR)
+fastapi_app.include_router(analysis_history.router, prefix=settings.API_V1_STR)
 fastapi_app.include_router(platform_modules.router, prefix=settings.API_V1_STR)
 fastapi_app.include_router(parcels.router, prefix=settings.API_V1_STR)
 fastapi_app.include_router(satellite_image.router, prefix=settings.API_V1_STR)
