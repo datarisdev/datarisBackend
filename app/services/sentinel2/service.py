@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 CACHE_DIR = Path(os.getenv("SENTINEL_LOCAL_CACHE_DIR", str(Path(tempfile.gettempdir()) / "dataris_sentinel2_cache")))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
-SENTINEL_CACHE_URL_VERSION = os.getenv("SENTINEL_CACHE_URL_VERSION", "sentinel-gcs-20260528-1")
+SENTINEL_CACHE_URL_VERSION = os.getenv("SENTINEL_CACHE_URL_VERSION", "sentinel-gcs-20260531-hq-1")
 
 
 DEFAULT_MAX_CLOUD = float(os.getenv("SENTINEL_DEFAULT_MAX_CLOUD", "80"))
@@ -341,15 +341,36 @@ def _reproject_array_to_web_mercator(arr: np.ndarray, meta: dict[str, Any]) -> t
         logger.exception("No se pudo reproyectar Sentinel-2 a EPSG:3857; se usará el grid original")
         return arr, meta, _bounds_from_raster_meta(meta)
 
-def _resize_png_if_needed(png_bytes: bytes, max_width: int, max_height: int) -> bytes:
-    if max_width <= 0 or max_height <= 0:
+def _fit_png_to_display_size(
+    png_bytes: bytes,
+    target_width: int,
+    target_height: int,
+    *,
+    preserve_pixels: bool = True,
+) -> bytes:
+    """Scale the PNG to a stable display size without blurring index pixels.
+
+    Sentinel-2 keeps its native 10m/20m information content. Upscaling does not
+    invent detail, but nearest-neighbour scaling prevents the browser from
+    smearing adjacent index cells when the user zooms into a lot. RGB previews
+    use Lanczos because photographic layers benefit from smooth interpolation.
+    """
+    if target_width <= 0 or target_height <= 0:
         return png_bytes
     with Image.open(BytesIO(png_bytes)) as image:
-        if image.width <= max_width and image.height <= max_height:
+        width, height = image.size
+        if width <= 0 or height <= 0:
             return png_bytes
-        image.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
+        scale = min(target_width / width, target_height / height)
+        if not math.isfinite(scale) or scale <= 0:
+            return png_bytes
+        output_size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
+        if output_size == image.size:
+            return png_bytes
+        resampling = Image.Resampling.NEAREST if preserve_pixels else Image.Resampling.LANCZOS
+        resized = image.resize(output_size, resampling)
         buffer = BytesIO()
-        image.save(buffer, format="PNG", optimize=True)
+        resized.save(buffer, format="PNG", optimize=True)
         return buffer.getvalue()
 
 
@@ -445,7 +466,7 @@ def _load_required_bands(item: Any, parcel_geometry: dict, bands: tuple[str, ...
 
 def _cache_key(*, user_id: str, parcel_id: str, index_key: str, image_date: str, width: int, height: int, geometry_hash: str = "") -> str:
     payload = {
-        "v": 6,
+        "v": 7,
         "geometry_hash": geometry_hash,
         "user_id": user_id,
         "parcel_id": parcel_id,
@@ -641,8 +662,13 @@ def generate_or_get_layer(
     # caused by displaying a native UTM Sentinel crop as a Leaflet image overlay.
     arr, output_meta, bounds = _reproject_array_to_web_mercator(arr, _meta)
     arr = _apply_precise_geometry_mask(arr, output_meta, parcel_geometry)
-    stats = compute_statistics(arr)
-    png_bytes = _resize_png_if_needed(render_index_png(index_key, arr), width, height)
+    stats = compute_statistics(arr, index_key=index_key)
+    png_bytes = _fit_png_to_display_size(
+        render_index_png(index_key, arr),
+        width,
+        height,
+        preserve_pixels=not definition.rgb,
+    )
     local_metadata = {
         "available": True,
         "date": image_date.isoformat(),
