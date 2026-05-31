@@ -220,8 +220,8 @@ def statistics(
         index_key=index_key,
         target_date=target_date,
         max_cloud=maxcc,
-        width=1024,
-        height=1024,
+        width=768,
+        height=768,
     )
     if not result.get("available"):
         return {"data": {"status": "NO_DATA", "data": [], "reason": result.get("reason")}}
@@ -239,6 +239,79 @@ def statistics(
             **stats,
         }
     }
+
+
+@router.get("/parcels/{parcel_id}/layers/{layer_key}/series")
+def statistics_series(
+    parcel_id: UUID,
+    layer_key: str,
+    maxcc: float = Query(DEFAULT_MAX_CLOUD),
+    limit: int = Query(6, ge=2, le=12),
+    db: Session = Depends(get_db),
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Return a real Sentinel-2 temporal series for charts.
+
+    Each point is calculated from the selected lot geometry and a real catalog
+    scene. The limit stays intentionally small because the first request may need
+    to read remote Sentinel bands; subsequent requests use the generated cache.
+    """
+    parcel = _get_owned_parcel(db, parcel_id, current_user)
+    index_key = normalize_index_key(layer_key)
+    if index_key not in INDEX_DEFINITIONS:
+        raise HTTPException(status_code=422, detail=f"Índice no soportado: {index_key}")
+
+    try:
+        date_items = catalog_dates_for_geometry(parcel["geometry"], max_cloud=maxcc)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"No se pudo consultar catálogo Sentinel-2: {exc}") from exc
+
+    points: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    seen_dates: set[str] = set()
+
+    for item in date_items:
+        raw_date = str(item.get("date") or "")[:10]
+        if not raw_date or raw_date in seen_dates:
+            continue
+        try:
+            result = generate_or_get_layer(
+                db,
+                parcel_geometry=parcel["geometry"],
+                user_id=_user_id(current_user),
+                parcel_id=str(parcel["id"]),
+                index_key=index_key,
+                target_date=_parse_target_date(raw_date),
+                max_cloud=maxcc,
+                width=768,
+                height=768,
+            )
+            if not result.get("available"):
+                continue
+            result_date = str(result.get("date") or raw_date)[:10]
+            if result_date in seen_dates:
+                continue
+            seen_dates.add(result_date)
+            points.append({
+                "date": result_date,
+                "cloud_coverage": result.get("cloud_coverage"),
+                "statistics": result.get("statistics") or {},
+                "source": result.get("source"),
+            })
+            if len(points) >= limit:
+                break
+        except Exception as exc:
+            warnings.append(f"{raw_date}: {exc}")
+
+    points.sort(key=lambda point: str(point.get("date") or ""))
+    return _json_safe({
+        "data": {
+            "status": "OK" if points else "NO_DATA",
+            "layer": index_key,
+            "points": points,
+            "warnings": warnings[:4],
+        }
+    })
 
 
 def _resolve_parcel_geometry_override(payload: dict[str, Any] | None) -> Any:
@@ -354,8 +427,8 @@ def map_layer(
     layer_key: Optional[str] = Query(None),
     wms_layer: Optional[str] = Query(None),
     date_param: Optional[str] = Query(None, alias="date"),
-    width: int = Query(1024, ge=128, le=2048),
-    height: int = Query(1024, ge=128, le=2048),
+    width: int = Query(2048, ge=128, le=4096),
+    height: int = Query(2048, ge=128, le=4096),
     maxcc: float = Query(DEFAULT_MAX_CLOUD),
     include_statistics: bool = Query(True),
     auto_sync: bool = Query(True),
@@ -402,8 +475,8 @@ def map_layer_from_geometry(
         layer_key=payload.get("layer_key"),
         wms_layer=payload.get("wms_layer"),
         date_param=payload.get("date"),
-        width=max(128, min(int(payload.get("width") or 1024), 2048)),
-        height=max(128, min(int(payload.get("height") or 1024), 2048)),
+        width=max(128, min(int(payload.get("width") or 2048), 4096)),
+        height=max(128, min(int(payload.get("height") or 2048), 4096)),
         maxcc=float(payload.get("maxcc") or DEFAULT_MAX_CLOUD),
         include_statistics=bool(payload.get("include_statistics", True)),
         auto_sync=bool(payload.get("auto_sync", True)),
@@ -518,8 +591,8 @@ def prefetch(
     current_user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     max_parcels = max(1, min(int(payload.get("max_parcels") or 8), 40))
-    width = max(128, min(int(payload.get("width") or 1024), 2048))
-    height = max(128, min(int(payload.get("height") or 1024), 2048))
+    width = max(128, min(int(payload.get("width") or 2048), 4096))
+    height = max(128, min(int(payload.get("height") or 2048), 4096))
     target_date = _parse_target_date(payload.get("date"))
     max_cloud = float(payload.get("maxcc") or DEFAULT_MAX_CLOUD)
     delay_seconds = max(0.0, min(float(payload.get("delay_seconds") or 0.35), 5.0))
