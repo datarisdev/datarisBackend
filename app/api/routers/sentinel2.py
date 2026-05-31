@@ -297,6 +297,9 @@ def statistics_series(
                 "cloud_coverage": result.get("cloud_coverage"),
                 "statistics": result.get("statistics") or {},
                 "source": result.get("source"),
+                "coverage_percent": result.get("coverage_percent"),
+                "is_partial": bool(result.get("is_partial", False)),
+                "source_count": result.get("source_count", 1),
             })
             if len(points) >= limit:
                 break
@@ -379,6 +382,13 @@ def _build_map_layer_response(
             }
         }
 
+    coverage_percent = result.get("coverage_percent")
+    is_partial = bool(result.get("is_partial", False))
+    warnings = list(result.get("warnings") or [])
+    if is_partial:
+        coverage_label = f"{float(coverage_percent or 0):.2f}%"
+        warnings.insert(0, f"Cobertura satelital parcial: {coverage_label} del lote tiene píxeles Sentinel-2 válidos para esta fecha.")
+
     overlay = {
         "id": f"sentinel2-{parcel.get('id')}-{index_key}-{result.get('date')}",
         "graniot_parcel_id": None,
@@ -386,7 +396,9 @@ def _build_map_layer_response(
         "bounds": result["bounds"],
         "date": result.get("date"),
         "layer": index_key,
-        "source": result.get("source", "sentinel-2-l2a"),
+        "source": result.get("source", "sentinel-2-l2a-mosaic"),
+        "coverage_percent": coverage_percent,
+        "is_partial": is_partial,
     }
     return _json_safe({
         "data": {
@@ -415,8 +427,12 @@ def _build_map_layer_response(
                 ],
                 **(result.get("statistics") or {}),
             },
-            "warnings": [],
-            "source_count": 1,
+            "warnings": warnings,
+            "source_count": result.get("source_count", 1),
+            "scene_ids": result.get("scene_ids") or [],
+            "coverage_percent": coverage_percent,
+            "is_partial": is_partial,
+            "processing_version": result.get("processing_version"),
         }
     })
 

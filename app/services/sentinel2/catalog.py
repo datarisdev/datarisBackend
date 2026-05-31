@@ -159,16 +159,80 @@ def available_dates(
     for scene in scenes:
         key = scene.datetime.date().isoformat()
         current = by_date.get(key)
-        if current is None or (scene.cloud_cover or 999) < (current.get("cloudCoverage") or 999):
-            by_date[key] = {
+        if current is None:
+            current = {
                 "date": key,
                 "cloudCoverage": scene.cloud_cover,
                 "cloud_coverage": scene.cloud_cover,
                 "scene_id": scene.id,
+                "scene_count": 0,
                 "source": "Sentinel-2 L2A",
             }
+            by_date[key] = current
+        current["scene_count"] = int(current.get("scene_count") or 0) + 1
+        current_cloud = current.get("cloudCoverage")
+        if (scene.cloud_cover if scene.cloud_cover is not None else 999.0) < (current_cloud if current_cloud is not None else 999.0):
+            current["cloudCoverage"] = scene.cloud_cover
+            current["cloud_coverage"] = scene.cloud_cover
+            current["scene_id"] = scene.id
     return sorted(by_date.values(), key=lambda item: item["date"], reverse=True)
 
+
+
+def _scene_tile_key(scene: SentinelScene) -> str:
+    """Return a stable tile identifier so same-day duplicate catalog items do not repeat work."""
+    props = scene.item.properties or {}
+    for key in ("s2:mgrs_tile", "mgrs:tile", "grid:code"):
+        value = props.get(key)
+        if value:
+            return f"{key}:{value}"
+
+    mgrs_parts = [
+        props.get("mgrs:utm_zone"),
+        props.get("mgrs:latitude_band"),
+        props.get("mgrs:grid_square"),
+    ]
+    if any(value not in (None, "") for value in mgrs_parts):
+        return "mgrs:" + ":".join(str(value or "") for value in mgrs_parts)
+
+    # Earth Search Sentinel-2 item ids normally include the MGRS tile. Keep the
+    # complete id as a safe fallback rather than accidentally merging different tiles.
+    return scene.id
+
+
+def scenes_for_date(
+    *,
+    bbox: Iterable[float],
+    target_date: date,
+    max_cloud: float | None = 80.0,
+    limit: int = 80,
+) -> list[SentinelScene]:
+    """Return every useful Sentinel-2 tile intersecting the parcel on one date.
+
+    A parcel can cross the edge of two Sentinel MGRS tiles. Selecting a single
+    catalog item makes only part of the lot visible. This helper keeps the best
+    item per tile and lets the raster service build a real same-day mosaic.
+    """
+    scenes = search_scenes(
+        bbox=bbox,
+        start_date=target_date,
+        end_date=target_date,
+        max_cloud=max_cloud,
+        limit=limit,
+    )
+    same_day = [scene for scene in scenes if scene.datetime.date() == target_date]
+    by_tile: dict[str, SentinelScene] = {}
+    for scene in same_day:
+        tile_key = _scene_tile_key(scene)
+        current = by_tile.get(tile_key)
+        scene_cloud = scene.cloud_cover if scene.cloud_cover is not None else 999.0
+        current_cloud = current.cloud_cover if current and current.cloud_cover is not None else 999.0
+        if current is None or scene_cloud < current_cloud:
+            by_tile[tile_key] = scene
+    return sorted(
+        by_tile.values(),
+        key=lambda scene: (scene.cloud_cover if scene.cloud_cover is not None else 999.0, scene.id),
+    )
 
 def best_scene_for_date(
     *,
