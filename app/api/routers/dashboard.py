@@ -298,7 +298,11 @@ def dashboard_summary(current_user: Any = Depends(get_current_user)):
     user_id = _user_id_from_current(current_user)
     db = read_db()
     role = _role_for_user(db, user_id)
-    admin_mode = role == "admin"
+    # El dashboard operativo siempre representa el espacio de trabajo del usuario
+    # autenticado. Los administradores disponen de sus vistas globales en /admin;
+    # mezclar aquí registros de otros usuarios provoca conteos, mapas y alertas
+    # inconsistentes con Configuración y con los demás módulos de la plataforma.
+    admin_mode = False
 
     parcels = _scoped_rows(db, "parcels", user_id, admin_mode)
     satellite_images = _scoped_rows(db, "satellite_images", user_id, admin_mode)
