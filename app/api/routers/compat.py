@@ -51,6 +51,29 @@ TABLES = [
     "extension_requests", "digiforms_accounts", "digiforms_user_links", "digiforms_operation_logs",
 ]
 
+USER_SCOPED_TABLES = {
+    "parcels",
+    "satellite_images",
+    "field_notes",
+    "parcel_crops",
+    "aerial_analyses",
+    "analysis_sessions",
+    "analysis_data_points",
+    "laborapp_registros",
+    "laborapp_empleados_foto",
+    "extension_requests",
+    "digiforms_accounts",
+    "digiforms_user_links",
+    "digiforms_operation_logs",
+}
+
+PARCEL_CHILD_TABLES = {
+    "satellite_images",
+    "field_notes",
+    "parcel_crops",
+    "analysis_sessions",
+}
+
 DEFAULT_MODULES = [
     ("dashboard", "Dashboard", "Panel principal", "LayoutDashboard"),
     ("satelite", "Monitoreo Satelital", "Análisis satelital", "Satellite"),
@@ -469,6 +492,68 @@ def add_defaults(table_name: str, row: Dict[str, Any], user_id: Optional[str]) -
     return row
 
 
+def normalize_lot_key(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip().lower()
+        if text:
+            return " ".join(text.split())
+    return ""
+
+
+def parcel_lot_key(row: Dict[str, Any]) -> str:
+    return normalize_lot_key(row.get("lote"), row.get("codigo"), row.get("name"))
+
+
+def user_parcel_ids(db: Dict[str, Any], user_id: str) -> set[str]:
+    return {str(row.get("id")) for row in table(db, "parcels") if str(row.get("user_id") or "") == user_id and row.get("id")}
+
+
+def scoped_table_rows(db: Dict[str, Any], table_name: str, user: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    rows = table(db, table_name)
+    if not user or table_name not in USER_SCOPED_TABLES:
+        return rows
+
+    user_id = str(user.get("id") or "")
+    if not user_id:
+        return []
+
+    if table_name == "admin_users":
+        return [row for row in rows if str(row.get("user_id") or "") == user_id]
+    if table_name in PARCEL_CHILD_TABLES:
+        allowed_parcels = user_parcel_ids(db, user_id)
+        return [
+            row
+            for row in rows
+            if str(row.get("user_id") or "") == user_id
+            or (row.get("parcel_id") and str(row.get("parcel_id")) in allowed_parcels)
+        ]
+    if table_name == "extension_requests":
+        return [row for row in rows if str(row.get("requested_by_user_id") or row.get("user_id") or "") == user_id]
+    return [row for row in rows if str(row.get("user_id") or "") == user_id]
+
+
+def dedupe_user_parcels(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    by_key: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        key = f"{row.get('user_id') or ''}:{parcel_lot_key(row) or row.get('id') or id(row)}"
+        current = by_key.get(key)
+        if current is None or str(row.get("updated_at") or row.get("created_at") or "") >= str(current.get("updated_at") or current.get("created_at") or ""):
+            by_key[key] = row
+    return list(by_key.values())
+
+
+def find_existing_user_parcel(rows: List[Dict[str, Any]], row: Dict[str, Any], user_id: str) -> Optional[Dict[str, Any]]:
+    row_key = parcel_lot_key(row)
+    for existing in rows:
+        if str(existing.get("user_id") or "") != user_id:
+            continue
+        if row.get("id") and str(existing.get("id")) == str(row.get("id")):
+            return existing
+        if row_key and parcel_lot_key(existing) == row_key:
+            return existing
+    return None
+
+
 def cmp_value(value: Any, op: str, expected: Any) -> bool:
     if op == "eq":
         return value == expected
@@ -871,9 +956,13 @@ def create_manual_admin_user(payload: Dict[str, Any] = Body(default_factory=dict
 
 
 @router.post("/tables/{table_name}/query")
-def query(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict)):
+def query(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
+    user = bearer_user(authorization)
     db = read_db()
-    rows = [enrich(db, table_name, r) for r in table(db, table_name)]
+    raw_rows = scoped_table_rows(db, table_name, user)
+    if table_name == "parcels":
+        raw_rows = dedupe_user_parcels(raw_rows)
+    rows = [enrich(db, table_name, r) for r in raw_rows]
     rows = apply_filters(rows, payload.get("filters") or [])
     count = len(rows)
     for spec in reversed(payload.get("order") or []):
@@ -901,6 +990,14 @@ def insert(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict)
         inserted = []
         for item in items:
             row = add_defaults(table_name, item, user.get("id") if user else None)
+            if table_name == "parcels" and user:
+                row["user_id"] = user["id"]
+                target = find_existing_user_parcel(rows, row, user["id"])
+                if target:
+                    target.update(row)
+                    target["updated_at"] = now()
+                    inserted.append(enrich(db, table_name, target))
+                    continue
             rows.append(row)
             inserted.append(enrich(db, table_name, row))
         write_db(db)
@@ -925,11 +1022,31 @@ def upsert(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict)
         rows = table(db, table_name)
         for item in items:
             row = add_defaults(table_name, item, user.get("id") if user else None)
+            if table_name == "parcels" and user:
+                row["user_id"] = user["id"]
             target = None
             if conflict_cols:
-                target = next((r for r in rows if all(r.get(c) == row.get(c) for c in conflict_cols)), None)
+                target = next(
+                    (
+                        r
+                        for r in rows
+                        if all(r.get(c) == row.get(c) for c in conflict_cols)
+                        and (not user or table_name not in USER_SCOPED_TABLES or str(r.get("user_id") or "") == str(user.get("id") or ""))
+                    ),
+                    None,
+                )
             if not target and row.get("id"):
-                target = next((r for r in rows if r.get("id") == row.get("id")), None)
+                target = next(
+                    (
+                        r
+                        for r in rows
+                        if r.get("id") == row.get("id")
+                        and (not user or table_name not in USER_SCOPED_TABLES or str(r.get("user_id") or "") == str(user.get("id") or ""))
+                    ),
+                    None,
+                )
+            if table_name == "parcels" and user and not target:
+                target = find_existing_user_parcel(rows, row, user["id"])
             if target:
                 target.update(row)
                 target["updated_at"] = now()
@@ -942,13 +1059,16 @@ def upsert(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict)
 
 
 @router.post("/tables/{table_name}/update")
-def update(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict)):
+def update(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
+    user = bearer_user(authorization)
     with LOCK:
         db = read_db()
-        rows = table(db, table_name)
+        rows = scoped_table_rows(db, table_name, user)
         targets = apply_filters(rows, payload.get("filters") or [])
         for row in targets:
             row.update(normalize_record_geometries(table_name, payload.get("data") or {}))
+            if table_name in USER_SCOPED_TABLES and user and "user_id" in row:
+                row["user_id"] = user["id"]
             row["updated_at"] = now()
             row.update(normalize_record_geometries(table_name, row))
         result = [enrich(db, table_name, r) for r in targets]
@@ -957,11 +1077,13 @@ def update(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict)
 
 
 @router.post("/tables/{table_name}/delete")
-def delete(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict)):
+def delete(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
+    user = bearer_user(authorization)
     with LOCK:
         db = read_db()
         rows = table(db, table_name)
-        targets = apply_filters(rows, payload.get("filters") or [])
+        scoped_rows = scoped_table_rows(db, table_name, user)
+        targets = apply_filters(scoped_rows, payload.get("filters") or [])
         ids = {id(r) for r in targets}
         db["tables"][table_name] = [r for r in rows if id(r) not in ids]
         write_db(db)
