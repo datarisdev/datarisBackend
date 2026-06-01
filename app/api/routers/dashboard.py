@@ -235,6 +235,29 @@ def _scoped_rows(db: Dict[str, Any], table_name: str, user_id: str, admin_mode: 
     return [dict(row) for row in table(db, table_name) if _belongs_to_user(dict(row), user_id, admin_mode)]
 
 
+def _parcel_unique_key(row: Dict[str, Any]) -> str:
+    for key in ("lote", "codigo", "name", "id"):
+        value = str(row.get(key) or "").strip().lower()
+        if value:
+            return " ".join(value.split())
+    return str(id(row))
+
+
+def _dedupe_parcels(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    by_key: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        key = _parcel_unique_key(row)
+        current = by_key.get(key)
+        if current is None:
+            by_key[key] = row
+            continue
+        current_dt = _as_datetime(current.get("updated_at") or current.get("created_at")) or datetime.min.replace(tzinfo=timezone.utc)
+        row_dt = _as_datetime(row.get("updated_at") or row.get("created_at")) or datetime.min.replace(tzinfo=timezone.utc)
+        if row_dt >= current_dt:
+            by_key[key] = row
+    return list(by_key.values())
+
+
 def _latest(rows: Iterable[Dict[str, Any]], *date_keys: str) -> Optional[Dict[str, Any]]:
     def key(row: Dict[str, Any]) -> datetime:
         for date_key in date_keys:
@@ -304,21 +327,26 @@ def dashboard_summary(current_user: Any = Depends(get_current_user)):
     # inconsistentes con Configuración y con los demás módulos de la plataforma.
     admin_mode = False
 
-    parcels = _scoped_rows(db, "parcels", user_id, admin_mode)
+    parcels = _dedupe_parcels(_scoped_rows(db, "parcels", user_id, admin_mode))
+    parcel_ids = {str(row.get("id")) for row in parcels if row.get("id")}
     satellite_images = _scoped_rows(db, "satellite_images", user_id, admin_mode)
     satellite_jobs = _scoped_rows(db, "satellite_jobs", user_id, admin_mode)
     aerial_analyses = _scoped_rows(db, "aerial_analyses", user_id, admin_mode)
     analysis_sessions = _scoped_rows(db, "analysis_sessions", user_id, admin_mode)
     analysis_points = _scoped_rows(db, "analysis_data_points", user_id, admin_mode)
     field_notes = _scoped_rows(db, "field_notes", user_id, admin_mode)
+    satellite_images = [row for row in satellite_images if not row.get("parcel_id") or str(row.get("parcel_id")) in parcel_ids]
+    satellite_jobs = [row for row in satellite_jobs if not row.get("parcel_id") or str(row.get("parcel_id")) in parcel_ids]
+    aerial_analyses = [row for row in aerial_analyses if not row.get("parcel_id") or str(row.get("parcel_id")) in parcel_ids]
+    analysis_sessions = [row for row in analysis_sessions if not row.get("parcel_id") or str(row.get("parcel_id")) in parcel_ids]
+    analysis_points = [row for row in analysis_points if not row.get("parcel_id") or str(row.get("parcel_id")) in parcel_ids]
+    field_notes = [row for row in field_notes if not row.get("parcel_id") or str(row.get("parcel_id")) in parcel_ids]
     extension_requests = _scoped_rows(db, "extension_requests", user_id, admin_mode)
     platform_modules = [dict(row) for row in table(db, "platform_modules")]
 
     total_area = round(sum(_area_from_row(row) for row in parcels), 4)
     with_geometry = [row for row in parcels if _has_geometry(row)]
     without_geometry = [row for row in parcels if not _has_geometry(row)]
-    parcel_ids = {str(row.get("id")) for row in parcels if row.get("id")}
-
     completed_satellite = [row for row in satellite_images if _status(row) == "completed"]
     satellite_with_ndvi = [row for row in satellite_images if _ndvi_mean(row) is not None]
     average_ndvi = None

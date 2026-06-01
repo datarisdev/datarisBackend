@@ -15,6 +15,15 @@ logging.basicConfig(level=logging.INFO)
 
 router = APIRouter(prefix="/parcels", tags=["Parcels"])
 
+
+def _normalize_lot_key(*values: object) -> str:
+    for value in values:
+        text = str(value or "").strip().lower()
+        if text:
+            return " ".join(text.split())
+    return ""
+
+
 @router.post("/", response_model=ParcelOut)
 def create_parcel(
     name: str = Form(...),
@@ -51,6 +60,29 @@ def create_parcel(
         logging.info(f"area calculated from geometry: {area} ha")
 
     props = extract_main_properties(geometry_dict)
+    lot_key = _normalize_lot_key(props.get("lote"), props.get("codigo"), name)
+    existing = None
+    if lot_key:
+        user_parcels = db.query(Parcel).filter(Parcel.user_id == current_user["id"]).all()
+        existing = next(
+            (
+                row
+                for row in user_parcels
+                if _normalize_lot_key(row.lote, row.codigo, row.name) == lot_key
+            ),
+            None,
+        )
+
+    if existing:
+        existing.name = name
+        existing.area = area
+        existing.geometry = geometry_dict
+        existing.file_url = existing.file_url or ""
+        for key, value in props.items():
+            setattr(existing, key, value)
+        db.commit()
+        db.refresh(existing)
+        return existing
 
     # 3️⃣ Create DB record
     parcel = Parcel(
@@ -80,12 +112,9 @@ def get_parcels(
         .options(joinedload(Parcel.crop))  
     )
 
-    # If user_id is provided, filter by it
-    if user_id:
-        query = query.filter(Parcel.user_id == user_id)
-    else:
-        # Default: return parcels for current_user
-        query = query.filter(Parcel.user_id == current_user["id"])
+    # Lotes siempre pertenecen al usuario autenticado. No honramos user_id
+    # externo para evitar que un usuario vea o cuente lotes de otra cuenta.
+    query = query.filter(Parcel.user_id == current_user["id"])
 
     return query.order_by(Parcel.created_at.desc()).all()
 
@@ -106,7 +135,7 @@ def delete_parcel(
 
     try:
         delete_parcel_files(
-            user_id=str(current_user.id),
+            user_id=str(current_user["id"]),
             parcel_id=str(parcel.id),
         )
     except Exception as e:
@@ -116,4 +145,3 @@ def delete_parcel(
     db.commit()
 
     return {"ok": True}
-
