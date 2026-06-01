@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Body, File, Form, Header, HTTPException, UploadFile
 from starlette.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
-from jose import JWTError, jwt
+from jose import ExpiredSignatureError, JWTError, jwt
 from pydantic import BaseModel
 
 try:
@@ -431,10 +431,15 @@ def bearer_user(authorization: Optional[str]) -> Optional[Dict[str, Any]]:
         return None
     try:
         payload = jwt.decode(authorization.split(" ", 1)[1], settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
+    except ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="SESSION_EXPIRED")
     except JWTError:
         return None
     db = read_db()
-    return next((u for u in db.get("users", []) if u.get("id") == payload.get("sub")), None)
+    user = next((u for u in db.get("users", []) if u.get("id") == payload.get("sub")), None)
+    if user and user.get("is_active", True) is False:
+        return None
+    return user
 
 
 def add_defaults(table_name: str, row: Dict[str, Any], user_id: Optional[str]) -> Dict[str, Any]:

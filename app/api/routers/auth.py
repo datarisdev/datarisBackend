@@ -191,6 +191,8 @@ def login(data: UserLogin, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == data.email).first()
     if not user or not verify_password(data.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid credentials")
+    if not user.is_active:
+        raise HTTPException(status_code=401, detail="User inactive")
 
     # Get user roles
     roles = [r.role.value for r in user.roles]  

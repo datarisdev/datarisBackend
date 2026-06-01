@@ -1,16 +1,42 @@
+from typing import Any
+
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import jwt, JWTError, ExpiredSignatureError
 from app.core.config import settings
-from fastapi import Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from app.db.session import SessionLocal
+from app.models.user import User
+from app.models.user_admin import AdminUser
 from app.models.user_roles import UserRole, AppRole
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 oauth2_scheme_admin = OAuth2PasswordBearer(tokenUrl="/api/admin_users/login")
 
-def get_current_admin(token: str = Depends(oauth2_scheme_admin)):
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def _session_expired() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="SESSION_EXPIRED",
+    )
+
+
+def _invalid_credentials() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid authentication credentials",
+    )
+
+
+def get_current_admin(token: str = Depends(oauth2_scheme_admin), db: Session = Depends(get_db)):
     try:
         payload = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
         admin_id = payload.get("sub")
@@ -20,17 +46,18 @@ def get_current_admin(token: str = Depends(oauth2_scheme_admin)):
         if not admin_id or token_type != "admin":
             raise HTTPException(status_code=401, detail="Invalid token")
 
+        admin = db.query(AdminUser).filter(AdminUser.id == admin_id, AdminUser.is_active == True).first()
+        if not admin:
+            raise _invalid_credentials()
+
         return {"id": admin_id, "role": role}
 
     except ExpiredSignatureError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="SESSION_EXPIRED",
-        )
+        raise _session_expired()
     except JWTError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authentication credentials")
+        raise _invalid_credentials()
     
-def get_current_user(token: str = Depends(oauth2_scheme)) -> str:
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> dict[str, Any]:
     try:
         payload = jwt.decode(
             token,
@@ -39,31 +66,32 @@ def get_current_user(token: str = Depends(oauth2_scheme)) -> str:
         )
         user_id: str = payload.get("sub")
         role = payload.get("role")
-        if user_id is None:
-            raise HTTPException(status_code=401)
+        token_type = payload.get("type")
+        if user_id is None or token_type not in {"user", "compat_user", None}:
+            raise _invalid_credentials()
+
+        if token_type == "compat_user":
+            from app.api.routers.compat import read_db
+
+            compat_db = read_db()
+            compat_user = next((u for u in compat_db.get("users", []) if u.get("id") == user_id), None)
+            if not compat_user or compat_user.get("is_active", True) is False:
+                raise _invalid_credentials()
+        else:
+            user = db.query(User).filter(User.id == user_id, User.is_active == True).first()
+            if not user:
+                raise _invalid_credentials()
         return {"id": user_id, "role": role} 
     except ExpiredSignatureError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="SESSION_EXPIRED",
-        )
+        raise _session_expired()
     except JWTError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication credentials",
-        )
-    
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+        raise _invalid_credentials()
+
 
 def require_role(role: AppRole):
-    def role_checker(user_id: str = Depends(get_current_user), db: Session = Depends(get_db)):
-        user_roles = db.query(UserRole).filter(UserRole.user_id == user_id).all()
+    def role_checker(current_user: dict[str, Any] = Depends(get_current_user), db: Session = Depends(get_db)):
+        user_roles = db.query(UserRole).filter(UserRole.user_id == current_user["id"]).all()
         if not any(r.role == role for r in user_roles):
             raise HTTPException(status_code=403, detail="Forbidden")
-        return user_id
+        return current_user
     return role_checker

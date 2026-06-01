@@ -30,6 +30,8 @@ def login(admin: AdminUserLogin, db: Session = Depends(get_db)):
     db_admin = db.query(AdminUser).filter(AdminUser.email == admin.email).first()
     if not db_admin or not pwd_context.verify(admin.password, db_admin.password_hash):
         raise HTTPException(status_code=401, detail="Invalid credentials")
+    if not db_admin.is_active:
+        raise HTTPException(status_code=401, detail="User inactive")
     
     # Use the new role-aware token
     token = create_access_token(subject=str(db_admin.id), role=db_admin.admin_role, token_type="admin")
