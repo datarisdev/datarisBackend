@@ -73,7 +73,8 @@ class Settings(BaseSettings):
     GRANIOT_WMS_TRY_STANDARD_FALLBACK: bool = False
 
 
-    # DigiformsApp integration. Keep credentials only in backend env vars.
+    # DigiformsApp integration. Global provider URLs remain in environment.
+    # Company credentials are stored encrypted per tenant from Extensiones → DigiForms.
     DIGIFORMS_BASE_URL: str = "https://d.interlinksoft.net/Digiforms/Api/user"
     DIGIFORMS_CLIENT_ID: str = "178"
     DIGIFORMS_API_USER: str = "api"
@@ -82,6 +83,23 @@ class Settings(BaseSettings):
     DIGIFORMS_PORTAL_URL: str = "https://d.interlinksoft.net/Digiforms/"
     DIGIFORMS_DEFAULT_PROFILE: str = "user"
     DIGIFORMS_PROVISIONING_ENABLED: bool = True
+
+    # Official DigiForms REST/JSON Data API. This is independent from User API.
+    # The API returns form submissions incrementally by ResponseId and image links.
+    DIGIFORMS_DATA_BASE_URL: str = "https://d.interlinksoft.net/digiformsdata/api"
+    DIGIFORMS_DATA_API_USER: str | None = None
+    DIGIFORMS_DATA_API_PASSWORD: str | None = None
+    DIGIFORMS_DATA_TIMEOUT_SECONDS: int = 45
+    DIGIFORMS_HARVEST_FORM_ID: str | None = None
+    DIGIFORMS_PEST_WEED_FORM_ID: str | None = None
+    DIGIFORMS_SYNC_INITIAL_RESPONSE_ID: int = 0
+    DIGIFORMS_SYNC_CRON_SECRET: str | None = None
+    # Global encryption key used to store tenant-specific DigiForms credentials.
+    # Generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    DIGIFORMS_CREDENTIALS_ENCRYPTION_KEY: str | None = None
+    # Optional: limit scheduled synchronization to one Dataris account. Useful
+    # when a deployment has multiple users but a single DigiForms client.
+    DIGIFORMS_SYNC_TARGET_USER_ID: str | None = None
 
     # OpenAI Copiloto de Aplicación Aérea.
     # OPENAI_API_KEY debe configurarse en producción; si no existe, el backend devuelve

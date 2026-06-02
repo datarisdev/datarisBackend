@@ -27,3 +27,6 @@ pystac-client>=0.7
 planetary-computer>=1.0
 redis>=5.0
 celery>=5.3
+
+openpyxl>=3.1
+cryptography>=42
