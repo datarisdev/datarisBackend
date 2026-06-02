@@ -49,6 +49,7 @@ TABLES = [
     "field_notes", "parcel_crops", "aerial_analyses", "analysis_sessions",
     "analysis_data_points", "laborapp_registros", "laborapp_empleados_foto",
     "extension_requests", "digiforms_accounts", "digiforms_user_links", "digiforms_operation_logs",
+    "sig_import_runs", "sig_harvest_records", "sig_pest_weed_records", "sig_harvest_overrides",
 ]
 
 USER_SCOPED_TABLES = {
@@ -65,6 +66,10 @@ USER_SCOPED_TABLES = {
     "digiforms_accounts",
     "digiforms_user_links",
     "digiforms_operation_logs",
+    "sig_import_runs",
+    "sig_harvest_records",
+    "sig_pest_weed_records",
+    "sig_harvest_overrides",
 }
 
 PARCEL_CHILD_TABLES = {
