@@ -55,12 +55,20 @@ class DigiformsUserAPI:
     endpoint that does not return 404.
     """
 
-    def __init__(self) -> None:
-        self.base_url = str(settings.DIGIFORMS_BASE_URL or "").rstrip("/")
-        self.client_id = str(settings.DIGIFORMS_CLIENT_ID or "").strip()
-        self.api_user = str(settings.DIGIFORMS_API_USER or "").strip()
-        self.api_password = settings.DIGIFORMS_API_PASSWORD
-        self.timeout = float(settings.DIGIFORMS_AUTH_TIMEOUT_SECONDS or 30)
+    def __init__(
+        self,
+        *,
+        base_url: Optional[str] = None,
+        client_id: Optional[str] = None,
+        api_user: Optional[str] = None,
+        api_password: Optional[str] = None,
+        timeout_seconds: Optional[float] = None,
+    ) -> None:
+        self.base_url = str(base_url if base_url is not None else settings.DIGIFORMS_BASE_URL or "").rstrip("/")
+        self.client_id = str(client_id if client_id is not None else settings.DIGIFORMS_CLIENT_ID or "").strip()
+        self.api_user = str(api_user if api_user is not None else settings.DIGIFORMS_API_USER or "").strip()
+        self.api_password = api_password if api_password is not None else settings.DIGIFORMS_API_PASSWORD
+        self.timeout = float(timeout_seconds if timeout_seconds is not None else settings.DIGIFORMS_AUTH_TIMEOUT_SECONDS or 30)
 
     @property
     def is_configured(self) -> bool:
@@ -69,7 +77,7 @@ class DigiformsUserAPI:
     def _auth(self) -> httpx.BasicAuth:
         if not self.is_configured:
             raise DigiformsAPIError(
-                "DigiformsApp no está configurado. Define DIGIFORMS_BASE_URL, DIGIFORMS_CLIENT_ID, DIGIFORMS_API_USER y DIGIFORMS_API_PASSWORD."
+                "DigiformsApp no está configurado para esta empresa. Completa ClientId, usuario técnico y contraseña desde Extensiones → DigiForms."
             )
         return httpx.BasicAuth(f"{self.client_id}/{self.api_user}", str(self.api_password))
 

@@ -15,6 +15,19 @@ from app.services.digiforms_user_api import (
     build_digiforms_user_id,
     generate_temporary_password,
 )
+from app.services.digiforms_company_config import (
+    HARVEST_FORM_TYPE,
+    PEST_WEED_FORM_TYPE,
+    connection_for_company,
+    encrypt_secret,
+    encryption_key_is_explicit,
+    mapping_for_company,
+    mappings_for_company,
+    runtime_credentials,
+    safe_connection,
+    safe_mappings,
+)
+from app.services.digiforms_data_api import DigiformsDataAPI, DigiformsDataAPIError
 
 router = APIRouter(prefix="/compat/extensions", tags=["Compatibility Extensions"])
 
@@ -396,7 +409,7 @@ def digiforms_status(authorization: Optional[str] = Header(default=None)):
             "status": "enabled" if enabled else ((latest or {}).get("status") or "not_requested"),
             "request": latest,
             "portal_url": settings.DIGIFORMS_PORTAL_URL,
-            "client_id": settings.DIGIFORMS_CLIENT_ID,
+            "client_id": (safe_connection(connection_for_company(db, company_id)) or {}).get("client_id"),
         },
         "error": None,
     }
@@ -508,6 +521,13 @@ def reject_extension_request(request_id: str, payload: Dict[str, Any] = Body(def
 
 @router.post("/requests/{request_id}/approve")
 async def approve_extension_request(request_id: str, payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
+    """Enable an extension after administrative review.
+
+    DigiForms tenant credentials are intentionally *not* provisioned here. Once
+    the extension is enabled, the company administrator completes the secure
+    connection wizard in Extensiones → DigiForms. This prevents one global
+    DigiForms account from being reused accidentally across companies.
+    """
     user = require_user(authorization)
     with LOCK:
         db = read_db()
@@ -520,156 +540,42 @@ async def approve_extension_request(request_id: str, payload: Dict[str, Any] = B
         if admin.get("admin_role") == "company_admin" and row.get("company_id") != admin.get("company_id"):
             raise HTTPException(status_code=403, detail="No puedes habilitar solicitudes de otra empresa")
         extension_id = normalize_extension_id(row.get("extension_id") or DIGIFORMS_MODULE["id"])
-        if extension_id != DIGIFORMS_MODULE["id"]:
-            t = now()
-            enable_extension_for(db, row.get("company_id"), row.get("requested_by_user_id"), extension_id)
-            row.update({
-                "status": "approved",
-                "admin_notes": (payload.get("admin_notes") or f"Extensión {safe_extension_name(db, extension_id)} revisada y habilitada desde el panel de administración.").strip(),
-                "client_message": f"Tu extensión {safe_extension_name(db, extension_id)} ya fue habilitada. Ahora puedes utilizarla desde Dataris.",
-                "reviewed_by_user_id": user["id"],
-                "reviewed_at": t,
-                "enabled_at": t,
-                "updated_at": t,
-            })
-            write_db(db)
-            return {"data": enrich_request(db, row), "error": None}
-        row["status"] = "in_review"
-        row["updated_at"] = now()
-        write_db(db)
-
-    # External Digiforms call happens outside the lock.
-    api = DigiformsUserAPI()
-    api_status = "not_configured"
-    api_response: Any = None
-    generated_password: Optional[str] = None
-    digiforms_user_id = row.get("existing_digiforms_user_id")
-    digiforms_user_name = row.get("requester_name") or "Usuario Dataris"
-    digiforms_email = row.get("requester_email") or ""
-    mode = "existing" if row.get("has_existing_account") else "generated"
-
-    try:
-        if settings.DIGIFORMS_PROVISIONING_ENABLED and api.is_configured:
-            if row.get("has_existing_account"):
-                if digiforms_user_id:
-                    api_response = await api.get_user(str(digiforms_user_id))
-                    api_status = "verified_existing"
-                else:
-                    api_status = "existing_not_verified_missing_user_id"
-            else:
-                generated_password = generate_temporary_password()
-                digiforms_user_id = payload.get("digiforms_user_id") or build_digiforms_user_id(digiforms_email, digiforms_user_name)
-                created = DigiformsUserPayload(
-                    user_id=str(digiforms_user_id),
-                    client_id=int(settings.DIGIFORMS_CLIENT_ID),
-                    user_name=digiforms_user_name,
-                    password=generated_password,
-                    email=digiforms_email,
-                    active=True,
-                    profile=str(settings.DIGIFORMS_DEFAULT_PROFILE or "user"),
-                )
-                api_response = await api.create_user(created)
-                api_status = "created_in_digiforms"
-        elif not api.is_configured:
-            api_status = "pending_external_provision_missing_env"
-        else:
-            api_status = "provisioning_disabled"
-    except DigiformsAPIError as exc:
-        with LOCK:
-            db = read_db()
-            row = next((r for r in table(db, "extension_requests") if r.get("id") == request_id), row)
-            row.update({
-                "status": "provision_failed",
-                "admin_notes": f"Error DigiformsApp: {exc}. {exc.response_text or ''}".strip(),
-                "client_message": "Estamos revisando tu solicitud de DigiformsApp. La habilitación quedó pendiente por una validación técnica externa.",
-                "reviewed_by_user_id": user["id"],
-                "reviewed_at": now(),
-                "updated_at": now(),
-            })
-            write_db(db)
-        raise HTTPException(status_code=502, detail=f"DigiformsApp no pudo completar la provisión: {exc}")
-
-    with LOCK:
-        db = read_db()
-        row = next((r for r in table(db, "extension_requests") if r.get("id") == request_id), row)
-        enable_extension_for(db, row.get("company_id"), row.get("requested_by_user_id"), DIGIFORMS_MODULE["id"])
         t = now()
+        enable_extension_for(db, row.get("company_id"), row.get("requested_by_user_id"), extension_id)
+        client_message = (
+            "Tu extensión DigiformsApp ya fue habilitada. Ingresa a Extensiones → DigiForms para conectar la cuenta de tu empresa, asociar los FormId y activar la sincronización automática."
+            if extension_id == DIGIFORMS_MODULE["id"]
+            else f"Tu extensión {safe_extension_name(db, extension_id)} ya fue habilitada. Ahora puedes utilizarla desde Dataris."
+        )
         row.update({
             "status": "approved",
-            "admin_notes": (payload.get("admin_notes") or "Extensión revisada y habilitada desde el panel de administración.").strip(),
-            "client_message": "Tu extensión DigiformsApp ya fue habilitada. Ahora puedes crear y utilizar formularios de campo desde Dataris.",
+            "admin_notes": (payload.get("admin_notes") or f"Extensión {safe_extension_name(db, extension_id)} revisada y habilitada desde el panel de administración.").strip(),
+            "client_message": client_message,
             "reviewed_by_user_id": user["id"],
             "reviewed_at": t,
             "enabled_at": t,
             "updated_at": t,
         })
-        account = {
-            "id": str(uuid.uuid4()),
-            "company_id": row.get("company_id"),
-            "user_id": row.get("requested_by_user_id"),
-            "extension_request_id": row.get("id"),
-            "digiforms_client_id": settings.DIGIFORMS_CLIENT_ID,
-            "digiforms_user_id": str(digiforms_user_id or ""),
-            "digiforms_user_name": digiforms_user_name,
-            "digiforms_email": digiforms_email,
-            "profile": settings.DIGIFORMS_DEFAULT_PROFILE,
-            "mode": mode,
-            "active": True,
-            "initial_password": generated_password,
-            "api_status": api_status,
-            "api_response": api_response,
-            "created_at": t,
-            "updated_at": t,
-        }
-        # Replace account for this request if it already exists.
-        table(db, "digiforms_accounts")[:] = [a for a in table(db, "digiforms_accounts") if a.get("extension_request_id") != row.get("id")]
-        table(db, "digiforms_accounts").append(account)
-
-        # Also expose the approved/provisioned base account in the DigiformsApp
-        # user-management section. This keeps approval, provisioning and daily
-        # user administration in the same operational view.
-        if digiforms_user_id:
-            existing_link = next(
-                (
-                    link
-                    for link in table(db, "digiforms_user_links")
-                    if link.get("digiforms_client_id") == settings.DIGIFORMS_CLIENT_ID
-                    and link.get("digiforms_user_id") == str(digiforms_user_id)
-                    and link.get("company_id") == row.get("company_id")
-                ),
-                None,
-            )
-            link_payload = {
+        if extension_id == DIGIFORMS_MODULE["id"]:
+            account = {
+                "id": str(uuid.uuid4()),
                 "company_id": row.get("company_id"),
-                "dataris_user_id": row.get("requested_by_user_id"),
-                "created_by_user_id": user.get("id"),
-                "digiforms_client_id": settings.DIGIFORMS_CLIENT_ID,
-                "digiforms_user_id": str(digiforms_user_id),
-                "digiforms_user_name": digiforms_user_name,
-                "digiforms_email": digiforms_email,
+                "user_id": row.get("requested_by_user_id"),
+                "extension_request_id": row.get("id"),
+                "digiforms_client_id": None,
+                "digiforms_user_id": None,
+                "digiforms_user_name": None,
+                "digiforms_email": row.get("requester_email"),
                 "profile": settings.DIGIFORMS_DEFAULT_PROFILE,
-                "mode": mode,
+                "mode": "company_configuration_required",
                 "active": True,
-                "external_status": api_status,
-                "last_api_action": "approve_extension",
-                "last_api_status": api_status,
-                "last_api_response": api_response,
+                "api_status": "waiting_company_configuration",
+                "api_response": None,
+                "created_at": t,
                 "updated_at": t,
             }
-            if existing_link:
-                existing_link.update(link_payload)
-                if generated_password:
-                    existing_link["initial_password"] = generated_password
-                    existing_link["temporary_password_was_generated"] = True
-            else:
-                table(db, "digiforms_user_links").append({
-                    "id": str(uuid.uuid4()),
-                    **link_payload,
-                    "initial_password": generated_password,
-                    "temporary_password_was_generated": bool(generated_password),
-                    "created_at": t,
-                })
-
+            table(db, "digiforms_accounts")[:] = [a for a in table(db, "digiforms_accounts") if a.get("extension_request_id") != row.get("id")]
+            table(db, "digiforms_accounts").append(account)
         write_db(db)
         data = enrich_request(db, row)
     return {"data": data, "error": None}
@@ -741,16 +647,233 @@ def create_operation_log(db: Dict[str, Any], *, user_id: str, action: str, statu
     })
 
 
-def digiforms_api_or_error() -> DigiformsUserAPI:
-    api = DigiformsUserAPI()
+def require_company_admin_scope(db: Dict[str, Any], user: Dict[str, Any], requested_company_id: Optional[str] = None) -> Dict[str, Any]:
+    scope = current_link_scope(db, user)
+    admin = scope.get("admin")
+    if not is_admin(admin):
+        raise HTTPException(status_code=403, detail="Solo un administrador puede configurar la conexión DigiForms de la empresa")
+    if admin and admin.get("admin_role") == "company_admin":
+        company_id = str(admin.get("company_id") or "")
+    else:
+        company_id = str(requested_company_id or scope.get("company_id") or (admin or {}).get("company_id") or "")
+    if not company_id:
+        raise HTTPException(status_code=400, detail="No se pudo determinar la empresa activa para configurar DigiForms")
+    return {**scope, "company_id": company_id}
+
+
+def _company_runtime_connection(db: Dict[str, Any], company_id: Optional[str]) -> Dict[str, str]:
+    row = connection_for_company(db, company_id)
+    if row:
+        try:
+            credentials = runtime_credentials(row)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        if credentials.get("client_id") and credentials.get("api_user") and credentials.get("api_password"):
+            return credentials
+    # Backward-compatible fallback for deployments configured before the
+    # multi-company assistant was added. New tenants should use the UI.
+    return {
+        "client_id": str(settings.DIGIFORMS_CLIENT_ID or "").strip(),
+        "api_user": str(settings.DIGIFORMS_API_USER or "").strip(),
+        "api_password": str(settings.DIGIFORMS_API_PASSWORD or ""),
+    }
+
+
+def digiforms_client_id_for_company(db: Dict[str, Any], company_id: Optional[str]) -> str:
+    return _company_runtime_connection(db, company_id).get("client_id") or ""
+
+
+def digiforms_api_or_error(db: Dict[str, Any], company_id: Optional[str]) -> DigiformsUserAPI:
+    credentials = _company_runtime_connection(db, company_id)
+    api = DigiformsUserAPI(
+        client_id=credentials.get("client_id"),
+        api_user=credentials.get("api_user"),
+        api_password=credentials.get("api_password"),
+    )
     if not api.is_configured:
         raise HTTPException(
             status_code=503,
-            detail="DigiformsApp User API no está configurada. Define DIGIFORMS_BASE_URL, DIGIFORMS_CLIENT_ID, DIGIFORMS_API_USER y DIGIFORMS_API_PASSWORD en el backend.",
+            detail="DigiformsApp User API no está configurada para esta empresa. Completa ClientId, usuario técnico y contraseña desde Extensiones → DigiForms.",
         )
     if not settings.DIGIFORMS_PROVISIONING_ENABLED:
         raise HTTPException(status_code=503, detail="La provisión vía DigiformsApp User API está deshabilitada en el backend.")
     return api
+
+
+def _upsert_form_mapping(
+    db: Dict[str, Any],
+    *,
+    company_id: str,
+    form_type: str,
+    form_id: Any,
+    display_name: str,
+    initial_response_id: int,
+    timestamp: str,
+) -> Dict[str, Any]:
+    rows = table(db, "digiforms_form_mappings")
+    row = mapping_for_company(db, company_id, form_type)
+    values = {
+        "company_id": company_id,
+        "form_type": form_type,
+        "display_name": display_name,
+        "form_id": str(form_id or "").strip(),
+        "is_enabled": bool(str(form_id or "").strip()),
+        "initial_response_id": int(initial_response_id or 0),
+        "updated_at": timestamp,
+    }
+    if row:
+        row.update(values)
+        return row
+    row = {"id": str(uuid.uuid4()), "created_at": timestamp, **values}
+    rows.append(row)
+    return row
+
+
+def _reset_company_cursor(db: Dict[str, Any], *, company_id: str, form_type: str, form_id: str, initial_response_id: int, timestamp: str) -> None:
+    rows = table(db, "sig_sync_cursors")
+    row = next((item for item in rows if str(item.get("company_id") or "") == company_id and item.get("form_type") == form_type), None)
+    values = {
+        "company_id": company_id,
+        "form_type": form_type,
+        "form_id": form_id,
+        "last_response_id": int(initial_response_id or 0),
+        "last_sync_at": None,
+        "last_success_at": None,
+        "last_error": None,
+        "updated_at": timestamp,
+    }
+    if row:
+        row.update(values)
+    else:
+        rows.append({"id": str(uuid.uuid4()), "created_at": timestamp, **values})
+
+
+@router.get("/digiforms/company-config")
+def get_digiforms_company_config(authorization: Optional[str] = Header(default=None)):
+    user = require_user(authorization)
+    with LOCK:
+        db = read_db()
+        scope = current_link_scope(db, user)
+        company_id = scope.get("company_id")
+        connection = connection_for_company(db, company_id)
+        mappings = safe_mappings(mappings_for_company(db, company_id))
+        can_edit = is_admin(scope.get("admin"))
+    return {
+        "data": {
+            "company_id": company_id,
+            "can_edit": can_edit,
+            "connection": safe_connection(connection),
+            "mappings": mappings,
+            "provider": {
+                "user_api_base_url": settings.DIGIFORMS_BASE_URL,
+                "data_api_base_url": settings.DIGIFORMS_DATA_BASE_URL,
+                "portal_url": settings.DIGIFORMS_PORTAL_URL,
+            },
+            "encryption_key_is_explicit": encryption_key_is_explicit(),
+        },
+        "error": None,
+    }
+
+
+@router.put("/digiforms/company-config")
+def save_digiforms_company_config(payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
+    user = require_user(authorization)
+    with LOCK:
+        db = read_db()
+        scope = require_company_admin_scope(db, user, str(payload.get("company_id") or "") or None)
+        company_id = str(scope.get("company_id") or "")
+        rows = table(db, "digiforms_connections")
+        row = connection_for_company(db, company_id)
+        client_id = str(payload.get("client_id") or (row or {}).get("client_id") or "").strip()
+        api_user = str(payload.get("api_user") or (row or {}).get("api_user") or "").strip()
+        password = str(payload.get("api_password") or "")
+        encrypted_password = (row or {}).get("encrypted_api_password")
+        if password:
+            encrypted_password = encrypt_secret(password)
+        if not client_id or not api_user or not encrypted_password:
+            raise HTTPException(status_code=400, detail="ClientId, usuario técnico y contraseña son obligatorios para conectar DigiForms")
+        timestamp = now()
+        values = {
+            "company_id": company_id,
+            "client_id": client_id,
+            "api_user": api_user,
+            "encrypted_api_password": encrypted_password,
+            "auto_sync_enabled": payload.get("auto_sync_enabled", (row or {}).get("auto_sync_enabled", True)) is not False,
+            "connection_status": (row or {}).get("connection_status") or "not_tested",
+            "configured_by_user_id": user.get("id"),
+            "updated_at": timestamp,
+        }
+        if row:
+            row.update(values)
+        else:
+            row = {"id": str(uuid.uuid4()), "created_at": timestamp, **values}
+            rows.append(row)
+
+        default_initial = int(payload.get("initial_response_id") or 0)
+        harvest_initial = int(payload.get("harvest_initial_response_id") or default_initial)
+        pest_initial = int(payload.get("pest_weed_initial_response_id") or default_initial)
+        previous_harvest_id = str((mapping_for_company(db, company_id, HARVEST_FORM_TYPE) or {}).get("form_id") or "")
+        previous_pest_id = str((mapping_for_company(db, company_id, PEST_WEED_FORM_TYPE) or {}).get("form_id") or "")
+        harvest = _upsert_form_mapping(db, company_id=company_id, form_type=HARVEST_FORM_TYPE, form_id=payload.get("harvest_form_id"), display_name="Monitoreo de cosecha", initial_response_id=harvest_initial, timestamp=timestamp)
+        pest = _upsert_form_mapping(db, company_id=company_id, form_type=PEST_WEED_FORM_TYPE, form_id=payload.get("pest_weed_form_id"), display_name="Malezas y plagas", initial_response_id=pest_initial, timestamp=timestamp)
+        reset_cursors = payload.get("reset_cursors") is True
+        cursor_rows = table(db, "sig_sync_cursors")
+        for form_type, mapping, previous_id, initial in [
+            (HARVEST_FORM_TYPE, harvest, previous_harvest_id, harvest_initial),
+            (PEST_WEED_FORM_TYPE, pest, previous_pest_id, pest_initial),
+        ]:
+            current_id = str(mapping.get("form_id") or "")
+            existing_cursor = next((item for item in cursor_rows if str(item.get("company_id") or "") == company_id and item.get("form_type") == form_type), None)
+            # Preserve progress on routine credential edits. A cursor is reset
+            # only for first setup, an explicit operator request, or a changed
+            # FormId that points to another DigiForms format.
+            if reset_cursors or existing_cursor is None or previous_id != current_id:
+                _reset_company_cursor(db, company_id=company_id, form_type=form_type, form_id=current_id, initial_response_id=initial, timestamp=timestamp)
+        write_db(db)
+    return {"data": {"connection": safe_connection(row), "mappings": safe_mappings([harvest, pest])}, "error": None, "message": "Configuración DigiForms guardada para la empresa."}
+
+
+@router.post("/digiforms/company-config/test")
+async def test_digiforms_company_config(payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
+    user = require_user(authorization)
+    with LOCK:
+        db = read_db()
+        scope = require_company_admin_scope(db, user, str(payload.get("company_id") or "") or None)
+        company_id = str(scope.get("company_id") or "")
+        stored = connection_for_company(db, company_id) or {}
+        credentials = _company_runtime_connection(db, company_id)
+        client_id = str(payload.get("client_id") or credentials.get("client_id") or "").strip()
+        api_user = str(payload.get("api_user") or credentials.get("api_user") or "").strip()
+        api_password = str(payload.get("api_password") or credentials.get("api_password") or "")
+        harvest_form_id = str(payload.get("harvest_form_id") or (mapping_for_company(db, company_id, HARVEST_FORM_TYPE) or {}).get("form_id") or "").strip()
+        pest_form_id = str(payload.get("pest_weed_form_id") or (mapping_for_company(db, company_id, PEST_WEED_FORM_TYPE) or {}).get("form_id") or "").strip()
+    if not client_id or not api_user or not api_password:
+        raise HTTPException(status_code=400, detail="Completa ClientId, usuario técnico y contraseña antes de probar la conexión")
+    result: Dict[str, Any] = {"client_id": client_id, "api_user": api_user, "user_api": {"ok": False}, "data_api": []}
+    user_api = DigiformsUserAPI(client_id=client_id, api_user=api_user, api_password=api_password)
+    try:
+        response = await user_api.get_user(api_user)
+        result["user_api"] = {"ok": True, "response": response}
+    except DigiformsAPIError as exc:
+        result["user_api"] = {"ok": False, "message": str(exc), "status_code": exc.status_code}
+    data_api = DigiformsDataAPI(client_id=client_id, api_user=api_user, api_password=api_password)
+    for form_type, form_id in [(HARVEST_FORM_TYPE, harvest_form_id), (PEST_WEED_FORM_TYPE, pest_form_id)]:
+        if not form_id:
+            continue
+        try:
+            probe = await data_api.test_results_connection(form_id, int(payload.get("from_response_id") or 0))
+            result["data_api"].append({"form_type": form_type, **probe})
+        except DigiformsDataAPIError as exc:
+            result["data_api"].append({"form_type": form_type, "form_id": form_id, "ok": False, "message": str(exc), "status_code": exc.status_code})
+    result["ok"] = bool(result["user_api"].get("ok") or any(item.get("ok") for item in result["data_api"]))
+    if payload.get("persist_test_result"):
+        with LOCK:
+            db = read_db()
+            row = connection_for_company(db, company_id)
+            if row:
+                row.update({"connection_status": "ok" if result["ok"] else "error", "last_connection_test_at": now(), "last_connection_error": None if result["ok"] else "No respondió ninguna API configurada.", "updated_at": now()})
+                write_db(db)
+    return {"data": result, "error": None}
 
 
 @router.get("/digiforms/connection-test")
@@ -758,25 +881,31 @@ async def test_digiforms_connection(authorization: Optional[str] = Header(defaul
     user = require_user(authorization)
     with LOCK:
         db = read_db()
-        current_link_scope(db, user)
-
-    api = DigiformsUserAPI()
+        scope = current_link_scope(db, user)
+        company_id = scope.get("company_id")
+        credentials = _company_runtime_connection(db, company_id)
+        connection = connection_for_company(db, company_id)
+    api = DigiformsUserAPI(
+        client_id=credentials.get("client_id"),
+        api_user=credentials.get("api_user"),
+        api_password=credentials.get("api_password"),
+    )
     configured = api.is_configured
     payload: Dict[str, Any] = {
         "configured": configured,
-        "client_id": settings.DIGIFORMS_CLIENT_ID,
-        "api_user": settings.DIGIFORMS_API_USER,
+        "client_id": credentials.get("client_id"),
+        "api_user": credentials.get("api_user"),
         "base_url": settings.DIGIFORMS_BASE_URL,
         "portal_url": settings.DIGIFORMS_PORTAL_URL,
         "provisioning_enabled": settings.DIGIFORMS_PROVISIONING_ENABLED,
         "external_ok": False,
         "external_status": "not_configured" if not configured else "not_tested",
+        "source": "company_config" if connection else "legacy_backend_env",
     }
     if not configured or not settings.DIGIFORMS_PROVISIONING_ENABLED:
         return {"data": payload, "error": None}
-
     try:
-        response = await api.get_user(settings.DIGIFORMS_API_USER)
+        response = await api.get_user(str(credentials.get("api_user") or ""))
         payload.update({"external_ok": True, "external_status": "ok", "response": response})
     except DigiformsAPIError as exc:
         payload.update({"external_ok": False, "external_status": "error", "message": str(exc), "response_text": exc.response_text, "status_code": exc.status_code})
@@ -799,8 +928,8 @@ async def lookup_digiforms_user(digiforms_user_id: str, authorization: Optional[
     user = require_user(authorization)
     with LOCK:
         db = read_db()
-        current_link_scope(db, user)
-    api = digiforms_api_or_error()
+        scope = current_link_scope(db, user)
+        api = digiforms_api_or_error(db, scope.get("company_id"))
     try:
         response = await api.get_user(digiforms_user_id)
     except DigiformsAPIError as exc:
@@ -814,57 +943,34 @@ async def link_existing_digiforms_user(payload: Dict[str, Any] = Body(default_fa
     digiforms_user_id = str(payload.get("digiforms_user_id") or "").strip()
     if not digiforms_user_id:
         raise HTTPException(status_code=400, detail="Debes indicar el UserId existente de DigiformsApp")
-
     with LOCK:
         db = read_db()
         scope = current_link_scope(db, user)
         company_id = str(payload.get("company_id") or scope.get("company_id") or "") or None
         if scope.get("admin") and scope["admin"].get("admin_role") == "company_admin":
             company_id = scope["admin"].get("company_id")
-        duplicate = next(
-            (
-                r for r in table(db, "digiforms_user_links")
-                if r.get("digiforms_client_id") == settings.DIGIFORMS_CLIENT_ID
-                and r.get("digiforms_user_id") == digiforms_user_id
-                and (not company_id or r.get("company_id") == company_id)
-            ),
-            None,
-        )
+        client_id = digiforms_client_id_for_company(db, company_id)
+        duplicate = next((r for r in table(db, "digiforms_user_links") if str(r.get("digiforms_client_id") or "") == client_id and r.get("digiforms_user_id") == digiforms_user_id and (not company_id or r.get("company_id") == company_id)), None)
         if duplicate:
             return {"data": safe_digiforms_link(duplicate), "error": None, "message": "El usuario ya estaba vinculado en Dataris."}
-
-    api = digiforms_api_or_error()
+        api = digiforms_api_or_error(db, company_id)
     try:
         external_response = await api.get_user(digiforms_user_id)
-        external_status = "verified_existing"
     except DigiformsAPIError as exc:
         raise HTTPException(status_code=502, detail=f"DigiformsApp no pudo validar el usuario existente: {exc}")
-
     with LOCK:
         db = read_db()
         scope = current_link_scope(db, user)
         company_id = str(payload.get("company_id") or scope.get("company_id") or "") or None
         if scope.get("admin") and scope["admin"].get("admin_role") == "company_admin":
             company_id = scope["admin"].get("company_id")
+        client_id = digiforms_client_id_for_company(db, company_id)
         t = now()
         row = {
-            "id": str(uuid.uuid4()),
-            "company_id": company_id,
-            "dataris_user_id": payload.get("dataris_user_id") or user.get("id"),
-            "created_by_user_id": user.get("id"),
-            "digiforms_client_id": settings.DIGIFORMS_CLIENT_ID,
-            "digiforms_user_id": digiforms_user_id,
-            "digiforms_user_name": str(payload.get("user_name") or payload.get("digiforms_user_name") or "").strip() or digiforms_user_id,
-            "digiforms_email": str(payload.get("email") or "").strip() or None,
-            "profile": normalize_digiforms_profile(payload.get("profile") or "user"),
-            "mode": "existing",
-            "active": True,
-            "external_status": external_status,
-            "last_api_action": "lookup",
-            "last_api_status": external_status,
-            "last_api_response": external_response,
-            "created_at": t,
-            "updated_at": t,
+            "id": str(uuid.uuid4()), "company_id": company_id, "dataris_user_id": payload.get("dataris_user_id") or user.get("id"), "created_by_user_id": user.get("id"),
+            "digiforms_client_id": client_id, "digiforms_user_id": digiforms_user_id, "digiforms_user_name": str(payload.get("user_name") or payload.get("digiforms_user_name") or "").strip() or digiforms_user_id,
+            "digiforms_email": str(payload.get("email") or "").strip() or None, "profile": normalize_digiforms_profile(payload.get("profile") or "user"), "mode": "existing", "active": True,
+            "external_status": "verified_existing", "last_api_action": "lookup", "last_api_status": "verified_existing", "last_api_response": external_response, "created_at": t, "updated_at": t,
         }
         table(db, "digiforms_user_links").append(row)
         create_operation_log(db, user_id=user.get("id"), action="link_existing_user", status="ok", target_user_id=digiforms_user_id, response=external_response)
@@ -882,48 +988,28 @@ async def create_digiforms_user(payload: Dict[str, Any] = Body(default_factory=d
         raise HTTPException(status_code=400, detail="Debes indicar el nombre del usuario DigiformsApp")
     if not email or "@" not in email:
         raise HTTPException(status_code=400, detail="Debes indicar un correo válido para el usuario DigiformsApp")
-
     digiforms_user_id = str(payload.get("digiforms_user_id") or "").strip() or build_digiforms_user_id(email, user_name)
     password = str(payload.get("password") or "").strip()
     generated_password = False
     if not password:
         password = generate_temporary_password()
         generated_password = True
-
     with LOCK:
         db = read_db()
         scope = current_link_scope(db, user)
         company_id = str(payload.get("company_id") or scope.get("company_id") or "") or None
         if scope.get("admin") and scope["admin"].get("admin_role") == "company_admin":
             company_id = scope["admin"].get("company_id")
-        duplicate = next(
-            (
-                r for r in table(db, "digiforms_user_links")
-                if r.get("digiforms_client_id") == settings.DIGIFORMS_CLIENT_ID
-                and r.get("digiforms_user_id") == digiforms_user_id
-                and (not company_id or r.get("company_id") == company_id)
-            ),
-            None,
-        )
+        client_id = digiforms_client_id_for_company(db, company_id)
+        duplicate = next((r for r in table(db, "digiforms_user_links") if str(r.get("digiforms_client_id") or "") == client_id and r.get("digiforms_user_id") == digiforms_user_id and (not company_id or r.get("company_id") == company_id)), None)
         if duplicate:
             raise HTTPException(status_code=409, detail="Ya existe un usuario DigiformsApp vinculado con ese UserId")
-
-    api = digiforms_api_or_error()
-    api_payload = DigiformsUserPayload(
-        user_id=digiforms_user_id,
-        client_id=int(settings.DIGIFORMS_CLIENT_ID),
-        user_name=user_name,
-        password=password,
-        email=email,
-        active=True,
-        profile=profile,
-    )
+        api = digiforms_api_or_error(db, company_id)
+    api_payload = DigiformsUserPayload(user_id=digiforms_user_id, client_id=int(client_id), user_name=user_name, password=password, email=email, active=True, profile=profile)
     try:
         external_response = await api.create_user(api_payload)
-        external_status = "created_in_digiforms"
     except DigiformsAPIError as exc:
         raise HTTPException(status_code=502, detail=f"DigiformsApp no pudo crear el usuario: {exc}. {exc.response_text or ''}".strip())
-
     with LOCK:
         db = read_db()
         scope = current_link_scope(db, user)
@@ -932,25 +1018,10 @@ async def create_digiforms_user(payload: Dict[str, Any] = Body(default_factory=d
             company_id = scope["admin"].get("company_id")
         t = now()
         row = {
-            "id": str(uuid.uuid4()),
-            "company_id": company_id,
-            "dataris_user_id": payload.get("dataris_user_id") or user.get("id"),
-            "created_by_user_id": user.get("id"),
-            "digiforms_client_id": settings.DIGIFORMS_CLIENT_ID,
-            "digiforms_user_id": digiforms_user_id,
-            "digiforms_user_name": user_name,
-            "digiforms_email": email,
-            "profile": profile,
-            "mode": "generated",
-            "active": True,
-            "external_status": external_status,
-            "last_api_action": "create",
-            "last_api_status": external_status,
-            "last_api_response": external_response,
-            "initial_password": password if generated_password else None,
-            "temporary_password_was_generated": generated_password,
-            "created_at": t,
-            "updated_at": t,
+            "id": str(uuid.uuid4()), "company_id": company_id, "dataris_user_id": payload.get("dataris_user_id") or user.get("id"), "created_by_user_id": user.get("id"), "digiforms_client_id": client_id,
+            "digiforms_user_id": digiforms_user_id, "digiforms_user_name": user_name, "digiforms_email": email, "profile": profile, "mode": "generated", "active": True,
+            "external_status": "created_in_digiforms", "last_api_action": "create", "last_api_status": "created_in_digiforms", "last_api_response": external_response,
+            "initial_password": password if generated_password else None, "temporary_password_was_generated": generated_password, "created_at": t, "updated_at": t,
         }
         table(db, "digiforms_user_links").append(row)
         create_operation_log(db, user_id=user.get("id"), action="create_user", status="ok", target_user_id=digiforms_user_id, response=external_response)
@@ -962,60 +1033,23 @@ async def create_digiforms_user(payload: Dict[str, Any] = Body(default_factory=d
 async def update_digiforms_user(link_id: str, payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
     user = require_user(authorization)
     with LOCK:
-        db = read_db()
-        scope = current_link_scope(db, user)
-        row = find_digiforms_link(db, link_id, scope)
-        if not row:
-            raise HTTPException(status_code=404, detail="Usuario DigiformsApp no encontrado")
-        current = dict(row)
-
+        db = read_db(); scope = current_link_scope(db, user); row = find_digiforms_link(db, link_id, scope)
+        if not row: raise HTTPException(status_code=404, detail="Usuario DigiformsApp no encontrado")
+        current = dict(row); api = digiforms_api_or_error(db, current.get("company_id"))
     user_name = str(payload.get("user_name") or payload.get("digiforms_user_name") or current.get("digiforms_user_name") or "").strip()
     email = str(payload.get("email") or payload.get("digiforms_email") or current.get("digiforms_email") or "").strip()
     profile = normalize_digiforms_profile(payload.get("profile") or current.get("profile") or "user")
-    password = str(payload.get("password") or "").strip()
-    active = bool(payload.get("active", current.get("active", True)))
-    if not user_name:
-        raise HTTPException(status_code=400, detail="Debes indicar el nombre del usuario")
-    if not email or "@" not in email:
-        raise HTTPException(status_code=400, detail="Debes indicar un correo válido")
-    if not password:
-        raise HTTPException(status_code=400, detail="Para actualizar un usuario por la API de DigiformsApp debes indicar la contraseña actual o una nueva contraseña. La API documentada requiere enviar el campo Password en el objeto User.")
-
-    api = digiforms_api_or_error()
-    api_payload = DigiformsUserPayload(
-        user_id=str(current.get("digiforms_user_id")),
-        client_id=int(current.get("digiforms_client_id") or settings.DIGIFORMS_CLIENT_ID),
-        user_name=user_name,
-        password=password,
-        email=email,
-        active=active,
-        profile=profile,
-    )
-    try:
-        external_response = await api.update_user(api_payload)
-        external_status = "updated_in_digiforms"
-    except DigiformsAPIError as exc:
-        raise HTTPException(status_code=502, detail=f"DigiformsApp no pudo actualizar el usuario: {exc}. {exc.response_text or ''}".strip())
-
+    password = str(payload.get("password") or "").strip(); active = bool(payload.get("active", current.get("active", True)))
+    if not user_name: raise HTTPException(status_code=400, detail="Debes indicar el nombre del usuario")
+    if not email or "@" not in email: raise HTTPException(status_code=400, detail="Debes indicar un correo válido")
+    if not password: raise HTTPException(status_code=400, detail="Para actualizar un usuario por la API de DigiformsApp debes indicar la contraseña actual o una nueva contraseña. La API documentada requiere enviar el campo Password en el objeto User.")
+    api_payload = DigiformsUserPayload(user_id=str(current.get("digiforms_user_id")), client_id=int(current.get("digiforms_client_id") or api.client_id), user_name=user_name, password=password, email=email, active=active, profile=profile)
+    try: external_response = await api.update_user(api_payload)
+    except DigiformsAPIError as exc: raise HTTPException(status_code=502, detail=f"DigiformsApp no pudo actualizar el usuario: {exc}. {exc.response_text or ''}".strip())
     with LOCK:
-        db = read_db()
-        scope = current_link_scope(db, user)
-        row = find_digiforms_link(db, link_id, scope)
-        t = now()
-        row.update({
-            "digiforms_user_name": user_name,
-            "digiforms_email": email,
-            "profile": profile,
-            "active": active,
-            "external_status": external_status,
-            "last_api_action": "update",
-            "last_api_status": external_status,
-            "last_api_response": external_response,
-            "updated_at": t,
-        })
-        create_operation_log(db, user_id=user.get("id"), action="update_user", status="ok", target_user_id=row.get("digiforms_user_id"), response=external_response)
-        write_db(db)
-        data = safe_digiforms_link(row)
+        db = read_db(); scope = current_link_scope(db, user); row = find_digiforms_link(db, link_id, scope); t = now()
+        row.update({"digiforms_user_name": user_name, "digiforms_email": email, "profile": profile, "active": active, "external_status": "updated_in_digiforms", "last_api_action": "update", "last_api_status": "updated_in_digiforms", "last_api_response": external_response, "updated_at": t})
+        create_operation_log(db, user_id=user.get("id"), action="update_user", status="ok", target_user_id=row.get("digiforms_user_id"), response=external_response); write_db(db); data = safe_digiforms_link(row)
     return {"data": data, "error": None}
 
 
@@ -1023,32 +1057,15 @@ async def update_digiforms_user(link_id: str, payload: Dict[str, Any] = Body(def
 async def verify_digiforms_user(link_id: str, authorization: Optional[str] = Header(default=None)):
     user = require_user(authorization)
     with LOCK:
-        db = read_db()
-        scope = current_link_scope(db, user)
-        row = find_digiforms_link(db, link_id, scope)
-        if not row:
-            raise HTTPException(status_code=404, detail="Usuario DigiformsApp no encontrado")
-        digiforms_user_id = row.get("digiforms_user_id")
-    api = digiforms_api_or_error()
-    try:
-        external_response = await api.get_user(str(digiforms_user_id))
-        external_status = "verified"
-    except DigiformsAPIError as exc:
-        raise HTTPException(status_code=502, detail=f"No se pudo verificar el usuario en DigiformsApp: {exc}")
+        db = read_db(); scope = current_link_scope(db, user); row = find_digiforms_link(db, link_id, scope)
+        if not row: raise HTTPException(status_code=404, detail="Usuario DigiformsApp no encontrado")
+        digiforms_user_id = str(row.get("digiforms_user_id")); api = digiforms_api_or_error(db, row.get("company_id"))
+    try: external_response = await api.get_user(digiforms_user_id)
+    except DigiformsAPIError as exc: raise HTTPException(status_code=502, detail=f"No se pudo verificar el usuario en DigiformsApp: {exc}")
     with LOCK:
-        db = read_db()
-        scope = current_link_scope(db, user)
-        row = find_digiforms_link(db, link_id, scope)
-        row.update({
-            "external_status": external_status,
-            "last_api_action": "verify",
-            "last_api_status": external_status,
-            "last_api_response": external_response,
-            "updated_at": now(),
-        })
-        create_operation_log(db, user_id=user.get("id"), action="verify_user", status="ok", target_user_id=row.get("digiforms_user_id"), response=external_response)
-        write_db(db)
-        data = safe_digiforms_link(row)
+        db = read_db(); scope = current_link_scope(db, user); row = find_digiforms_link(db, link_id, scope)
+        row.update({"external_status": "verified", "last_api_action": "verify", "last_api_status": "verified", "last_api_response": external_response, "updated_at": now()})
+        create_operation_log(db, user_id=user.get("id"), action="verify_user", status="ok", target_user_id=row.get("digiforms_user_id"), response=external_response); write_db(db); data = safe_digiforms_link(row)
     return {"data": data, "error": None}
 
 
@@ -1056,34 +1073,13 @@ async def verify_digiforms_user(link_id: str, authorization: Optional[str] = Hea
 async def deactivate_digiforms_user(link_id: str, authorization: Optional[str] = Header(default=None)):
     user = require_user(authorization)
     with LOCK:
-        db = read_db()
-        scope = current_link_scope(db, user)
-        row = find_digiforms_link(db, link_id, scope)
-        if not row:
-            raise HTTPException(status_code=404, detail="Usuario DigiformsApp no encontrado")
-        digiforms_user_id = str(row.get("digiforms_user_id"))
-        client_id = str(row.get("digiforms_client_id") or settings.DIGIFORMS_CLIENT_ID)
-    api = digiforms_api_or_error()
-    try:
-        external_response = await api.deactivate_user(digiforms_user_id, client_id=client_id)
-        external_status = "deactivated_in_digiforms"
-    except DigiformsAPIError as exc:
-        raise HTTPException(status_code=502, detail=f"DigiformsApp no pudo desactivar el usuario: {exc}. {exc.response_text or ''}".strip())
+        db = read_db(); scope = current_link_scope(db, user); row = find_digiforms_link(db, link_id, scope)
+        if not row: raise HTTPException(status_code=404, detail="Usuario DigiformsApp no encontrado")
+        digiforms_user_id = str(row.get("digiforms_user_id")); client_id = str(row.get("digiforms_client_id") or ""); api = digiforms_api_or_error(db, row.get("company_id"))
+    try: external_response = await api.deactivate_user(digiforms_user_id, client_id=client_id)
+    except DigiformsAPIError as exc: raise HTTPException(status_code=502, detail=f"DigiformsApp no pudo desactivar el usuario: {exc}. {exc.response_text or ''}".strip())
     with LOCK:
-        db = read_db()
-        scope = current_link_scope(db, user)
-        row = find_digiforms_link(db, link_id, scope)
-        t = now()
-        row.update({
-            "active": False,
-            "external_status": external_status,
-            "last_api_action": "deactivate",
-            "last_api_status": external_status,
-            "last_api_response": external_response,
-            "deactivated_at": t,
-            "updated_at": t,
-        })
-        create_operation_log(db, user_id=user.get("id"), action="deactivate_user", status="ok", target_user_id=digiforms_user_id, response=external_response)
-        write_db(db)
-        data = safe_digiforms_link(row)
+        db = read_db(); scope = current_link_scope(db, user); row = find_digiforms_link(db, link_id, scope); t = now()
+        row.update({"active": False, "external_status": "deactivated_in_digiforms", "last_api_action": "deactivate", "last_api_status": "deactivated_in_digiforms", "last_api_response": external_response, "deactivated_at": t, "updated_at": t})
+        create_operation_log(db, user_id=user.get("id"), action="deactivate_user", status="ok", target_user_id=digiforms_user_id, response=external_response); write_db(db); data = safe_digiforms_link(row)
     return {"data": data, "error": None}
