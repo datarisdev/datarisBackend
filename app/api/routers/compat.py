@@ -554,6 +554,30 @@ def find_existing_user_parcel(rows: List[Dict[str, Any]], row: Dict[str, Any], u
     return None
 
 
+def replace_user_parcels_with(db: Dict[str, Any], user_id: str, row: Dict[str, Any]) -> None:
+    """Keep exactly one loaded parcel per user in compat storage."""
+    parcel_rows = table(db, "parcels")
+    previous_ids = {
+        str(existing.get("id"))
+        for existing in parcel_rows
+        if str(existing.get("user_id") or "") == user_id and existing.get("id") and str(existing.get("id")) != str(row.get("id"))
+    }
+    db["tables"]["parcels"] = [
+        existing
+        for existing in parcel_rows
+        if str(existing.get("user_id") or "") != user_id
+    ]
+    table(db, "parcels").append(row)
+
+    if previous_ids:
+        for child_table in PARCEL_CHILD_TABLES:
+            db["tables"][child_table] = [
+                child
+                for child in table(db, child_table)
+                if str(child.get("parcel_id") or "") not in previous_ids
+            ]
+
+
 def cmp_value(value: Any, op: str, expected: Any) -> bool:
     if op == "eq":
         return value == expected
@@ -1216,7 +1240,7 @@ async def upload_parcel_from_satellite(
         })
         with LOCK:
             db = read_db()
-            table(db, "parcels").append(row)
+            replace_user_parcels_with(db, user["id"], row)
             write_db(db)
         return {"data": {"parcel": row}, "error": None}
     except ValueError as exc:
