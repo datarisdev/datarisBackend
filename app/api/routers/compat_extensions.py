@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, Header, HTTPException
@@ -700,6 +700,19 @@ def digiforms_api_or_error(db: Dict[str, Any], company_id: Optional[str]) -> Dig
     return api
 
 
+def _default_initial_sync_dates() -> tuple[str, str]:
+    current_year = date.today().year
+    return f"{current_year}-01-01", f"{current_year}-12-31"
+
+
+def _clean_iso_date(value: Any, fallback: str) -> str:
+    raw = str(value or fallback).strip()
+    try:
+        return date.fromisoformat(raw).isoformat()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Las fechas iniciales DigiForms deben usar formato AAAA-MM-DD.") from exc
+
+
 def _upsert_form_mapping(
     db: Dict[str, Any],
     *,
@@ -708,6 +721,8 @@ def _upsert_form_mapping(
     form_id: Any,
     display_name: str,
     initial_response_id: int,
+    initial_sync_start_date: str,
+    initial_sync_end_date: str,
     timestamp: str,
 ) -> Dict[str, Any]:
     rows = table(db, "digiforms_form_mappings")
@@ -719,6 +734,8 @@ def _upsert_form_mapping(
         "form_id": str(form_id or "").strip(),
         "is_enabled": bool(str(form_id or "").strip()),
         "initial_response_id": int(initial_response_id or 0),
+        "initial_sync_start_date": initial_sync_start_date,
+        "initial_sync_end_date": initial_sync_end_date,
         "updated_at": timestamp,
     }
     if row:
@@ -812,10 +829,17 @@ def save_digiforms_company_config(payload: Dict[str, Any] = Body(default_factory
         default_initial = int(payload.get("initial_response_id") or 0)
         harvest_initial = int(payload.get("harvest_initial_response_id") or default_initial)
         pest_initial = int(payload.get("pest_weed_initial_response_id") or default_initial)
-        previous_harvest_id = str((mapping_for_company(db, company_id, HARVEST_FORM_TYPE) or {}).get("form_id") or "")
-        previous_pest_id = str((mapping_for_company(db, company_id, PEST_WEED_FORM_TYPE) or {}).get("form_id") or "")
-        harvest = _upsert_form_mapping(db, company_id=company_id, form_type=HARVEST_FORM_TYPE, form_id=payload.get("harvest_form_id"), display_name="Monitoreo de cosecha", initial_response_id=harvest_initial, timestamp=timestamp)
-        pest = _upsert_form_mapping(db, company_id=company_id, form_type=PEST_WEED_FORM_TYPE, form_id=payload.get("pest_weed_form_id"), display_name="Malezas y plagas", initial_response_id=pest_initial, timestamp=timestamp)
+        default_start, default_end = _default_initial_sync_dates()
+        previous_harvest = mapping_for_company(db, company_id, HARVEST_FORM_TYPE) or {}
+        previous_pest = mapping_for_company(db, company_id, PEST_WEED_FORM_TYPE) or {}
+        previous_harvest_id = str(previous_harvest.get("form_id") or "")
+        previous_pest_id = str(previous_pest.get("form_id") or "")
+        harvest_start = _clean_iso_date(payload.get("harvest_initial_sync_start_date"), str(previous_harvest.get("initial_sync_start_date") or default_start))
+        harvest_end = _clean_iso_date(payload.get("harvest_initial_sync_end_date"), str(previous_harvest.get("initial_sync_end_date") or default_end))
+        pest_start = _clean_iso_date(payload.get("pest_weed_initial_sync_start_date"), str(previous_pest.get("initial_sync_start_date") or default_start))
+        pest_end = _clean_iso_date(payload.get("pest_weed_initial_sync_end_date"), str(previous_pest.get("initial_sync_end_date") or default_end))
+        harvest = _upsert_form_mapping(db, company_id=company_id, form_type=HARVEST_FORM_TYPE, form_id=payload.get("harvest_form_id"), display_name="Monitoreo de cosecha", initial_response_id=harvest_initial, initial_sync_start_date=harvest_start, initial_sync_end_date=harvest_end, timestamp=timestamp)
+        pest = _upsert_form_mapping(db, company_id=company_id, form_type=PEST_WEED_FORM_TYPE, form_id=payload.get("pest_weed_form_id"), display_name="Malezas y plagas", initial_response_id=pest_initial, initial_sync_start_date=pest_start, initial_sync_end_date=pest_end, timestamp=timestamp)
         reset_cursors = payload.get("reset_cursors") is True
         cursor_rows = table(db, "sig_sync_cursors")
         for form_type, mapping, previous_id, initial in [
@@ -845,8 +869,15 @@ async def test_digiforms_company_config(payload: Dict[str, Any] = Body(default_f
         client_id = str(payload.get("client_id") or credentials.get("client_id") or "").strip()
         api_user = str(payload.get("api_user") or credentials.get("api_user") or "").strip()
         api_password = str(payload.get("api_password") or credentials.get("api_password") or "")
-        harvest_form_id = str(payload.get("harvest_form_id") or (mapping_for_company(db, company_id, HARVEST_FORM_TYPE) or {}).get("form_id") or "").strip()
-        pest_form_id = str(payload.get("pest_weed_form_id") or (mapping_for_company(db, company_id, PEST_WEED_FORM_TYPE) or {}).get("form_id") or "").strip()
+        harvest_mapping = mapping_for_company(db, company_id, HARVEST_FORM_TYPE) or {}
+        pest_mapping = mapping_for_company(db, company_id, PEST_WEED_FORM_TYPE) or {}
+        default_start, default_end = _default_initial_sync_dates()
+        harvest_form_id = str(payload.get("harvest_form_id") or harvest_mapping.get("form_id") or "").strip()
+        pest_form_id = str(payload.get("pest_weed_form_id") or pest_mapping.get("form_id") or "").strip()
+        harvest_start = _clean_iso_date(payload.get("harvest_initial_sync_start_date"), str(harvest_mapping.get("initial_sync_start_date") or default_start))
+        harvest_end = _clean_iso_date(payload.get("harvest_initial_sync_end_date"), str(harvest_mapping.get("initial_sync_end_date") or default_end))
+        pest_start = _clean_iso_date(payload.get("pest_weed_initial_sync_start_date"), str(pest_mapping.get("initial_sync_start_date") or default_start))
+        pest_end = _clean_iso_date(payload.get("pest_weed_initial_sync_end_date"), str(pest_mapping.get("initial_sync_end_date") or default_end))
     if not client_id or not api_user or not api_password:
         raise HTTPException(status_code=400, detail="Completa ClientId, usuario técnico y contraseña antes de probar la conexión")
     result: Dict[str, Any] = {"client_id": client_id, "api_user": api_user, "user_api": {"ok": False}, "data_api": []}
@@ -857,21 +888,26 @@ async def test_digiforms_company_config(payload: Dict[str, Any] = Body(default_f
     except DigiformsAPIError as exc:
         result["user_api"] = {"ok": False, "message": str(exc), "status_code": exc.status_code}
     data_api = DigiformsDataAPI(client_id=client_id, api_user=api_user, api_password=api_password)
-    for form_type, form_id in [(HARVEST_FORM_TYPE, harvest_form_id), (PEST_WEED_FORM_TYPE, pest_form_id)]:
+    for form_type, form_id, initial, start_date, end_date in [
+        (HARVEST_FORM_TYPE, harvest_form_id, int(payload.get("harvest_initial_response_id") or 0), harvest_start, harvest_end),
+        (PEST_WEED_FORM_TYPE, pest_form_id, int(payload.get("pest_weed_initial_response_id") or 0), pest_start, pest_end),
+    ]:
         if not form_id:
             continue
         try:
-            probe = await data_api.test_results_connection(form_id, int(payload.get("from_response_id") or 0))
+            probe = await data_api.test_results_connection(form_id, initial, start_date=start_date, end_date=end_date)
             result["data_api"].append({"form_type": form_type, **probe})
         except DigiformsDataAPIError as exc:
             result["data_api"].append({"form_type": form_type, "form_id": form_id, "ok": False, "message": str(exc), "status_code": exc.status_code})
-    result["ok"] = bool(result["user_api"].get("ok") or any(item.get("ok") for item in result["data_api"]))
+    data_api_ok = any(item.get("ok") for item in result["data_api"])
+    result["data_api_ok"] = data_api_ok
+    result["ok"] = bool(data_api_ok if result["data_api"] else result["user_api"].get("ok"))
     if payload.get("persist_test_result"):
         with LOCK:
             db = read_db()
             row = connection_for_company(db, company_id)
             if row:
-                row.update({"connection_status": "ok" if result["ok"] else "error", "last_connection_test_at": now(), "last_connection_error": None if result["ok"] else "No respondió ninguna API configurada.", "updated_at": now()})
+                row.update({"connection_status": "ok" if result["ok"] else "error", "last_connection_test_at": now(), "last_connection_error": None if result["ok"] else "La Data API no validó los FormId internos configurados.", "updated_at": now()})
                 write_db(db)
     return {"data": result, "error": None}
 

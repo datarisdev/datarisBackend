@@ -86,7 +86,7 @@ class Settings(BaseSettings):
 
     # Official DigiForms REST/JSON Data API. This is independent from User API.
     # The API returns form submissions incrementally by ResponseId and image links.
-    DIGIFORMS_DATA_BASE_URL: str = "https://d.interlinksoft.net/digiformsdata/api"
+    DIGIFORMS_DATA_BASE_URL: str = "https://d.interlinksoft.net/DigiformsData/api"
     DIGIFORMS_DATA_API_USER: str | None = None
     DIGIFORMS_DATA_API_PASSWORD: str | None = None
     DIGIFORMS_DATA_TIMEOUT_SECONDS: int = 45

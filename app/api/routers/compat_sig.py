@@ -19,6 +19,8 @@ from app.core.config import settings
 from app.services.digiforms_data_api import (
     DigiformsDataAPI,
     DigiformsDataAPIError,
+    discover_field_names,
+    dynamic_fields_from_payload,
     extract_image_rows,
     extract_submission_rows,
     image_path_from_payload,
@@ -329,7 +331,8 @@ def _harvest_record(row: Dict[str, Any], index: int, features: Sequence[Tuple[st
         "outside_registered_parcel": feature_key is None,
         "digiforms_state": _safe_text(_first_value(row, ["State", "EstadoAprobacion", "ApprovalState"], "0")) or "0",
         "image_urls": [_safe_text(value) for value in (row.get("_image_urls") or []) if _safe_text(value)],
-        "raw_payload": _json_safe({key: value for key, value in row.items() if key not in {"_hyperlinks", "_raw_api_payload"}}),
+        "dynamic_fields": _json_safe(dynamic_fields_from_payload(row)),
+        "raw_payload": _json_safe(row.get("_raw_api_payload") or {key: value for key, value in row.items() if key not in {"_hyperlinks", "_raw_api_payload"}}),
     }
 
 
@@ -392,7 +395,8 @@ def _pest_weed_record(row: Dict[str, Any], index: int, features: Sequence[Tuple[
         "outside_registered_parcel": feature_key is None,
         "digiforms_state": _safe_text(_first_value(row, ["State", "EstadoAprobacion", "ApprovalState"], "0")) or "0",
         "image_urls": [_safe_text(value) for value in (row.get("_image_urls") or []) if _safe_text(value)],
-        "raw_payload": _json_safe({key: value for key, value in row.items() if key not in {"_hyperlinks", "_raw_api_payload"}}),
+        "dynamic_fields": _json_safe(dynamic_fields_from_payload(row)),
+        "raw_payload": _json_safe(row.get("_raw_api_payload") or {key: value for key, value in row.items() if key not in {"_hyperlinks", "_raw_api_payload"}}),
     }
 
 
@@ -538,6 +542,14 @@ def _configured_form_types(db: Dict[str, Any], company_id: Optional[str]) -> Lis
     return [form_type for form_type in [HARVEST_FORM_TYPE, PEST_WEED_FORM_TYPE] if _form_id_for_type(db, company_id, form_type)]
 
 
+def _initial_sync_dates_for_type(db: Dict[str, Any], company_id: Optional[str], form_type: str) -> Tuple[str, str]:
+    mapping = mapping_for_company(db, company_id, form_type) or {}
+    current_year = date.today().year
+    start_date = _safe_text(mapping.get("initial_sync_start_date")) or f"{current_year}-01-01"
+    end_date = _safe_text(mapping.get("initial_sync_end_date")) or f"{current_year}-12-31"
+    return start_date, end_date
+
+
 def _company_user_ids(db: Dict[str, Any], company_id: Optional[str]) -> set[str]:
     if not company_id:
         return set()
@@ -671,6 +683,55 @@ def _state_stats(records: Sequence[Dict[str, Any]]) -> Dict[str, int]:
     return stats
 
 
+def _persist_raw_api_submissions(
+    *,
+    db: Dict[str, Any],
+    user_id: str,
+    company_id: Optional[str],
+    form_type: str,
+    form_id: str,
+    response_rows: Sequence[Dict[str, Any]],
+    image_map: Dict[str, List[str]],
+    timestamp: str,
+) -> int:
+    """Persist every variable DigiForms submission before specialized parsing.
+
+    A configured FormId can add, remove or rename questions at any moment. Raw
+    storage guarantees that no provider data is lost when a new field is not yet
+    represented by a SIG card.
+    """
+    destination = table(db, "sig_digiforms_raw_submissions")
+    existing = {
+        (str(item.get("form_id") or ""), str(item.get("external_response_id") or "")): item
+        for item in destination
+        if _same_company_or_legacy_user(item, company_id=company_id, user_id=user_id)
+    }
+    persisted = 0
+    for index, row in enumerate(response_rows[:MAX_ROWS_PER_IMPORT]):
+        external_id = response_id_from_payload(row) or _stable_external_id(form_type, row, index)
+        values = {
+            "user_id": user_id,
+            "company_id": company_id,
+            "form_type": form_type,
+            "form_id": form_id,
+            "external_response_id": external_id,
+            "digiforms_state": state_from_payload(row),
+            "dynamic_fields": _json_safe(dynamic_fields_from_payload(row)),
+            "raw_payload": _json_safe(row.get("_raw_api_payload") or row),
+            "image_urls": list(image_map.get(external_id, [])),
+            "updated_at": timestamp,
+        }
+        current = existing.get((form_id, external_id))
+        if current:
+            current.update(values)
+        else:
+            current = {"id": str(uuid.uuid4()), "created_at": timestamp, **values}
+            destination.append(current)
+            existing[(form_id, external_id)] = current
+        persisted += 1
+    return persisted
+
+
 def _persist_api_records(
     *,
     db: Dict[str, Any],
@@ -682,6 +743,9 @@ def _persist_api_records(
     image_rows: Sequence[Dict[str, Any]],
     parcels: Sequence[Dict[str, Any]],
     cursor_before: int,
+    sync_mode: str,
+    initial_sync_start_date: Optional[str] = None,
+    initial_sync_end_date: Optional[str] = None,
     warning: Optional[str] = None,
 ) -> Dict[str, Any]:
     features = _build_feature_index(parcels)
@@ -704,6 +768,16 @@ def _persist_api_records(
 
     run_id = str(uuid.uuid4())
     timestamp = now()
+    raw_rows_persisted = _persist_raw_api_submissions(
+        db=db,
+        user_id=user_id,
+        company_id=company_id,
+        form_type=form_type,
+        form_id=form_id,
+        response_rows=response_rows,
+        image_map=image_map,
+        timestamp=timestamp,
+    )
     destination = table(db, _record_table_name(form_type))
     existing_by_external = {
         str(item.get("external_response_id")): item
@@ -750,6 +824,7 @@ def _persist_api_records(
                 "last_sync_at": timestamp,
                 "last_success_at": timestamp,
                 "last_error": None,
+                "last_request_mode": sync_mode,
                 "updated_at": timestamp,
             }
         )
@@ -762,7 +837,7 @@ def _persist_api_records(
         "form_type": form_type,
         "form_id": form_id,
         "source": DIGIFORMS_RESULTS_API_SOURCE,
-        "file_name": "API incremental",
+        "file_name": "API por fechas" if sync_mode == "initial_date_range" else "API incremental",
         "status": "completed",
         "total_rows": len(response_rows),
         "valid_rows": len(parsed_records),
@@ -773,6 +848,11 @@ def _persist_api_records(
         "outside_registered_parcel_rows": outside_rows,
         "parcel_features_received": len(features),
         "images_received": len(image_rows),
+        "raw_rows_persisted": raw_rows_persisted,
+        "discovered_fields": discover_field_names(response_rows),
+        "sync_mode": sync_mode,
+        "initial_sync_start_date": initial_sync_start_date,
+        "initial_sync_end_date": initial_sync_end_date,
         "cursor_before": cursor_before,
         "cursor_after": cursor_after,
         "warning": warning,
@@ -804,8 +884,15 @@ async def _sync_form_from_api(
         cursor_before = int(from_response_id if from_response_id is not None else (cursor or {}).get("last_response_id") or 0)
         write_db(db)
 
+    with LOCK:
+        db = read_db()
+        initial_start_date, initial_end_date = _initial_sync_dates_for_type(db, company_id, form_type)
+    sync_mode = "incremental_response_id" if cursor_before > 0 else "initial_date_range"
     try:
-        results_payload = await api.get_all_results_since(form_id, cursor_before)
+        if sync_mode == "incremental_response_id":
+            results_payload = await api.get_all_results_since(form_id, cursor_before)
+        else:
+            results_payload = await api.get_all_results_by_dates(form_id, initial_start_date, initial_end_date)
         response_rows = extract_submission_rows(results_payload)
     except DigiformsDataAPIError as exc:
         with LOCK:
@@ -819,7 +906,11 @@ async def _sync_form_from_api(
     image_rows: List[Dict[str, Any]] = []
     image_warning: Optional[str] = None
     try:
-        image_rows = extract_image_rows(await api.get_images_since(form_id, cursor_before))
+        if sync_mode == "incremental_response_id":
+            image_payload = await api.get_images_since(form_id, cursor_before)
+        else:
+            image_payload = await api.get_images_by_dates(form_id, initial_start_date, initial_end_date)
+        image_rows = extract_image_rows(image_payload)
     except DigiformsDataAPIError as exc:
         image_warning = f"Los registros se sincronizaron, pero no se pudieron actualizar imágenes: {exc}"
 
@@ -835,6 +926,9 @@ async def _sync_form_from_api(
             image_rows=image_rows,
             parcels=parcels,
             cursor_before=cursor_before,
+            sync_mode=sync_mode,
+            initial_sync_start_date=initial_start_date if sync_mode == "initial_date_range" else None,
+            initial_sync_end_date=initial_end_date if sync_mode == "initial_date_range" else None,
             warning=image_warning,
         )
         write_db(db)
@@ -864,6 +958,7 @@ def _cursor_public(row: Dict[str, Any]) -> Dict[str, Any]:
         "last_sync_at": row.get("last_sync_at"),
         "last_success_at": row.get("last_success_at"),
         "last_error": row.get("last_error"),
+        "last_request_mode": row.get("last_request_mode"),
     }
 
 
@@ -891,11 +986,11 @@ def integration_status(authorization: Optional[str] = Header(default=None)):
             "company_id": company_id,
             "capture_platform": "DigiformsApp",
             "active_results_channel": DIGIFORMS_RESULTS_API_SOURCE if api_enabled else DIGIFORMS_EXCEL_SOURCE,
-            "active_results_channel_label": "DigiForms Data API incremental" if api_enabled else "Exportación Excel de DigiForms (respaldo)",
+            "active_results_channel_label": "DigiForms Data API: carga inicial por fechas + incremental por ResponseId" if api_enabled else "Exportación Excel de DigiForms (respaldo)",
             "automatic_forms_results_api_enabled": api_enabled,
             "automatic_forms_results_api_status": "configured" if api_enabled else "missing_configuration",
             "automatic_forms_results_api_message": (
-                "La API REST/JSON oficial está configurada para tu empresa. Dataris consulta respuestas incrementales por ResponseId y recupera enlaces de imágenes."
+                "La API REST/JSON oficial está configurada para tu empresa. La primera carga usa fechas; las siguientes consultan respuestas incrementales por ResponseId. Cada respuesta conserva sus campos dinámicos y enlaces de imágenes."
                 if api_enabled
                 else "Configura la cuenta y al menos un FormId desde Extensiones → DigiForms. Mientras tanto, la carga Excel permanece disponible como respaldo."
             ),
@@ -971,8 +1066,18 @@ async def test_digiforms_data_api(payload: Dict[str, Any] = Body(default_factory
             form_type = configured[0]; form_id = _form_id_for_type(db, company_id, form_type)
         api = _data_api_for_company(db, company_id)
     if not api.is_configured: raise HTTPException(status_code=400, detail="DigiForms Data API no está configurada para esta empresa.")
-    try: result = await api.test_results_connection(form_id, int(payload.get("from_response_id") or 0))
-    except DigiformsDataAPIError as exc: raise HTTPException(status_code=502, detail=str(exc)) from exc
+    with LOCK:
+        db = read_db()
+        initial_start_date, initial_end_date = _initial_sync_dates_for_type(db, company_id, form_type)
+    try:
+        result = await api.test_results_connection(
+            form_id,
+            int(payload.get("from_response_id") or 0),
+            start_date=_safe_text(payload.get("start_date")) or initial_start_date,
+            end_date=_safe_text(payload.get("end_date")) or initial_end_date,
+        )
+    except DigiformsDataAPIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     return {"data": {**result, "form_type": form_type}, "error": None}
 
 
@@ -1012,6 +1117,18 @@ async def cron_sync_from_digiforms_api(x_dataris_cron_secret: Optional[str] = He
             except HTTPException as exc:
                 errors.append({"company_id": company_id, "user_id": user_id, "form_type": form_type, "message": str(exc.detail)})
     return {"data": {"runs": results, "errors": errors, "companies_processed": len(targets)}, "error": None}
+
+
+@router.get("/raw-submissions")
+def list_raw_submissions(form_type: Optional[str] = None, authorization: Optional[str] = Header(default=None)):
+    """Expose preserved dynamic DigiForms payloads for diagnostics and future mappings."""
+    user = _require_user(authorization); user_id = str(user.get("id") or "")
+    with LOCK:
+        db = read_db(); company_id = _company_id_for_user(db, user_id)
+        rows = [dict(row) for row in table(db, "sig_digiforms_raw_submissions") if _same_company_or_legacy_user(row, company_id=company_id, user_id=user_id)]
+        if form_type: rows = [row for row in rows if row.get("form_type") == form_type]
+        rows = sorted(rows, key=lambda row: str(row.get("updated_at") or row.get("created_at") or ""), reverse=True)[:500]
+    return {"data": rows, "error": None, "count": len(rows)}
 
 
 @router.get("/imports")
