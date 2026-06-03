@@ -136,6 +136,8 @@ def safe_mapping(mapping: Dict[str, Any]) -> Dict[str, Any]:
         "form_id": mapping.get("form_id"),
         "is_enabled": mapping.get("is_enabled", True) is not False,
         "initial_response_id": int(mapping.get("initial_response_id") or 0),
+        "initial_sync_start_date": mapping.get("initial_sync_start_date"),
+        "initial_sync_end_date": mapping.get("initial_sync_end_date"),
         "created_at": mapping.get("created_at"),
         "updated_at": mapping.get("updated_at"),
     }
