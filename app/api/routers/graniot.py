@@ -3355,6 +3355,142 @@ def _sources_from_local_row(local: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [source for source in sources if source.get("graniot_wms_url") or source.get("graniot_image_url") or source.get("graniot_wms_access_key") or source.get("graniot_access_key")]
 
 
+def _statistics_mean_value(statistics: Any) -> Optional[float]:
+    def as_float(value: Any) -> Optional[float]:
+        try:
+            number = float(str(value).replace(",", "."))
+            return number if number == number and number not in (float("inf"), float("-inf")) else None
+        except Exception:
+            return None
+
+    if not isinstance(statistics, dict):
+        return None
+
+    for key in ("ndvi_mean", "mean_ndvi", "average_ndvi", "avg_ndvi", "mean", "average"):
+        value = as_float(statistics.get(key))
+        if value is not None:
+            return value
+
+    rows = statistics.get("data")
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            basic_stats = row.get("basicStats")
+            if isinstance(basic_stats, list):
+                for item in basic_stats:
+                    if isinstance(item, dict):
+                        for key in ("mean", "average", "avg", "value"):
+                            value = as_float(item.get(key))
+                            if value is not None:
+                                return value
+            for key in ("mean", "average", "avg", "value"):
+                value = as_float(row.get(key))
+                if value is not None:
+                    return value
+    return None
+
+
+def _persist_satellite_analysis_record(
+    *,
+    user_id: str,
+    local_parcel_id: str,
+    local: Dict[str, Any],
+    resolved_date: Optional[str],
+    resolved_layer: Dict[str, Any],
+    overlays: List[Dict[str, Any]],
+    statistics: Any,
+    warnings: List[str],
+    sources: List[Dict[str, Any]],
+    render_sources: List[Dict[str, Any]],
+    available_resolution_ids: List[int],
+) -> None:
+    layer_name = str(resolved_layer.get("wms_layer") or resolved_layer.get("family") or DEFAULT_NDVI_WMS_LAYER)
+    image_date = resolved_date or datetime.now(timezone.utc).date().isoformat()
+    analysis_key = _stable_hash({
+        "parcel_id": local_parcel_id,
+        "image_date": image_date,
+        "layer": layer_name,
+        "resolution_id": resolved_layer.get("resolution_id"),
+        "overlay_ids": [item.get("id") for item in overlays],
+    })
+    t = now()
+    ndvi_mean = _statistics_mean_value(statistics)
+    status = "completed" if overlays else "failed"
+    object_path = overlays[0].get("image_url") if overlays else f"graniot/map-layer/{analysis_key}.png"
+    bounds = overlays[0].get("bounds") if overlays else local.get("geometry_bounds") or local.get("bounds") or local.get("bbox")
+    compared_images = [
+        {
+            "overlay_id": overlay.get("id"),
+            "graniot_parcel_id": overlay.get("graniot_parcel_id"),
+            "image_url": overlay.get("image_url"),
+            "bounds": overlay.get("bounds"),
+            "date": overlay.get("date") or image_date,
+            "layer": overlay.get("layer") or layer_name,
+            "source": overlay.get("source"),
+        }
+        for overlay in overlays
+    ]
+
+    record = {
+        "user_id": user_id,
+        "parcel_id": local_parcel_id,
+        "image_date": image_date,
+        "index_type": layer_name,
+        "index": layer_name,
+        "image_object_path": object_path,
+        "processing_status": status,
+        "status": status,
+        "bounds": bounds,
+        "statistics": statistics if isinstance(statistics, dict) else {},
+        "ndvi_mean": ndvi_mean,
+        "average_ndvi": ndvi_mean,
+        "source": "graniot-map-layer",
+        "analysis_key": analysis_key,
+        "analysis_type": "satellite_vegetation_health",
+        "analysis_payload": {
+            "date": image_date,
+            "layer": resolved_layer,
+            "overlays": compared_images,
+            "warnings": warnings,
+            "source_count": len(render_sources),
+            "available_resolution_ids": available_resolution_ids,
+            "source_parcels": [
+                {
+                    "graniot_parcel_id": source.get("graniot_parcel_id"),
+                    "graniot_parcel_key": source.get("graniot_parcel_key"),
+                    "last_image_date": _date_from_graniot_sources([source], resolved_layer.get("resolution_id")),
+                }
+                for source in sources
+            ],
+            "parcel": {
+                "id": local.get("id"),
+                "name": local.get("name") or local.get("lote") or local.get("finca"),
+                "area": local.get("area"),
+            },
+        },
+        "updated_at": t,
+    }
+
+    with LOCK:
+        db = read_db()
+        rows = table(db, "satellite_images")
+        existing = next(
+            (
+                row for row in rows
+                if str(row.get("user_id") or "") == str(user_id)
+                and str(row.get("parcel_id") or "") == str(local_parcel_id)
+                and row.get("analysis_key") == analysis_key
+            ),
+            None,
+        )
+        if existing:
+            existing.update(record)
+        else:
+            rows.append({"id": str(uuid.uuid4()), "created_at": t, **record})
+        write_db(db)
+
+
 async def _attempt_auto_sync_for_map_layer(
     *,
     local_parcel_id: str,
@@ -3412,8 +3548,10 @@ async def _attempt_auto_sync_for_map_layer(
         return []
 
 @router.get("/parcels/{local_parcel_id}/ndvi/map-layer")
+@router.post("/parcels/{local_parcel_id}/ndvi/map-layer")
 async def get_local_parcel_ndvi_map_layer(
     local_parcel_id: str,
+    payload: Optional[Dict[str, Any]] = Body(default=None),
     layer_key: str = Query(default=DEFAULT_NDVI_LAYER_KEY),
     wms_layer: str = Query(default=DEFAULT_NDVI_WMS_LAYER),
     resolution_id: int = Query(default=DEFAULT_NDVI_RESOLUTION_ID),
@@ -3427,11 +3565,38 @@ async def get_local_parcel_ndvi_map_layer(
     authorization: Optional[str] = Header(default=None),
 ):
     user = _require_user(authorization)
+    payload = payload or {}
+    layer_key = str(payload.get("layer_key") or payload.get("layerKey") or layer_key or DEFAULT_NDVI_LAYER_KEY)
+    wms_layer = str(payload.get("wms_layer") or payload.get("wmsLayer") or wms_layer or DEFAULT_NDVI_WMS_LAYER)
+    try:
+        resolution_id = int(payload.get("resolution_id") or payload.get("resolutionId") or resolution_id or DEFAULT_NDVI_RESOLUTION_ID)
+    except Exception:
+        resolution_id = DEFAULT_NDVI_RESOLUTION_ID
+    resolution_key = str(payload.get("resolution_key") or payload.get("resolutionKey") or resolution_key or DEFAULT_NDVI_RESOLUTION_KEY)
+    date = payload.get("date") or date
+    try:
+        width = int(payload.get("width") or width)
+        height = int(payload.get("height") or height)
+    except Exception:
+        width = height = 1024
+    try:
+        maxcc = float(payload.get("maxcc") if payload.get("maxcc") is not None else maxcc)
+    except Exception:
+        maxcc = 100
+    if "include_statistics" in payload or "includeStatistics" in payload:
+        include_statistics = bool(payload.get("include_statistics", payload.get("includeStatistics")))
+    if "auto_sync" in payload or "autoSync" in payload:
+        auto_sync = bool(payload.get("auto_sync", payload.get("autoSync")))
+    force_refresh = bool(payload.get("force_refresh") or payload.get("forceRefresh"))
+
     with LOCK:
         db = read_db()
         local = next((p for p in table(db, "parcels") if p.get("id") == local_parcel_id and p.get("user_id") == user["id"]), None)
     if not local:
         raise HTTPException(status_code=404, detail="Lote local no encontrado")
+    if payload.get("geometry"):
+        local = dict(local)
+        local["geometry"] = payload.get("geometry")
 
     client = GraniotClient()
     warnings: List[str] = []
@@ -3451,8 +3616,9 @@ async def get_local_parcel_ndvi_map_layer(
         "include_statistics": include_statistics,
         "local_updated_at": local.get("updated_at"),
         "graniot_synced_at": local.get("graniot_synced_at"),
+        "geometry_hash": _stable_hash(payload.get("geometry")) if payload.get("geometry") else None,
     })
-    cached_map_layer = _cache_get(map_cache_key)
+    cached_map_layer = None if force_refresh else _cache_get(map_cache_key)
     if cached_map_layer is not None:
         cached_copy = json.loads(json.dumps(cached_map_layer, default=str))
         cached_copy.setdefault("data", {}).setdefault("cache", {})["status"] = "HIT"
@@ -3551,6 +3717,21 @@ async def get_local_parcel_ndvi_map_layer(
     if not overlays:
         warnings.append("Graniot devolvió el lote, pero no hay access_key o bounds válidos para construir la imagen WMS.")
 
+    available_resolution_ids = sorted(_available_resolution_ids_with_images(sources))
+    _persist_satellite_analysis_record(
+        user_id=str(user["id"]),
+        local_parcel_id=local_parcel_id,
+        local=local,
+        resolved_date=resolved_date,
+        resolved_layer=resolved_layer,
+        overlays=overlays,
+        statistics=statistics,
+        warnings=warnings,
+        sources=sources,
+        render_sources=render_sources,
+        available_resolution_ids=available_resolution_ids,
+    )
+
     response_payload = {
         "data": {
             "available": bool(overlays),
@@ -3569,7 +3750,7 @@ async def get_local_parcel_ndvi_map_layer(
             "statistics": statistics,
             "warnings": warnings,
             "source_count": len(render_sources),
-            "available_resolution_ids": sorted(_available_resolution_ids_with_images(sources)),
+            "available_resolution_ids": available_resolution_ids,
             "cache": {"status": "MISS", "ttl_seconds": GRANIOT_MAP_LAYER_CACHE_TTL_SECONDS},
         },
         "error": None,
