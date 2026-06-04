@@ -438,7 +438,10 @@ def statistics_series(
                 "statistics": result.get("statistics") or {},
                 "source": result.get("source"),
                 "coverage_percent": result.get("coverage_percent"),
+                "unavailable_percent": result.get("unavailable_percent"),
                 "is_partial": bool(result.get("is_partial", False)),
+                "quality_placeholder_applied": bool(result.get("quality_placeholder_applied", False)),
+                "quality_mask_applied": bool(result.get("quality_mask_applied", False)),
                 "source_count": result.get("source_count", 1),
             })
             if len(points) >= limit:
@@ -523,11 +526,19 @@ def _build_map_layer_response(
         }
 
     coverage_percent = result.get("coverage_percent")
+    unavailable_percent = result.get("unavailable_percent")
     is_partial = bool(result.get("is_partial", False))
+    quality_placeholder_applied = bool(result.get("quality_placeholder_applied", False))
+    quality_mask_applied = bool(result.get("quality_mask_applied", False))
     warnings = list(result.get("warnings") or [])
     if is_partial:
         coverage_label = f"{float(coverage_percent or 0):.2f}%"
-        warnings.insert(0, f"Cobertura satelital parcial: {coverage_label} del lote tiene píxeles Sentinel-2 válidos para esta fecha.")
+        unavailable_label = f"{float(unavailable_percent or 0):.2f}%"
+        warnings.insert(
+            0,
+            f"Cobertura utilizable parcial: {coverage_label} del lote contiene píxeles Sentinel-2 válidos. "
+            f"El {unavailable_label} restante se muestra en gris y no participa en las estadísticas.",
+        )
 
     persisted = _persist_generated_layer(
         parcel=parcel,
@@ -547,7 +558,10 @@ def _build_map_layer_response(
         "layer": index_key,
         "source": result.get("source", "sentinel-2-l2a-mosaic"),
         "coverage_percent": coverage_percent,
+        "unavailable_percent": unavailable_percent,
         "is_partial": is_partial,
+        "quality_placeholder_applied": quality_placeholder_applied,
+        "quality_mask_applied": quality_mask_applied,
     }
     return _json_safe({
         "data": {
@@ -580,7 +594,10 @@ def _build_map_layer_response(
             "source_count": result.get("source_count", 1),
             "scene_ids": result.get("scene_ids") or [],
             "coverage_percent": coverage_percent,
+            "unavailable_percent": unavailable_percent,
             "is_partial": is_partial,
+            "quality_placeholder_applied": quality_placeholder_applied,
+            "quality_mask_applied": quality_mask_applied,
             "processing_version": result.get("processing_version"),
             "history_id": (persisted or {}).get("id"),
             "analysis_key": (persisted or {}).get("analysis_key"),

@@ -120,7 +120,10 @@ def _overlay_from_side(side: dict[str, Any], suffix: str = "") -> dict[str, Any]
         "layer": overlay.get("layer") or side.get("index_type") or side.get("index"),
         "source": overlay.get("source") or side.get("source") or "sentinel2-comparison",
         "coverage_percent": overlay.get("coverage_percent") if overlay.get("coverage_percent") is not None else side.get("coverage_percent"),
+        "unavailable_percent": overlay.get("unavailable_percent") if overlay.get("unavailable_percent") is not None else side.get("unavailable_percent"),
         "is_partial": bool(overlay.get("is_partial", side.get("is_partial", False))),
+        "quality_placeholder_applied": bool(overlay.get("quality_placeholder_applied", side.get("quality_placeholder_applied", False))),
+        "quality_mask_applied": bool(overlay.get("quality_mask_applied", side.get("quality_mask_applied", False))),
     }
 
 
@@ -141,7 +144,10 @@ def _public_layer_record(row: dict[str, Any]) -> dict[str, Any]:
         "layer": overlay.get("layer") or record.get("index_type") or record.get("index"),
         "source": overlay.get("source") or record.get("source"),
         "coverage_percent": overlay.get("coverage_percent") if overlay.get("coverage_percent") is not None else record.get("coverage_percent"),
+        "unavailable_percent": overlay.get("unavailable_percent") if overlay.get("unavailable_percent") is not None else record.get("unavailable_percent"),
         "is_partial": bool(overlay.get("is_partial", record.get("is_partial", False))),
+        "quality_placeholder_applied": bool(overlay.get("quality_placeholder_applied", record.get("quality_placeholder_applied", False))),
+        "quality_mask_applied": bool(overlay.get("quality_mask_applied", record.get("quality_mask_applied", False))),
     }
     return _json_safe(record)
 
@@ -171,7 +177,14 @@ def _normalize_comparison_side(raw: Any, *, label: str) -> Optional[dict[str, An
         coverage_percent = map_layer.get("coverage_percent")
     if coverage_percent is None:
         coverage_percent = overlay.get("coverage_percent")
+    unavailable_percent = raw.get("unavailable_percent")
+    if unavailable_percent is None:
+        unavailable_percent = map_layer.get("unavailable_percent")
+    if unavailable_percent is None:
+        unavailable_percent = overlay.get("unavailable_percent")
     is_partial = bool(raw.get("is_partial", map_layer.get("is_partial", overlay.get("is_partial", False))))
+    quality_placeholder_applied = bool(raw.get("quality_placeholder_applied", map_layer.get("quality_placeholder_applied", overlay.get("quality_placeholder_applied", False))))
+    quality_mask_applied = bool(raw.get("quality_mask_applied", map_layer.get("quality_mask_applied", overlay.get("quality_mask_applied", False))))
     mean_value = _mean_value(statistics)
     ndvi_mean = mean_value if index_type == "NDVI" else None
     source_count = raw.get("source_count") if raw.get("source_count") is not None else map_layer.get("source_count")
@@ -185,7 +198,10 @@ def _normalize_comparison_side(raw: Any, *, label: str) -> Optional[dict[str, An
         "layer": index_type,
         "source": overlay.get("source") or raw.get("source") or "sentinel2-comparison",
         "coverage_percent": coverage_percent,
+        "unavailable_percent": unavailable_percent,
         "is_partial": is_partial,
+        "quality_placeholder_applied": quality_placeholder_applied,
+        "quality_mask_applied": quality_mask_applied,
     }
     return _json_safe(
         {
@@ -201,7 +217,10 @@ def _normalize_comparison_side(raw: Any, *, label: str) -> Optional[dict[str, An
             "average_ndvi": ndvi_mean,
             "cloud_coverage": raw.get("cloud_coverage") if raw.get("cloud_coverage") is not None else map_layer.get("cloud_coverage"),
             "coverage_percent": coverage_percent,
+            "unavailable_percent": unavailable_percent,
             "is_partial": is_partial,
+            "quality_placeholder_applied": quality_placeholder_applied,
+            "quality_mask_applied": quality_mask_applied,
             "source_count": source_count or 1,
             "scene_ids": scene_ids,
             "processing_version": processing_version,
@@ -267,7 +286,10 @@ def _public_comparison_record(row: dict[str, Any]) -> dict[str, Any]:
             "average_ndvi": representative.get("ndvi_mean") if representative.get("ndvi_mean") is not None else record.get("average_ndvi"),
             "cloud_coverage": representative.get("cloud_coverage") if representative.get("cloud_coverage") is not None else record.get("cloud_coverage"),
             "coverage_percent": representative.get("coverage_percent") if representative.get("coverage_percent") is not None else record.get("coverage_percent"),
+            "unavailable_percent": representative.get("unavailable_percent") if representative.get("unavailable_percent") is not None else record.get("unavailable_percent"),
             "is_partial": bool(representative.get("is_partial", record.get("is_partial", False))),
+            "quality_placeholder_applied": bool(representative.get("quality_placeholder_applied", record.get("quality_placeholder_applied", False))),
+            "quality_mask_applied": bool(representative.get("quality_mask_applied", record.get("quality_mask_applied", False))),
             "overlay": overlay,
             "overlays": overlays,
             "comparison": {
@@ -333,7 +355,10 @@ def persist_satellite_analysis_record(
         "layer": normalized_index,
         "source": result.get("source") or source,
         "coverage_percent": result.get("coverage_percent"),
+        "unavailable_percent": result.get("unavailable_percent"),
         "is_partial": bool(result.get("is_partial", False)),
+        "quality_placeholder_applied": bool(result.get("quality_placeholder_applied", False)),
+        "quality_mask_applied": bool(result.get("quality_mask_applied", False)),
     }
     record = {
         "user_id": str(user_id),
@@ -351,7 +376,10 @@ def persist_satellite_analysis_record(
         "ndvi_mean": ndvi_mean,
         "average_ndvi": ndvi_mean,
         "coverage_percent": result.get("coverage_percent"),
+        "unavailable_percent": result.get("unavailable_percent"),
         "is_partial": bool(result.get("is_partial", False)),
+        "quality_placeholder_applied": bool(result.get("quality_placeholder_applied", False)),
+        "quality_mask_applied": bool(result.get("quality_mask_applied", False)),
         "source_count": result.get("source_count", 1),
         "scene_ids": result.get("scene_ids") or [],
         "processing_version": processing_version,
@@ -367,7 +395,10 @@ def persist_satellite_analysis_record(
             "source_count": result.get("source_count", 1),
             "scene_ids": result.get("scene_ids") or [],
             "coverage_percent": result.get("coverage_percent"),
+            "unavailable_percent": result.get("unavailable_percent"),
             "is_partial": bool(result.get("is_partial", False)),
+            "quality_placeholder_applied": bool(result.get("quality_placeholder_applied", False)),
+            "quality_mask_applied": bool(result.get("quality_mask_applied", False)),
             "processing_version": processing_version,
             "parcel": {
                 "id": parcel_id,
@@ -499,7 +530,10 @@ def persist_satellite_comparison_record(
         "average_ndvi": representative.get("ndvi_mean"),
         "cloud_coverage": representative.get("cloud_coverage"),
         "coverage_percent": representative.get("coverage_percent"),
+        "unavailable_percent": representative.get("unavailable_percent"),
         "is_partial": bool(representative.get("is_partial", False)),
+        "quality_placeholder_applied": bool(representative.get("quality_placeholder_applied", False)),
+        "quality_mask_applied": bool(representative.get("quality_mask_applied", False)),
         "max_cloud_coverage": max_cloud_coverage,
         "analysis_payload": {
             "left": normalized_left,
