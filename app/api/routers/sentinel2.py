@@ -17,8 +17,10 @@ from app.models.satellite_image import ProcessingStatus, SatelliteImage
 from app.api.routers import compat as compat_store
 from app.services.sentinel2.history import (
     list_satellite_analysis_history,
+    list_satellite_comparison_history,
     persist_satellite_analysis_record,
-    summarize_satellite_analysis_history,
+    persist_satellite_comparison_record,
+    summarize_satellite_comparison_history,
 )
 from app.services.sentinel2.indices import INDEX_DEFINITIONS, normalize_index_key
 from app.utils.storage_satellite import download_satellite_cache_png_bytes
@@ -179,7 +181,7 @@ def history(
     limit: int = Query(100, ge=1, le=500),
     current_user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
-    data = list_satellite_analysis_history(
+    data = list_satellite_comparison_history(
         user_id=_user_id(current_user),
         parcel_id=parcel_id,
         index_type=index_type,
@@ -188,12 +190,38 @@ def history(
     return {"data": data, "count": len(data)}
 
 
+@router.post("/history/comparisons")
+def save_comparison(
+    payload: dict[str, Any],
+    db: Session = Depends(get_db),
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    parcel_id = str(payload.get("parcel_id") or "").strip()
+    if not parcel_id:
+        raise HTTPException(status_code=422, detail="Selecciona un lote antes de guardar la comparación.")
+    parcel = _get_owned_parcel(db, parcel_id, current_user)
+    left = payload.get("left")
+    right = payload.get("right")
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        raise HTTPException(status_code=422, detail="La comparación debe incluir las dos imágenes revisadas.")
+    record = persist_satellite_comparison_record(
+        user_id=_user_id(current_user),
+        parcel=parcel,
+        left=left,
+        right=right,
+        max_cloud_coverage=payload.get("max_cloud_coverage"),
+    )
+    if not record:
+        raise HTTPException(status_code=422, detail="Las dos imágenes deben estar disponibles antes de guardar la comparación.")
+    return {"data": record}
+
+
 @router.get("/history/summary")
 def history_summary(
     parcel_id: Optional[str] = Query(None),
     current_user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
-    return {"data": summarize_satellite_analysis_history(user_id=_user_id(current_user), parcel_id=parcel_id)}
+    return {"data": summarize_satellite_comparison_history(user_id=_user_id(current_user), parcel_id=parcel_id)}
 
 
 @router.get("/parcels/{parcel_id}/history")
@@ -205,7 +233,7 @@ def parcel_history(
     current_user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     _get_owned_parcel(db, parcel_id, current_user)
-    data = list_satellite_analysis_history(
+    data = list_satellite_comparison_history(
         user_id=_user_id(current_user),
         parcel_id=str(parcel_id),
         index_type=index_type,

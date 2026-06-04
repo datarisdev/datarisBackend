@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
 from app.api.routers.compat import read_db, table
+from app.services.sentinel2.history import representative_satellite_comparison_side, satellite_comparison_sides
 from app.api.routers.dashboard import (
     _aircraft_type,
     _as_datetime,
@@ -234,22 +235,43 @@ def _satellite_layers(rows: List[Dict[str, Any]], parcels: Dict[str, Dict[str, A
     layers: List[Dict[str, Any]] = []
     for row in rows:
         parcel = parcels.get(str(row.get("parcel_id") or ""))
-        image_url = _first(row.get("image_url"), row.get("url"), row.get("signed_url"), row.get("public_url"))
+        side = representative_satellite_comparison_side(row)
+        sides = satellite_comparison_sides(row)
+        left = sides[0] if sides else {}
+        right = sides[1] if len(sides) > 1 else {}
+        image_url = _first(side.get("image_url"), row.get("image_url"), row.get("url"), row.get("signed_url"), row.get("public_url"))
         geometry = _normalize_geojson(_geometry(row)) or _normalize_geojson(_geometry(parcel or {}))
+        left_label = f"{left.get('index_type') or 'Índice'} {left.get('image_date') or ''}".strip()
+        right_label = f"{right.get('index_type') or 'Índice'} {right.get('image_date') or ''}".strip()
+        comparison_label = f"{left_label} vs {right_label}" if right else left_label
         layers.append(
             _layer(
                 id=f"satellite:{row.get('id')}",
                 source="satellite",
-                source_label="Satélite",
-                title=f"{row.get('index_type') or row.get('index') or 'Índice'} - {_parcel_name(parcel) or 'Sin lote'}",
-                subtitle=f"Nubosidad {row.get('cloud_coverage')}%" if row.get("cloud_coverage") is not None else _parcel_name(parcel),
-                date=_date_value(row, "image_date", "created_at"),
+                source_label="Comparaciones satelitales",
+                title=f"{comparison_label} - {_parcel_name(parcel) or 'Sin lote'}",
+                subtitle=f"Comparación guardada · {comparison_label}",
+                date=_date_value(row, "compared_at", "updated_at", "created_at"),
                 status=_status(row),
                 geometry=geometry,
-                bounds=_bounds(row) or _bounds(parcel or {}),
-                center=_center(row) or _center(parcel or {}),
-                metrics={"Nubosidad": row.get("cloud_coverage"), "Índice": row.get("index_type") or row.get("index")},
-                metadata={"parcel_id": row.get("parcel_id"), "image_url": image_url, "raw_id": row.get("id")},
+                bounds=_bounds(side) or _bounds(row) or _bounds(parcel or {}),
+                center=_center(side) or _center(row) or _center(parcel or {}),
+                metrics={
+                    "Comparación": comparison_label,
+                    "Cobertura": side.get("coverage_percent"),
+                    "Nubosidad": side.get("cloud_coverage"),
+                },
+                metadata={
+                    "parcel_id": row.get("parcel_id"),
+                    "image_url": image_url,
+                    "comparison": {
+                        "left_date": left.get("image_date"),
+                        "right_date": right.get("image_date"),
+                        "left_index": left.get("index_type"),
+                        "right_index": right.get("index_type"),
+                    },
+                    "raw_id": row.get("id"),
+                },
             )
         )
     return layers
@@ -285,7 +307,7 @@ def build_work_area_layers_response(
         ]
         layers.extend(_mapeo_layers(sessions, points, parcel_by_id, max_points_per_layer))
     if "satellite" in wanted:
-        layers.extend(_satellite_layers(_scoped_rows(db, "satellite_images", user_id, admin_mode), parcel_by_id))
+        layers.extend(_satellite_layers(_scoped_rows(db, "satellite_comparisons", user_id, admin_mode), parcel_by_id))
 
     layers = sorted(layers, key=_sort_key, reverse=True)[:limit]
     counts: Dict[str, int] = {}
