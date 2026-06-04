@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 CACHE_DIR = Path(os.getenv("SENTINEL_LOCAL_CACHE_DIR", str(Path(tempfile.gettempdir()) / "dataris_sentinel2_cache")))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
-SENTINEL_CACHE_URL_VERSION = os.getenv("SENTINEL_CACHE_URL_VERSION", "sentinel-gcs-20260531-mosaic-1")
+SENTINEL_CACHE_URL_VERSION = os.getenv("SENTINEL_CACHE_URL_VERSION", "sentinel-gcs-20260604-quality-mosaic-2")
 
 
 DEFAULT_MAX_CLOUD = float(os.getenv("SENTINEL_DEFAULT_MAX_CLOUD", "80"))
@@ -52,9 +52,11 @@ DATE_LOOKBACK_DAYS = int(os.getenv("SENTINEL_DATE_LOOKBACK_DAYS", "180"))
 MAP_LOOKBACK_DAYS = int(os.getenv("SENTINEL_MAP_LOOKBACK_DAYS", "90"))
 DB_CACHE_ENABLED = os.getenv("SENTINEL_DB_CACHE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 MASK_ALL_TOUCHED = os.getenv("SENTINEL_MASK_ALL_TOUCHED", "true").strip().lower() not in {"0", "false", "no", "off"}
-MAX_MOSAIC_SCENES = max(1, int(os.getenv("SENTINEL_MAX_MOSAIC_SCENES", "12")))
+MAX_MOSAIC_SCENES = max(1, int(os.getenv("SENTINEL_MAX_MOSAIC_SCENES", "24")))
 MAX_MOSAIC_GRID_SIZE = max(256, int(os.getenv("SENTINEL_MAX_MOSAIC_GRID_SIZE", "4096")))
-MOSAIC_PROCESSING_VERSION = "sentinel2-mosaic-v1"
+MOSAIC_CATALOG_LIMIT = max(MAX_MOSAIC_SCENES, int(os.getenv("SENTINEL_MOSAIC_CATALOG_LIMIT", "240")))
+MOSAIC_PROCESSING_VERSION = "sentinel2-quality-mosaic-v2"
+SCL_UNAVAILABLE_CLASSES = frozenset({0, 1, 3, 8, 9, 10, 11})
 
 RASTERIO_ENV = {
     "AWS_NO_SIGN_REQUEST": os.getenv("AWS_NO_SIGN_REQUEST", "YES"),
@@ -467,20 +469,19 @@ def _build_mosaic_grid(parcel_geometry: dict, resolution: str | int | float | No
     }
 
 
-def _merge_scene_band(
+def _reproject_scene_band(
     scene: SentinelScene,
     band: str,
-    destination: np.ndarray,
     meta: dict[str, Any],
-) -> bool:
-    """Fill only missing mosaic cells from one scene band.
+) -> np.ndarray:
+    """Reproject one STAC asset into the common parcel grid.
 
-    Scenes are ordered by cloud cover, so lower-cloud tiles win in overlap
-    areas while the remaining tiles fill gaps at MGRS boundaries.
+    Reflectance bands use bilinear interpolation. SCL is categorical and must
+    use nearest-neighbour interpolation so cloud classes are not blended.
     """
     signed_item = sign_item_if_needed(scene.item)
     href = _asset_href(signed_item, band)
-    tile = np.full(destination.shape, np.nan, dtype="float32")
+    tile = np.full((int(meta["height"]), int(meta["width"])), np.nan, dtype="float32")
     with rasterio.Env(**RASTERIO_ENV):
         with rasterio.open(normalize_asset_href(href)) as src:
             reproject(
@@ -492,17 +493,85 @@ def _merge_scene_band(
                 dst_transform=meta["transform"],
                 dst_crs=meta["crs"],
                 dst_nodata=np.nan,
-                resampling=Resampling.bilinear,
+                resampling=Resampling.nearest if band == "scl" else Resampling.bilinear,
                 init_dest_nodata=True,
                 num_threads=2,
             )
-    valid = np.isfinite(tile)
-    missing = ~np.isfinite(destination)
-    take = valid & missing
-    if np.any(take):
-        destination[take] = tile[take]
-        return True
-    return False
+    return tile
+
+
+def _scl_usable_mask(scl: np.ndarray) -> np.ndarray:
+    """Return usable Sentinel-2 L2A pixels from the Scene Classification Layer.
+
+    The excluded classes are no-data, saturated/defective pixels, cloud shadow,
+    medium/high probability cloud, cirrus and snow/ice. Water and bare soil stay
+    valid because they are real observations and may matter for NDWI/NDMI.
+    """
+    finite = np.isfinite(scl)
+    classes = np.full(scl.shape, -1, dtype="int16")
+    if np.any(finite):
+        classes[finite] = np.rint(scl[finite]).astype("int16")
+    return finite & ~np.isin(classes, tuple(SCL_UNAVAILABLE_CLASSES))
+
+
+def _merge_scene_into_mosaic(
+    scene: SentinelScene,
+    bands: tuple[str, ...],
+    destinations: dict[str, np.ndarray],
+    meta: dict[str, Any],
+) -> tuple[bool, bool, list[str]]:
+    """Fill missing mosaic cells from one scene without mixing invalid pixels.
+
+    A complete set of required bands is loaded first. When SCL exists, cloudy or
+    otherwise unusable pixels are discarded before merge so a later same-day
+    tile can fill the overlap with a cleaner observation.
+    """
+    warnings: list[str] = []
+    scene_bands: dict[str, np.ndarray] = {}
+    for band in bands:
+        try:
+            scene_bands[band] = _reproject_scene_band(scene, band, meta)
+        except Exception as exc:
+            warnings.append(f"{scene.id} · {band}: {exc}")
+            logger.warning("No se pudo incorporar banda %s de escena %s al mosaico: %s", band, scene.id, exc)
+            return False, False, warnings
+
+    valid = np.ones((int(meta["height"]), int(meta["width"])), dtype=bool)
+    for tile in scene_bands.values():
+        valid &= np.isfinite(tile)
+
+    quality_mask_applied = False
+    try:
+        scl = _reproject_scene_band(scene, "scl", meta)
+        valid &= _scl_usable_mask(scl)
+        quality_mask_applied = True
+    except Exception as exc:
+        # Some compatible STAC providers do not expose SCL. The image remains
+        # usable, but callers receive a warning so quality expectations are clear.
+        warnings.append(f"{scene.id} · SCL no disponible: {exc}")
+        logger.info("SCL no disponible para escena %s: %s", scene.id, exc)
+
+    existing = np.ones(valid.shape, dtype=bool)
+    for destination in destinations.values():
+        existing &= np.isfinite(destination)
+    take = valid & ~existing
+    if not np.any(take):
+        return False, quality_mask_applied, warnings
+
+    for band, tile in scene_bands.items():
+        destinations[band][take] = tile[take]
+    return True, quality_mask_applied, warnings
+
+
+def _dedupe_warnings(warnings: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for warning in warnings:
+        normalized = str(warning).strip()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            unique.append(normalized)
+    return unique
 
 
 def _load_required_bands_mosaic(
@@ -510,8 +579,12 @@ def _load_required_bands_mosaic(
     parcel_geometry: dict,
     bands: tuple[str, ...],
     resolution: str | int | float | None,
-) -> tuple[dict[str, np.ndarray], dict[str, Any], list[str], list[str]]:
-    """Load bands from all intersecting same-day tiles into a single grid."""
+) -> tuple[dict[str, np.ndarray], dict[str, Any], list[str], list[str], int]:
+    """Load all same-day tiles into one parcel grid with optional SCL masking.
+
+    Missing observations intentionally remain NaN. The renderer later paints
+    those NaNs in neutral gray inside the lot instead of leaving visual holes.
+    """
     if not scenes:
         raise ValueError("No se encontraron escenas Sentinel-2 para construir el mosaico")
 
@@ -519,24 +592,21 @@ def _load_required_bands_mosaic(
     loaded = {band: np.full((int(meta["height"]), int(meta["width"])), np.nan, dtype="float32") for band in bands}
     used_scene_ids: set[str] = set()
     warnings: list[str] = []
+    quality_mask_scene_count = 0
 
     for scene in scenes[:MAX_MOSAIC_SCENES]:
-        scene_used = False
-        for band in bands:
-            try:
-                if _merge_scene_band(scene, band, loaded[band], meta):
-                    scene_used = True
-            except Exception as exc:
-                warnings.append(f"{scene.id} · {band}: {exc}")
-                logger.warning("No se pudo incorporar banda %s de escena %s al mosaico: %s", band, scene.id, exc)
+        scene_used, quality_mask_applied, scene_warnings = _merge_scene_into_mosaic(scene, bands, loaded, meta)
+        warnings.extend(scene_warnings)
+        if quality_mask_applied:
+            quality_mask_scene_count += 1
         if scene_used:
             used_scene_ids.add(scene.id)
 
     missing_bands = [band for band, arr in loaded.items() if not np.any(np.isfinite(arr))]
     if missing_bands:
-        raise ValueError(f"No se pudieron cargar bandas Sentinel-2 para el mosaico: {', '.join(missing_bands)}")
+        warnings.insert(0, f"No se encontraron píxeles utilizables para: {', '.join(missing_bands)}. El lote se mostrará en gris.")
 
-    return normalize_band_values(loaded), meta, sorted(used_scene_ids), warnings
+    return normalize_band_values(loaded), meta, sorted(used_scene_ids), _dedupe_warnings(warnings), quality_mask_scene_count
 
 
 def _inside_geometry_mask(meta: dict[str, Any], parcel_geometry: Any) -> np.ndarray:
@@ -552,23 +622,34 @@ def _inside_geometry_mask(meta: dict[str, Any], parcel_geometry: Any) -> np.ndar
     )
 
 
-def _coverage_summary(arr: np.ndarray, meta: dict[str, Any], parcel_geometry: Any) -> dict[str, Any]:
-    inside = _inside_geometry_mask(meta, parcel_geometry)
+def _coverage_summary(
+    arr: np.ndarray,
+    meta: dict[str, Any],
+    parcel_geometry: Any,
+    *,
+    inside: np.ndarray | None = None,
+) -> dict[str, Any]:
+    inside_mask = inside if inside is not None else _inside_geometry_mask(meta, parcel_geometry)
     valid = np.all(np.isfinite(arr), axis=0) if arr.ndim == 3 else np.isfinite(arr)
-    total_pixels = int(np.count_nonzero(inside))
-    valid_pixels = int(np.count_nonzero(valid & inside))
+    total_pixels = int(np.count_nonzero(inside_mask))
+    valid_pixels = int(np.count_nonzero(valid & inside_mask))
+    unavailable_pixels = max(total_pixels - valid_pixels, 0)
     coverage_percent = round((valid_pixels / total_pixels) * 100, 2) if total_pixels else 0.0
+    unavailable_percent = round((unavailable_pixels / total_pixels) * 100, 2) if total_pixels else 0.0
     return {
         "coverage_percent": coverage_percent,
+        "unavailable_percent": unavailable_percent,
         "is_partial": coverage_percent < 99.5,
+        "quality_placeholder_applied": unavailable_pixels > 0,
         "valid_pixels": valid_pixels,
+        "unavailable_pixels": unavailable_pixels,
         "total_parcel_pixels": total_pixels,
     }
 
 
 def _cache_key(*, user_id: str, parcel_id: str, index_key: str, image_date: str, width: int, height: int, geometry_hash: str = "") -> str:
     payload = {
-        "v": 9,
+        "v": 10,
         "geometry_hash": geometry_hash,
         "user_id": user_id,
         "parcel_id": parcel_id,
@@ -710,7 +791,10 @@ def generate_or_get_layer(
             "object_path": cached.image_object_path,
             "source": "cache",
             "coverage_percent": cached_stats.get("coverage_percent"),
+            "unavailable_percent": cached_stats.get("unavailable_percent"),
             "is_partial": bool(cached_stats.get("is_partial", False)),
+            "quality_placeholder_applied": bool(cached_stats.get("quality_placeholder_applied", False)),
+            "quality_mask_applied": bool(cached_stats.get("quality_mask_applied", False)),
             "source_count": cached_stats.get("source_count", 1),
             "scene_ids": cached_stats.get("scene_ids") or [],
             "processing_version": MOSAIC_PROCESSING_VERSION,
@@ -725,7 +809,11 @@ def generate_or_get_layer(
         }
 
     image_date = primary_scene.datetime.date()
-    scenes = scenes_for_date(bbox=bbox, target_date=image_date, max_cloud=max_cloud, limit=max(40, MAX_MOSAIC_SCENES * 4))
+    # Once the date is chosen, collect every intersecting same-day tile even if
+    # one tile exceeds the cloud threshold. Excluding a cloudy boundary tile
+    # creates a transparent half-lot. SCL masking below marks its unusable pixels
+    # in gray while retaining any valid observations.
+    scenes = scenes_for_date(bbox=bbox, target_date=image_date, max_cloud=None, limit=MOSAIC_CATALOG_LIMIT)
     if not scenes:
         scenes = [primary_scene]
     cache_key = _cache_key(
@@ -767,11 +855,14 @@ def generate_or_get_layer(
             "scene_ids": cached_meta.get("scene_ids") or [primary_scene.id],
             "source_count": cached_meta.get("source_count") or 1,
             "coverage_percent": cached_meta.get("coverage_percent"),
+            "unavailable_percent": cached_meta.get("unavailable_percent"),
             "is_partial": bool(cached_meta.get("is_partial", False)),
+            "quality_placeholder_applied": bool(cached_meta.get("quality_placeholder_applied", False)),
+            "quality_mask_applied": bool(cached_meta.get("quality_mask_applied", False)),
             "processing_version": cached_meta.get("processing_version") or MOSAIC_PROCESSING_VERSION,
         })
 
-    bands, _meta, used_scene_ids, mosaic_warnings = _load_required_bands_mosaic(
+    bands, _meta, used_scene_ids, mosaic_warnings, quality_mask_scene_count = _load_required_bands_mosaic(
         scenes,
         parcel_geometry,
         definition.bands,
@@ -783,16 +874,26 @@ def generate_or_get_layer(
     # caused by displaying a native UTM Sentinel crop as a Leaflet image overlay.
     arr, output_meta, bounds = _reproject_array_to_web_mercator(arr, _meta)
     arr = _apply_precise_geometry_mask(arr, output_meta, parcel_geometry)
-    coverage = _coverage_summary(arr, output_meta, parcel_geometry)
+    inside_mask = _inside_geometry_mask(output_meta, parcel_geometry)
+    coverage = _coverage_summary(arr, output_meta, parcel_geometry, inside=inside_mask)
+    quality_mask_applied = quality_mask_scene_count > 0
+    if coverage["quality_placeholder_applied"]:
+        mosaic_warnings.insert(
+            0,
+            f"{coverage['unavailable_percent']:.2f}% del lote no tiene observaciones utilizables para esta fecha y se muestra en gris.",
+        )
     stats = compute_statistics(arr, index_key=index_key)
     stats.update({
         **coverage,
         "processing_version": MOSAIC_PROCESSING_VERSION,
         "source_count": len(used_scene_ids),
         "scene_ids": used_scene_ids,
+        "candidate_scene_count": len(scenes),
+        "quality_mask_applied": quality_mask_applied,
+        "quality_mask_scene_count": quality_mask_scene_count,
     })
     png_bytes = _fit_png_to_display_size(
-        render_index_png(index_key, arr),
+        render_index_png(index_key, arr, unavailable_mask=inside_mask),
         width,
         height,
         preserve_pixels=not definition.rgb,
@@ -807,10 +908,14 @@ def generate_or_get_layer(
         "scene_id": primary_scene.id,
         "scene_ids": used_scene_ids,
         "source_count": len(used_scene_ids),
+        "candidate_scene_count": len(scenes),
         "coverage_percent": coverage["coverage_percent"],
+        "unavailable_percent": coverage["unavailable_percent"],
         "is_partial": coverage["is_partial"],
+        "quality_placeholder_applied": coverage["quality_placeholder_applied"],
+        "quality_mask_applied": quality_mask_applied,
         "processing_version": MOSAIC_PROCESSING_VERSION,
-        "warnings": mosaic_warnings[:6],
+        "warnings": _dedupe_warnings(mosaic_warnings)[:6],
         "geometry_hash": geometry_fingerprint,
     }
     object_path, image_url = _store_png(
@@ -875,8 +980,12 @@ def generate_or_get_layer(
         "scene_id": primary_scene.id,
         "scene_ids": used_scene_ids,
         "source_count": len(used_scene_ids),
+        "candidate_scene_count": len(scenes),
         "coverage_percent": coverage["coverage_percent"],
+        "unavailable_percent": coverage["unavailable_percent"],
         "is_partial": coverage["is_partial"],
+        "quality_placeholder_applied": coverage["quality_placeholder_applied"],
+        "quality_mask_applied": quality_mask_applied,
         "processing_version": MOSAIC_PROCESSING_VERSION,
-        "warnings": mosaic_warnings[:6],
+        "warnings": _dedupe_warnings(mosaic_warnings)[:6],
     })

@@ -40,6 +40,12 @@ PALETTES: Dict[str, list[tuple[float, tuple[int, int, int]]]] = {
     ],
 }
 
+# Pixels inside a parcel that cannot be used for analysis are rendered with a
+# neutral slate tone instead of becoming transparent. This differentiates
+# clouds, shadows, missing tiles and catalog no-data from actual NDVI values.
+UNAVAILABLE_RGB = np.array((148, 163, 184), dtype="uint8")
+UNAVAILABLE_ALPHA = 218
+
 
 def _finite_values(arr: np.ndarray) -> np.ndarray:
     return arr[np.isfinite(arr)].astype("float32", copy=False)
@@ -130,7 +136,23 @@ def _apply_palette(norm: np.ndarray, palette: list[tuple[float, tuple[int, int, 
     return rgb
 
 
-def _render_rgb(arr: np.ndarray, opacity: float) -> bytes:
+def _resolve_unavailable_mask(unavailable_mask: np.ndarray | None, valid_mask: np.ndarray) -> np.ndarray:
+    if unavailable_mask is None:
+        return np.zeros(valid_mask.shape, dtype=bool)
+    mask = np.asarray(unavailable_mask, dtype=bool)
+    if mask.shape != valid_mask.shape:
+        raise ValueError("Unavailable mask shape must match rendered raster shape")
+    return mask & ~valid_mask
+
+
+def _build_alpha(valid: np.ndarray, unavailable: np.ndarray, opacity: float) -> np.ndarray:
+    alpha = np.zeros(valid.shape, dtype="uint8")
+    alpha[valid] = int(np.clip(opacity, 0, 1) * 255)
+    alpha[unavailable] = UNAVAILABLE_ALPHA
+    return alpha
+
+
+def _render_rgb(arr: np.ndarray, opacity: float, unavailable_mask: np.ndarray | None = None) -> bytes:
     if arr.ndim != 3 or arr.shape[0] != 3:
         raise ValueError("RGB arrays must have shape (3, height, width)")
     bands = []
@@ -140,19 +162,26 @@ def _render_rgb(arr: np.ndarray, opacity: float) -> bytes:
         norm = _normalize(band, None, None)
         bands.append((np.power(norm, 1 / 1.7) * 255).astype("uint8"))
     rgb = np.stack(bands, axis=-1)
-    alpha = np.where(valid, int(np.clip(opacity, 0, 1) * 255), 0).astype("uint8")
+    unavailable = _resolve_unavailable_mask(unavailable_mask, valid)
+    rgb[unavailable] = UNAVAILABLE_RGB
+    alpha = _build_alpha(valid, unavailable, opacity)
     rgba = np.dstack([rgb, alpha])
     buffer = BytesIO()
     Image.fromarray(rgba, mode="RGBA").save(buffer, format="PNG", optimize=True)
     return buffer.getvalue()
 
 
-def render_index_png(index_key: str, arr: np.ndarray, opacity: float = 0.94) -> bytes:
+def render_index_png(
+    index_key: str,
+    arr: np.ndarray,
+    opacity: float = 0.94,
+    unavailable_mask: np.ndarray | None = None,
+) -> bytes:
     normalized_key = normalize_index_key(index_key)
     definition = INDEX_DEFINITIONS.get(normalized_key) or INDEX_DEFINITIONS["NDVI"]
 
     if definition.rgb:
-        return _render_rgb(arr, opacity)
+        return _render_rgb(arr, opacity, unavailable_mask=unavailable_mask)
 
     valid = np.isfinite(arr)
     norm = _normalize(arr, definition.min_value, definition.max_value)
@@ -163,7 +192,9 @@ def render_index_png(index_key: str, arr: np.ndarray, opacity: float = 0.94) -> 
         palette = PALETTES["moisture"]
 
     rgb = _apply_palette(norm, palette)
-    alpha = np.where(valid, int(np.clip(opacity, 0, 1) * 255), 0).astype("uint8")
+    unavailable = _resolve_unavailable_mask(unavailable_mask, valid)
+    rgb[unavailable] = UNAVAILABLE_RGB
+    alpha = _build_alpha(valid, unavailable, opacity)
     rgba = np.dstack([rgb, alpha])
     buffer = BytesIO()
     Image.fromarray(rgba, mode="RGBA").save(buffer, format="PNG", optimize=True)
