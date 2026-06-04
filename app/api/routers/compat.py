@@ -45,7 +45,7 @@ STATE_KEY = os.getenv("DATARIS_COMPAT_STATE_KEY", "default")
 
 TABLES = [
     "profiles", "user_roles", "admin_users", "companies", "platform_modules",
-    "company_modules", "user_modules", "parcels", "satellite_images",
+    "company_modules", "user_modules", "parcels", "satellite_images", "satellite_comparisons",
     "field_notes", "parcel_crops", "aerial_analyses", "analysis_sessions",
     "analysis_data_points", "laborapp_registros", "laborapp_empleados_foto",
     "extension_requests", "digiforms_accounts", "digiforms_user_links", "digiforms_operation_logs",
@@ -56,6 +56,7 @@ TABLES = [
 USER_SCOPED_TABLES = {
     "parcels",
     "satellite_images",
+    "satellite_comparisons",
     "field_notes",
     "parcel_crops",
     "aerial_analyses",
@@ -76,6 +77,7 @@ USER_SCOPED_TABLES = {
 
 PARCEL_CHILD_TABLES = {
     "satellite_images",
+    "satellite_comparisons",
     "field_notes",
     "parcel_crops",
     "analysis_sessions",
@@ -229,6 +231,7 @@ def default_db() -> Dict[str, Any]:
             ],
             "parcels": [],
             "satellite_images": [],
+            "satellite_comparisons": [],
             "field_notes": [],
             "parcel_crops": [],
             "aerial_analyses": [],
@@ -478,7 +481,7 @@ def add_defaults(table_name: str, row: Dict[str, Any], user_id: Optional[str]) -
     row.setdefault("id", str(uuid.uuid4()))
     row.setdefault("created_at", t)
     row["updated_at"] = row.get("updated_at") or t
-    if user_id and table_name in {"profiles", "user_roles", "parcels", "satellite_images", "field_notes", "parcel_crops", "aerial_analyses", "analysis_sessions", "analysis_data_points", "laborapp_registros"}:
+    if user_id and table_name in {"profiles", "user_roles", "parcels", "satellite_images", "satellite_comparisons", "field_notes", "parcel_crops", "aerial_analyses", "analysis_sessions", "analysis_data_points", "laborapp_registros"}:
         row.setdefault("user_id", user_id)
     if table_name == "profiles":
         row.setdefault("user_id", row.get("id") or user_id)
