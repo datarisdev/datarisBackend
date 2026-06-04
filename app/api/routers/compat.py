@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from threading import RLock
+from time import monotonic
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, File, Form, Header, HTTPException, UploadFile
@@ -40,6 +41,25 @@ DB_FILE = ROOT / "compat_db.json"
 FILES = ROOT / "compat_files"
 LOCK = RLock()
 ENSURING_STORAGE = False
+STORAGE_READY = False
+STATE_TABLE_READY = False
+STATE_CACHE: Optional[Dict[str, Any]] = None
+STATE_CACHE_LOADED_AT = 0.0
+STATE_CACHE_VERSION = 0
+
+
+def _float_env(name: str, default: float) -> float:
+    try:
+        return max(0.0, float(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+# This JSON compatibility state can be large. Reading it from PostgreSQL on every
+# authenticated request made login and navigation unnecessarily expensive. The
+# short TTL keeps different Cloud Run workers convergent while allowing repeated
+# reads inside the same request and rapid section changes to reuse the same state.
+STATE_CACHE_TTL_SECONDS = _float_env("DATARIS_COMPAT_CACHE_TTL_SECONDS", 1.0)
 STATE_TABLE = os.getenv("DATARIS_COMPAT_STATE_TABLE", "dataris_compat_state")
 STATE_KEY = os.getenv("DATARIS_COMPAT_STATE_KEY", "default")
 
@@ -281,25 +301,74 @@ def postgres_connection():
     return psycopg2.connect(postgres_dsn())
 
 
+def _cache_state(db: Dict[str, Any], *, changed: bool = False) -> Dict[str, Any]:
+    global STATE_CACHE, STATE_CACHE_LOADED_AT, STATE_CACHE_VERSION
+    STATE_CACHE = db
+    STATE_CACHE_LOADED_AT = monotonic()
+    if changed:
+        STATE_CACHE_VERSION += 1
+    return db
+
+
+def get_state_cache_version() -> int:
+    """Return a process-local revision incremented after successful writes."""
+    return STATE_CACHE_VERSION
+
+
+def invalidate_state_cache() -> None:
+    global STATE_CACHE, STATE_CACHE_LOADED_AT
+    with LOCK:
+        STATE_CACHE = None
+        STATE_CACHE_LOADED_AT = 0.0
+
+
+def _state_cache_is_fresh() -> bool:
+    if STATE_CACHE is None:
+        return False
+    if STATE_CACHE_TTL_SECONDS <= 0:
+        return False
+    return monotonic() - STATE_CACHE_LOADED_AT < STATE_CACHE_TTL_SECONDS
+
+
 def ensure_state_table() -> None:
-    if not use_postgres_state():
+    global STATE_TABLE_READY
+    if not use_postgres_state() or STATE_TABLE_READY:
         return
-    ddl = f"""
-        CREATE TABLE IF NOT EXISTS {STATE_TABLE} (
-            id TEXT PRIMARY KEY,
-            payload JSONB NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-    """
-    with postgres_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(ddl)
+    with LOCK:
+        if STATE_TABLE_READY:
+            return
+        ddl = f"""
+            CREATE TABLE IF NOT EXISTS {STATE_TABLE} (
+                id TEXT PRIMARY KEY,
+                payload JSONB NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """
+        with postgres_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(ddl)
+        STATE_TABLE_READY = True
 
 
 def read_db_from_file() -> Dict[str, Any]:
     with DB_FILE.open("r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _write_db_to_file(db: Dict[str, Any]) -> None:
+    ROOT.mkdir(parents=True, exist_ok=True)
+    tmp = ROOT / f"{DB_FILE.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    try:
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(db, f, ensure_ascii=False, indent=2, default=str)
+        tmp.replace(DB_FILE)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
 
 
 def read_db_from_postgres() -> Optional[Dict[str, Any]]:
@@ -330,90 +399,100 @@ def write_db_to_postgres(db: Dict[str, Any]) -> None:
             cur.execute(sql, (STATE_KEY, payload))
 
 
-def read_db() -> Dict[str, Any]:
-    ensure_storage()
+def _persist_db(db: Dict[str, Any]) -> None:
     if use_postgres_state():
-        data = read_db_from_postgres()
-        if data is not None:
-            return data
-        data = default_db()
-        write_db_to_postgres(data)
-        return data
-    return read_db_from_file()
+        write_db_to_postgres(db)
+    else:
+        _write_db_to_file(db)
+
+
+def read_db(*, force_refresh: bool = False) -> Dict[str, Any]:
+    ensure_storage()
+    with LOCK:
+        if not force_refresh and _state_cache_is_fresh() and STATE_CACHE is not None:
+            return STATE_CACHE
+
+        if use_postgres_state():
+            data = read_db_from_postgres()
+            if data is None:
+                data = default_db()
+                _persist_db(data)
+        else:
+            try:
+                data = read_db_from_file()
+            except Exception:
+                data = default_db()
+                _persist_db(data)
+
+        normalized = normalize_db(data)
+        return _cache_state(normalized)
 
 
 def write_db(db: Dict[str, Any]) -> None:
-    """Persist the compatibility database.
+    """Persist state and immediately refresh the process-local read cache.
 
-    Production Cloud Run must not depend on /tmp for application state because
-    instances are ephemeral and multiple instances do not share files. When a
-    production DATABASE_URL is available, this stores the compat JSON state in
-    PostgreSQL automatically. Local development keeps the JSON file fallback.
+    Cloud Run instances still converge through PostgreSQL because the read cache
+    has a short TTL. Writes performed by the current worker become visible to the
+    next request immediately without repeating a database read.
     """
-    if use_postgres_state():
-        write_db_to_postgres(db)
-        return
+    ensure_storage()
+    with LOCK:
+        normalized = normalize_db(db)
+        _persist_db(normalized)
+        _cache_state(normalized, changed=True)
 
-    ROOT.mkdir(parents=True, exist_ok=True)
-
-    tmp = ROOT / f"{DB_FILE.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-
-    try:
-        with tmp.open("w", encoding="utf-8") as f:
-            json.dump(db, f, ensure_ascii=False, indent=2, default=str)
-        tmp.replace(DB_FILE)
-    finally:
-        try:
-            if tmp.exists():
-                tmp.unlink()
-        except OSError:
-            pass
 
 def ensure_storage() -> None:
-    global ENSURING_STORAGE
-    if ENSURING_STORAGE:
+    global ENSURING_STORAGE, STORAGE_READY
+    if STORAGE_READY or ENSURING_STORAGE:
         return
-    ENSURING_STORAGE = True
-    try:
-        ROOT.mkdir(parents=True, exist_ok=True)
-        FILES.mkdir(parents=True, exist_ok=True)
 
-        if use_postgres_state():
-            ensure_state_table()
-            db = read_db_from_postgres()
-            if db is None:
-                if DB_FILE.exists():
+    with LOCK:
+        if STORAGE_READY or ENSURING_STORAGE:
+            return
+        ENSURING_STORAGE = True
+        try:
+            ROOT.mkdir(parents=True, exist_ok=True)
+            FILES.mkdir(parents=True, exist_ok=True)
+
+            if use_postgres_state():
+                ensure_state_table()
+                db = read_db_from_postgres()
+                if db is None:
+                    if DB_FILE.exists():
+                        try:
+                            db = read_db_from_file()
+                        except Exception:
+                            db = default_db()
+                    else:
+                        db = default_db()
+                    normalized = normalize_db(db)
+                    _persist_db(normalized)
+                else:
+                    before = json.dumps(db, sort_keys=True, default=str)
+                    normalized = normalize_db(db)
+                    after = json.dumps(normalized, sort_keys=True, default=str)
+                    if after != before:
+                        _persist_db(normalized)
+            else:
+                if not DB_FILE.exists():
+                    normalized = normalize_db(default_db())
+                    _persist_db(normalized)
+                else:
                     try:
                         db = read_db_from_file()
                     except Exception:
                         db = default_db()
-                else:
-                    db = default_db()
-                write_db_to_postgres(normalize_db(db))
-            else:
-                before = json.dumps(db, sort_keys=True, default=str)
-                normalized = normalize_db(db)
-                after = json.dumps(normalized, sort_keys=True, default=str)
-                if after != before:
-                    write_db_to_postgres(normalized)
-            return
+                    before = json.dumps(db, sort_keys=True, default=str)
+                    normalized = normalize_db(db)
+                    after = json.dumps(normalized, sort_keys=True, default=str)
+                    if after != before or not DB_FILE.exists():
+                        _persist_db(normalized)
 
-        if not DB_FILE.exists():
-            write_db(default_db())
-            return
-        try:
-            db = read_db_from_file()
-        except Exception:
-            write_db(default_db())
-            return
-        before = json.dumps(db, sort_keys=True, default=str)
-        normalized = normalize_db(db)
-        after = json.dumps(normalized, sort_keys=True, default=str)
-        if after != before:
-            write_db(normalized)
-    finally:
-        ENSURING_STORAGE = False
-
+            _cache_state(normalized)
+            STORAGE_READY = True
+        finally:
+            ENSURING_STORAGE = False
 
 def normalize_db(db: Dict[str, Any]) -> Dict[str, Any]:
     db.setdefault("users", [])
