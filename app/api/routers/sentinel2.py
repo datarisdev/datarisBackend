@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+import logging
 from pathlib import Path
 from time import sleep
 from typing import Any, Optional
@@ -14,6 +15,11 @@ from app.api.deps import get_current_user, get_db
 from app.db.session import SessionLocal
 from app.models.satellite_image import ProcessingStatus, SatelliteImage
 from app.api.routers import compat as compat_store
+from app.services.sentinel2.history import (
+    list_satellite_analysis_history,
+    persist_satellite_analysis_record,
+    summarize_satellite_analysis_history,
+)
 from app.services.sentinel2.indices import INDEX_DEFINITIONS, normalize_index_key
 from app.utils.storage_satellite import download_satellite_cache_png_bytes
 from app.services.sentinel2.service import (
@@ -29,6 +35,7 @@ from app.services.sentinel2.service import (
 )
 
 router = APIRouter(prefix="/satellite-free", tags=["Sentinel-2 Free Satellite"])
+logger = logging.getLogger(__name__)
 
 
 def _user_id(current_user: dict[str, Any]) -> str:
@@ -104,6 +111,42 @@ def _date_to_datetime_range(day: date) -> tuple[datetime, datetime]:
     return start, start + timedelta(days=1)
 
 
+def _persist_generated_layer(
+    *,
+    parcel: dict[str, Any],
+    current_user_id: str,
+    index_key: str,
+    result: dict[str, Any],
+    requested_date: date | str | None = None,
+    warnings: Optional[list[str]] = None,
+    source: str = "sentinel2-map-layer",
+) -> Optional[dict[str, Any]]:
+    """Register one usable Sentinel-2 render in the shared persisted history.
+
+    Image generation must not fail merely because history persistence is
+    temporarily unavailable. The layer remains usable and the retry path can
+    store it during the next request or background prefetch.
+    """
+    if not result.get("available"):
+        return None
+    try:
+        return persist_satellite_analysis_record(
+            user_id=current_user_id,
+            parcel=parcel,
+            index_key=index_key,
+            result=result,
+            requested_date=str(requested_date)[:10] if requested_date else None,
+            warnings=warnings,
+            source=source,
+        )
+    except Exception:
+        logger.exception(
+            "No se pudo persistir historial Sentinel-2",
+            extra={"parcel_id": str(parcel.get("id") or ""), "index_key": index_key},
+        )
+        return None
+
+
 @router.get("/status")
 def status() -> dict[str, Any]:
     return {
@@ -129,6 +172,48 @@ def layers(
     return {"data": data, "count": len(data)}
 
 
+@router.get("/history")
+def history(
+    parcel_id: Optional[str] = Query(None),
+    index_type: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    data = list_satellite_analysis_history(
+        user_id=_user_id(current_user),
+        parcel_id=parcel_id,
+        index_type=index_type,
+        limit=limit,
+    )
+    return {"data": data, "count": len(data)}
+
+
+@router.get("/history/summary")
+def history_summary(
+    parcel_id: Optional[str] = Query(None),
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    return {"data": summarize_satellite_analysis_history(user_id=_user_id(current_user), parcel_id=parcel_id)}
+
+
+@router.get("/parcels/{parcel_id}/history")
+def parcel_history(
+    parcel_id: UUID,
+    index_type: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    db: Session = Depends(get_db),
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    _get_owned_parcel(db, parcel_id, current_user)
+    data = list_satellite_analysis_history(
+        user_id=_user_id(current_user),
+        parcel_id=str(parcel_id),
+        index_type=index_type,
+        limit=limit,
+    )
+    return {"data": data, "count": len(data)}
+
+
 @router.get("/parcels/{parcel_id}/resolutions/{resolution_key}/dates")
 def dates(
     parcel_id: UUID,
@@ -140,6 +225,17 @@ def dates(
     parcel = _get_owned_parcel(db, parcel_id, current_user)
 
     db_dates: list[dict[str, Any]] = []
+    for row in list_satellite_analysis_history(user_id=_user_id(current_user), parcel_id=str(parcel["id"]), limit=100):
+        if not row.get("image_date"):
+            continue
+        db_dates.append({
+            "date": str(row.get("image_date"))[:10],
+            "cloudCoverage": row.get("cloud_coverage"),
+            "cloud_coverage": row.get("cloud_coverage"),
+            "isLoaded": True,
+            "source": "history",
+        })
+
     if DB_CACHE_ENABLED:
         try:
             rows = db.query(SatelliteImage).filter(
@@ -225,6 +321,14 @@ def statistics(
     )
     if not result.get("available"):
         return {"data": {"status": "NO_DATA", "data": [], "reason": result.get("reason")}}
+    _persist_generated_layer(
+        parcel=parcel,
+        current_user_id=_user_id(current_user),
+        index_key=index_key,
+        result=result,
+        requested_date=target_date,
+        source="sentinel2-statistics",
+    )
     stats = result.get("statistics") or {}
     return {
         "data": {
@@ -288,6 +392,14 @@ def statistics_series(
             )
             if not result.get("available"):
                 continue
+            _persist_generated_layer(
+                parcel=parcel,
+                current_user_id=_user_id(current_user),
+                index_key=index_key,
+                result=result,
+                requested_date=raw_date,
+                source="sentinel2-series",
+            )
             result_date = str(result.get("date") or raw_date)[:10]
             if result_date in seen_dates:
                 continue
@@ -389,6 +501,15 @@ def _build_map_layer_response(
         coverage_label = f"{float(coverage_percent or 0):.2f}%"
         warnings.insert(0, f"Cobertura satelital parcial: {coverage_label} del lote tiene píxeles Sentinel-2 válidos para esta fecha.")
 
+    persisted = _persist_generated_layer(
+        parcel=parcel,
+        current_user_id=_user_id(current_user),
+        index_key=index_key,
+        result=result,
+        requested_date=target_date,
+        warnings=warnings,
+    )
+
     overlay = {
         "id": f"sentinel2-{parcel.get('id')}-{index_key}-{result.get('date')}",
         "graniot_parcel_id": None,
@@ -433,6 +554,8 @@ def _build_map_layer_response(
             "coverage_percent": coverage_percent,
             "is_partial": is_partial,
             "processing_version": result.get("processing_version"),
+            "history_id": (persisted or {}).get("id"),
+            "analysis_key": (persisted or {}).get("analysis_key"),
         }
     })
 
@@ -585,11 +708,20 @@ def _run_prefetch_job(
                         width=width,
                         height=height,
                     )
+                    persisted = _persist_generated_layer(
+                        parcel=parcel,
+                        current_user_id=user_id,
+                        index_key=layer_key,
+                        result=result,
+                        requested_date=target_date,
+                        source="sentinel2-prefetch",
+                    )
                     results.append({
                         "parcel_id": str(parcel["id"]),
                         "layer_key": layer_key,
                         "available": bool(result.get("available")),
                         "date": result.get("date"),
+                        "history_id": (persisted or {}).get("id"),
                     })
                 except Exception as exc:
                     results.append({"parcel_id": str(parcel.get("id")), "layer_key": layer_key, "available": False, "error": str(exc)})

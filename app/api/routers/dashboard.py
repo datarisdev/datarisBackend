@@ -86,7 +86,7 @@ def _statistics(row: Dict[str, Any]) -> Dict[str, Any]:
 
 def _ndvi_mean(row: Dict[str, Any]) -> Optional[float]:
     stats = _statistics(row)
-    candidates = [
+    explicit_ndvi = _first_number(
         row.get("ndvi_mean"),
         row.get("mean_ndvi"),
         row.get("average_ndvi"),
@@ -95,11 +95,25 @@ def _ndvi_mean(row: Dict[str, Any]) -> Optional[float]:
         stats.get("mean_ndvi"),
         stats.get("average_ndvi"),
         stats.get("avg_ndvi"),
-        stats.get("mean"),
         _nested_get(stats, "NDVI", "mean"),
         _nested_get(stats, "ndvi", "mean"),
-    ]
-    return _first_number(*candidates)
+    )
+    if explicit_ndvi is not None:
+        return explicit_ndvi
+
+    # A generic `statistics.mean` only represents NDVI when the saved analysis
+    # itself is NDVI. Treating NDWI/GNDVI means as NDVI distorts vegetation KPIs.
+    index_type = str(row.get("index_type") or row.get("index") or "").upper().strip()
+    return _first_number(stats.get("mean"), stats.get("average")) if index_type == "NDVI" else None
+
+
+def _satellite_coverage(row: Dict[str, Any]) -> Optional[float]:
+    stats = _statistics(row)
+    return _first_number(
+        row.get("coverage_percent"),
+        stats.get("coverage_percent"),
+        _nested_get(row, "analysis_payload", "coverage_percent"),
+    )
 
 
 def _area_from_row(row: Dict[str, Any]) -> float:
@@ -367,6 +381,17 @@ def dashboard_summary(current_user: Any = Depends(get_current_user)):
             if row_dt > current_dt:
                 latest_sat_by_parcel[parcel_id] = row
 
+    latest_ndvi_by_parcel: Dict[str, Dict[str, Any]] = {}
+    for row in satellite_images:
+        parcel_id = str(row.get("parcel_id") or "")
+        if not parcel_id or _ndvi_mean(row) is None:
+            continue
+        current = latest_ndvi_by_parcel.get(parcel_id)
+        current_dt = _as_datetime((current or {}).get("image_date") or (current or {}).get("created_at")) or datetime.min.replace(tzinfo=timezone.utc)
+        row_dt = _as_datetime(row.get("image_date") or row.get("created_at")) or datetime.min.replace(tzinfo=timezone.utc)
+        if current is None or row_dt > current_dt:
+            latest_ndvi_by_parcel[parcel_id] = row
+
     now_dt = datetime.now(timezone.utc)
     stale_cutoff = now_dt - timedelta(days=MONITORING_DAYS)
     unmonitored_parcel_ids = []
@@ -378,7 +403,7 @@ def dashboard_summary(current_user: Any = Depends(get_current_user)):
             unmonitored_parcel_ids.append(pid)
 
     stressed_parcel_ids = set()
-    for parcel_id, row in latest_sat_by_parcel.items():
+    for parcel_id, row in latest_ndvi_by_parcel.items():
         ndvi = _ndvi_mean(row)
         if ndvi is not None and ndvi < 0.35:
             stressed_parcel_ids.add(parcel_id)
@@ -389,6 +414,16 @@ def dashboard_summary(current_user: Any = Depends(get_current_user)):
 
     satellite_status = Counter(_status(row) for row in satellite_images)
     satellite_job_status = Counter(_status(row) for row in satellite_jobs)
+    satellite_index_counts = Counter(str(row.get("index_type") or row.get("index") or "sin_indice").upper() for row in satellite_images)
+    satellite_coverage_values = [_satellite_coverage(row) for row in completed_satellite]
+    satellite_coverage_values = [value for value in satellite_coverage_values if value is not None]
+    average_valid_coverage_percent = (
+        round(sum(satellite_coverage_values) / len(satellite_coverage_values), 2)
+        if satellite_coverage_values
+        else None
+    )
+    partial_satellite_analyses = len([row for row in completed_satellite if bool(row.get("is_partial") or _nested_get(row, "statistics", "is_partial"))])
+    covered_satellite_parcels = {str(row.get("parcel_id")) for row in satellite_images if row.get("parcel_id")}
 
     alerts: List[Dict[str, Any]] = []
     if without_geometry:
@@ -438,7 +473,8 @@ def dashboard_summary(current_user: Any = Depends(get_current_user)):
     for parcel in parcels:
         pid = str(parcel.get("id") or "")
         latest_sat = latest_sat_by_parcel.get(pid)
-        ndvi = _ndvi_mean(latest_sat or {}) if latest_sat else None
+        latest_ndvi = latest_ndvi_by_parcel.get(pid)
+        ndvi = _ndvi_mean(latest_ndvi or {}) if latest_ndvi else None
         parcel_cards.append({
             "id": pid,
             "name": parcel.get("name") or parcel.get("lote") or parcel.get("finca") or "Lote sin nombre",
@@ -491,6 +527,10 @@ def dashboard_summary(current_user: Any = Depends(get_current_user)):
             "analyses_with_ndvi": len(satellite_with_ndvi),
             "stressed_parcels": len(stressed_parcel_ids),
             "unmonitored_parcels": len(unmonitored_parcel_ids),
+            "covered_parcels": len(covered_satellite_parcels),
+            "index_counts": dict(satellite_index_counts),
+            "average_valid_coverage_percent": average_valid_coverage_percent,
+            "partial_analyses": partial_satellite_analyses,
             "last_analysis_at": _iso((satellite_last or {}).get("image_date") or (satellite_last or {}).get("created_at")) if satellite_last else None,
             "last_index_type": (satellite_last or {}).get("index_type") or (satellite_last or {}).get("index") if satellite_last else None,
         },
