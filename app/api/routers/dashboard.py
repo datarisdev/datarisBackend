@@ -4,17 +4,40 @@ import json
 import math
 from collections import Counter, defaultdict
 from datetime import datetime, timezone, timedelta
+from threading import RLock
+from time import monotonic
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends
 
 from app.api.deps import get_current_user
-from app.api.routers.compat import read_db, table
+from app.api.routers.compat import get_state_cache_version, read_db, table
 from app.services.sentinel2.history import representative_satellite_comparison_side, satellite_comparison_sides
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
 
 MONITORING_DAYS = 30
+DASHBOARD_CACHE_TTL_SECONDS = 15.0
+_DASHBOARD_CACHE_LOCK = RLock()
+_DASHBOARD_CACHE: Dict[str, Tuple[float, int, Dict[str, Any]]] = {}
+
+
+def _cached_dashboard(user_id: str, state_version: int) -> Optional[Dict[str, Any]]:
+    with _DASHBOARD_CACHE_LOCK:
+        entry = _DASHBOARD_CACHE.get(user_id)
+        if not entry:
+            return None
+        saved_at, saved_version, payload = entry
+        if saved_version != state_version or monotonic() - saved_at >= DASHBOARD_CACHE_TTL_SECONDS:
+            _DASHBOARD_CACHE.pop(user_id, None)
+            return None
+        return payload
+
+
+def _store_dashboard(user_id: str, state_version: int, payload: Dict[str, Any]) -> None:
+    with _DASHBOARD_CACHE_LOCK:
+        _DASHBOARD_CACHE[user_id] = (monotonic(), state_version, payload)
+
 
 
 def _user_id_from_current(current_user: Any) -> str:
@@ -508,9 +531,14 @@ def _mapping_sort_key(mapping: Dict[str, Any]) -> datetime:
 
 
 @router.get("/summary")
-def dashboard_summary(current_user: Any = Depends(get_current_user)):
+def dashboard_summary(force_refresh: bool = False, current_user: Any = Depends(get_current_user)):
     user_id = _user_id_from_current(current_user)
-    db = read_db()
+    db = read_db(force_refresh=force_refresh)
+    state_version = get_state_cache_version()
+    cached = None if force_refresh else _cached_dashboard(user_id, state_version)
+    if cached is not None:
+        return {"data": cached, "error": None}
+
     role = _role_for_user(db, user_id)
     # El Centro de Control siempre resume el espacio de trabajo del usuario
     # autenticado. Las vistas administrativas globales se mantienen separadas.
@@ -596,6 +624,16 @@ def dashboard_summary(current_user: Any = Depends(get_current_user)):
     for point in analysis_points:
         points_by_session[str(point.get("session_id") or "")].append(point)
 
+    satellite_by_parcel: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    sessions_by_parcel: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    aerial_by_parcel: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in satellite_comparisons:
+        satellite_by_parcel[_parcel_ref(row)].append(row)
+    for row in analysis_sessions:
+        sessions_by_parcel[_parcel_ref(row)].append(row)
+    for row in aerial_analyses:
+        aerial_by_parcel[_parcel_ref(row)].append(row)
+
     parcel_cards = []
     for parcel in parcels:
         pid = str(parcel.get("id") or "")
@@ -604,8 +642,8 @@ def dashboard_summary(current_user: Any = Depends(get_current_user)):
         candidates: List[Dict[str, Any]] = []
         if latest_sat:
             candidates.append(_satellite_mapping(latest_sat))
-        candidates.extend(_mapeo_mapping(row, points_by_session.get(str(row.get("id") or ""), [])) for row in analysis_sessions if _parcel_ref(row) == pid)
-        candidates.extend(_aerial_mapping(row) for row in aerial_analyses if _parcel_ref(row) == pid)
+        candidates.extend(_mapeo_mapping(row, points_by_session.get(str(row.get("id") or ""), [])) for row in sessions_by_parcel.get(pid, []))
+        candidates.extend(_aerial_mapping(row) for row in aerial_by_parcel.get(pid, []))
         latest_mapping = max(candidates, key=_mapping_sort_key) if candidates else None
         parcel_cards.append({
             "id": pid,
@@ -622,9 +660,9 @@ def dashboard_summary(current_user: Any = Depends(get_current_user)):
             "latest_satellite_at": _iso((latest_sat or {}).get("compared_at") or (latest_sat or {}).get("updated_at") or (latest_sat or {}).get("created_at")) if latest_sat else None,
             "latest_analysis_at": latest_mapping.get("analysis_at") if latest_mapping else None,
             "latest_mapping": latest_mapping,
-            "satellite_count": len([row for row in satellite_comparisons if str(row.get("parcel_id")) == pid]),
-            "aerial_count": len([row for row in aerial_analyses if _parcel_ref(row) == pid]),
-            "mapeo_count": len([row for row in analysis_sessions if _parcel_ref(row) == pid]),
+            "satellite_count": len(satellite_by_parcel.get(pid, [])),
+            "aerial_count": len(aerial_by_parcel.get(pid, [])),
+            "mapeo_count": len(sessions_by_parcel.get(pid, [])),
         })
 
     activities: List[Dict[str, Any]] = []
@@ -693,5 +731,6 @@ def dashboard_summary(current_user: Any = Depends(get_current_user)):
             ],
         },
     }
+    _store_dashboard(user_id, state_version, payload)
     return {"data": payload, "error": None}
 

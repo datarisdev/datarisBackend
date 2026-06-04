@@ -128,7 +128,9 @@ def get_current_access(authorization: Optional[str] = Header(default=None)):
 
     with LOCK:
         db = read_db()
-        ensure_extension_catalog(db)
+        catalog_before = json.dumps(table(db, "platform_modules"), sort_keys=True, default=str)
+        catalog = ensure_extension_catalog(db)
+        catalog_changed = catalog_before != json.dumps(table(db, "platform_modules"), sort_keys=True, default=str)
 
         user_id = user.get("id")
         profile = profile_for(db, user_id) or {}
@@ -173,7 +175,7 @@ def get_current_access(authorization: Optional[str] = Header(default=None)):
 
         extensions = []
         extension_statuses: Dict[str, Any] = {}
-        for row in ensure_extension_catalog(db):
+        for row in catalog:
             extension_id = normalize_extension_id(row.get("id") or row.get("name"))
             enabled = extension_enabled_for(db, company_id, user_id, extension_id)
             latest_request = _latest_request_for(db, user_id, company_id, extension_id)
@@ -220,6 +222,8 @@ def get_current_access(authorization: Optional[str] = Header(default=None)):
             "generatedAt": now(),
         }
 
-        # ensure_extension_catalog can add default extension rows.
-        write_db(db)
+        # Persist only when the catalog really needed a repair. Previously every
+        # access check rewrote the complete compatibility JSON state.
+        if catalog_changed:
+            write_db(db)
         return {"data": access, "error": None}
