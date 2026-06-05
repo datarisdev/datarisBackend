@@ -23,7 +23,7 @@ from app.services.sentinel2.history import (
     summarize_satellite_comparison_history,
 )
 from app.services.sentinel2.indices import INDEX_DEFINITIONS, normalize_index_key
-from app.utils.storage_satellite import download_satellite_cache_png_bytes
+from app.utils.storage_satellite import download_satellite_cache_png_bytes, safe_satellite_cache_key
 from app.services.sentinel2.service import (
     DEFAULT_MAX_CLOUD,
     DB_CACHE_ENABLED,
@@ -841,10 +841,15 @@ def prefetch(
     })
 
 
-def _satellite_png_headers(origin: str | None = None) -> dict[str, str]:
+def _satellite_png_headers(cache_key: str, origin: str | None = None) -> dict[str, str]:
+    # These URLs are content-addressed: changing lot, geometry, layer, date, size
+    # or render version produces a different hash. The browser can therefore keep
+    # a generated PNG for a long time without hiding newly generated imagery.
     allowed_origin = origin if origin == "https://app.dataris.es" else "https://app.dataris.es"
+    safe_key = safe_satellite_cache_key(cache_key)
     return {
-        "Cache-Control": "no-store, max-age=0",
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "ETag": f'"sentinel2-{safe_key}"',
         "Access-Control-Allow-Origin": allowed_origin,
         "Access-Control-Allow-Credentials": "true",
         "Access-Control-Expose-Headers": "*",
@@ -855,7 +860,9 @@ def _satellite_png_headers(origin: str | None = None) -> dict[str, str]:
 
 
 def _cache_png_response(cache_key: str, request: Request, *, head_only: bool = False) -> Response:
-    headers = _satellite_png_headers(request.headers.get("origin"))
+    headers = _satellite_png_headers(cache_key, request.headers.get("origin"))
+    if request.headers.get("if-none-match") == headers["ETag"]:
+        return Response(status_code=304, headers=headers)
     path = local_png_path(cache_key)
     if path.exists():
         if head_only:
