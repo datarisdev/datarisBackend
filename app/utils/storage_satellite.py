@@ -101,7 +101,7 @@ def upload_satellite_png_bytes(
         f"{image_date}.png"
     )
     blob = bucket.blob(object_path)
-    blob.cache_control = "public, max-age=3600"
+    blob.cache_control = "public, max-age=31536000, immutable"
     blob.upload_from_string(content, content_type="image/png")
 
     # Also store by the hash exposed by /api/satellite-free/cache/<hash>.png.
@@ -109,7 +109,7 @@ def upload_satellite_png_bytes(
     # by another instance when the browser loads the image overlay.
     if cache_key:
         alias_blob = bucket.blob(satellite_cache_object_path(cache_key))
-        alias_blob.cache_control = "no-store, max-age=0"
+        alias_blob.cache_control = "public, max-age=31536000, immutable"
         alias_blob.upload_from_string(content, content_type="image/png")
 
     return object_path
