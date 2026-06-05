@@ -109,6 +109,12 @@ class Settings(BaseSettings):
     OPENAI_AERIAL_COPILOT_MAX_OUTPUT_TOKENS: int = 1400
     OPENAI_AERIAL_COPILOT_TIMEOUT_SECONDS: int = 25
 
+    # Copiloto contextual global. Analiza la ventana que el usuario está viendo
+    # con texto visible, filtros, tablas y un resumen estructurado sin geometrías crudas.
+    OPENAI_CONTEXTUAL_COPILOT_MODEL: str = "gpt-4o-mini"
+    OPENAI_CONTEXTUAL_COPILOT_MAX_OUTPUT_TOKENS: int = 1400
+    OPENAI_CONTEXTUAL_COPILOT_TIMEOUT_SECONDS: int = 35
+
     model_config = {
         "env_file": ".env",
         "extra": "ignore",
