@@ -487,6 +487,7 @@ def _build_map_layer_response(
     include_statistics: bool,
     auto_sync: bool,
     force_refresh: bool,
+    revalidate_latest: bool = False,
 ) -> dict[str, Any]:
     _ = include_statistics, auto_sync
     index_key = normalize_index_key(layer_key or wms_layer or "NDVI")
@@ -506,6 +507,7 @@ def _build_map_layer_response(
             width=width,
             height=height,
             force_refresh=force_refresh,
+            revalidate_latest=revalidate_latest,
         )
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"No se pudo generar la capa Sentinel-2: {exc}") from exc
@@ -617,6 +619,7 @@ def map_layer(
     include_statistics: bool = Query(True),
     auto_sync: bool = Query(True),
     force_refresh: bool = Query(False),
+    revalidate_latest: bool = Query(False),
     db: Session = Depends(get_db),
     current_user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
@@ -634,6 +637,7 @@ def map_layer(
         include_statistics=include_statistics,
         auto_sync=auto_sync,
         force_refresh=force_refresh,
+        revalidate_latest=revalidate_latest,
     )
 
 
@@ -665,6 +669,7 @@ def map_layer_from_geometry(
         include_statistics=bool(payload.get("include_statistics", True)),
         auto_sync=bool(payload.get("auto_sync", True)),
         force_refresh=bool(payload.get("force_refresh", False)),
+        revalidate_latest=bool(payload.get("revalidate_latest", False)),
     )
 
 

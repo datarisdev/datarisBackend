@@ -38,13 +38,23 @@ from app.services.sentinel2.indices import (
 from app.services.sentinel2.render import compute_statistics, render_index_png
 from PIL import Image
 from io import BytesIO
-from app.utils.storage_satellite import generate_signed_satellite_url, upload_satellite_png_bytes
+from app.utils.storage_satellite import (
+    download_satellite_cache_metadata,
+    download_satellite_cache_png_bytes,
+    download_satellite_date_manifest,
+    download_satellite_latest_manifest,
+    generate_signed_satellite_url,
+    upload_satellite_cache_metadata,
+    upload_satellite_date_manifest,
+    upload_satellite_latest_manifest,
+    upload_satellite_png_bytes,
+)
 
 logger = logging.getLogger(__name__)
 
 CACHE_DIR = Path(os.getenv("SENTINEL_LOCAL_CACHE_DIR", str(Path(tempfile.gettempdir()) / "dataris_sentinel2_cache")))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
-SENTINEL_CACHE_URL_VERSION = os.getenv("SENTINEL_CACHE_URL_VERSION", "sentinel-gcs-20260605-immutable-browser-cache-1")
+SENTINEL_CACHE_URL_VERSION = os.getenv("SENTINEL_CACHE_URL_VERSION", "sentinel-gcs-20260605-persistent-manifest-cache-2")
 
 
 DEFAULT_MAX_CLOUD = float(os.getenv("SENTINEL_DEFAULT_MAX_CLOUD", "80"))
@@ -649,7 +659,8 @@ def _coverage_summary(
 
 def _cache_key(*, user_id: str, parcel_id: str, index_key: str, image_date: str, width: int, height: int, geometry_hash: str = "") -> str:
     payload = {
-        "v": 11,
+        "v": 12,
+        "processing_version": MOSAIC_PROCESSING_VERSION,
         "geometry_hash": geometry_hash,
         "user_id": user_id,
         "parcel_id": parcel_id,
@@ -657,6 +668,57 @@ def _cache_key(*, user_id: str, parcel_id: str, index_key: str, image_date: str,
         "image_date": image_date,
         "width": width,
         "height": height,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _latest_manifest_key(*, user_id: str, parcel_id: str, index_key: str, geometry_hash: str = "") -> str:
+    """Stable pointer for the best recent immutable raster of a lot/layer.
+
+    The key deliberately excludes width and height. An image rendered once at a
+    high enough resolution can be reused by the normal view, comparison and
+    zoning maps instead of reading Sentinel bands again for each screen size.
+    """
+    payload = {
+        "v": 4,
+        "processing_version": MOSAIC_PROCESSING_VERSION,
+        "geometry_hash": geometry_hash,
+        "user_id": user_id,
+        "parcel_id": parcel_id,
+        "index_key": index_key,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _legacy_latest_manifest_key(*, user_id: str, parcel_id: str, index_key: str, width: int, height: int, geometry_hash: str = "") -> str:
+    """Pointer format published by the previous cache delivery.
+
+    Keep this read-only migration path so already generated images become
+    instantly available after deployment without waiting for another STAC read.
+    """
+    payload = {
+        "v": 3,
+        "processing_version": MOSAIC_PROCESSING_VERSION,
+        "geometry_hash": geometry_hash,
+        "user_id": user_id,
+        "parcel_id": parcel_id,
+        "index_key": index_key,
+        "width": width,
+        "height": height,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _date_manifest_key(*, user_id: str, parcel_id: str, index_key: str, image_date: str, geometry_hash: str = "") -> str:
+    """Stable pointer for the largest generated raster of one immutable date."""
+    payload = {
+        "v": 1,
+        "processing_version": MOSAIC_PROCESSING_VERSION,
+        "geometry_hash": geometry_hash,
+        "user_id": user_id,
+        "parcel_id": parcel_id,
+        "index_key": index_key,
+        "image_date": image_date,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -696,6 +758,335 @@ def local_png_url(cache_key: str) -> str:
     return f"/api/satellite-free/cache/{cache_key}.png?v={safe_version}"
 
 
+def _metadata_render_size(metadata: dict[str, Any]) -> tuple[int, int]:
+    try:
+        width = int(metadata.get("render_width") or metadata.get("width") or 0)
+        height = int(metadata.get("render_height") or metadata.get("height") or 0)
+    except Exception:
+        return 0, 0
+    return max(width, 0), max(height, 0)
+
+
+def _metadata_has_enough_resolution(metadata: dict[str, Any], *, min_width: int, min_height: int) -> bool:
+    render_width, render_height = _metadata_render_size(metadata)
+    return render_width >= min_width and render_height >= min_height
+
+
+def _metadata_cloud_is_acceptable(metadata: dict[str, Any], max_cloud: float | None) -> bool:
+    if max_cloud is None:
+        return True
+    try:
+        cloud = float(metadata.get("cloud_coverage"))
+    except (TypeError, ValueError):
+        return True
+    return cloud <= float(max_cloud)
+
+
+def _persistent_result_from_metadata(cache_key: str, metadata: dict[str, Any], *, source: str) -> dict[str, Any] | None:
+    """Convert persisted GCS metadata into the regular map-layer result."""
+    if not isinstance(metadata, dict):
+        return None
+    if metadata.get("processing_version") != MOSAIC_PROCESSING_VERSION:
+        return None
+    if not metadata.get("available") or not metadata.get("bounds") or not metadata.get("date"):
+        return None
+    result = dict(metadata)
+    result.update({
+        "available": True,
+        "image_url": local_png_url(cache_key),
+        "object_path": metadata.get("object_path") or f"cache://{cache_key}",
+        "cache_key": cache_key,
+        "source": source,
+        "processing_version": MOSAIC_PROCESSING_VERSION,
+    })
+    return _json_safe(result)
+
+
+def _read_persistent_cache_result(cache_key: str) -> dict[str, Any] | None:
+    """Read a generated immutable raster from GCS without touching STAC bands."""
+    try:
+        metadata = download_satellite_cache_metadata(cache_key)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        logger.info("Cache persistente Sentinel-2 no disponible; se continúa con cache local/STAC", exc_info=True)
+        return None
+    return _persistent_result_from_metadata(cache_key, metadata, source="persistent-cache")
+
+
+def _result_from_manifest(manifest: dict[str, Any], *, source: str, min_width: int, min_height: int, max_cloud: float | None = None) -> dict[str, Any] | None:
+    if not isinstance(manifest, dict):
+        return None
+    if not _metadata_has_enough_resolution(manifest, min_width=min_width, min_height=min_height):
+        return None
+    if not _metadata_cloud_is_acceptable(manifest, max_cloud):
+        return None
+    cache_key = str(manifest.get("cache_key") or "")
+    if not cache_key:
+        return None
+    # Prefer the complete adjacent metadata object. The pointer also carries a
+    # copy so a temporary metadata-read failure does not force expensive raster
+    # work. Both objects are stored in GCS and survive instance replacement.
+    persisted = _read_persistent_cache_result(cache_key)
+    if persisted and _metadata_has_enough_resolution(persisted, min_width=min_width, min_height=min_height):
+        if _metadata_cloud_is_acceptable(persisted, max_cloud):
+            persisted["source"] = source
+            return persisted
+    return _persistent_result_from_metadata(cache_key, manifest, source=source)
+
+
+def _read_latest_persistent_result(*, user_id: str, parcel_id: str, index_key: str, width: int, height: int, geometry_hash: str, max_cloud: float | None = None) -> dict[str, Any] | None:
+    """Return a recent generated raster pointer from GCS for instant first paint.
+
+    The second lookup migrates manifests created by the previous delivery, whose
+    latest pointer still included render dimensions. That lets already processed
+    imagery become instant immediately after this deployment.
+    """
+    manifest_key = _latest_manifest_key(
+        user_id=user_id,
+        parcel_id=parcel_id,
+        index_key=index_key,
+        geometry_hash=geometry_hash,
+    )
+    manifest: dict[str, Any] | None = None
+    try:
+        manifest = download_satellite_latest_manifest(manifest_key)
+    except FileNotFoundError:
+        manifest = None
+    except Exception:
+        logger.info("Manifest latest Sentinel-2 no disponible; se continúa con catálogo", exc_info=True)
+
+    if manifest:
+        result = _result_from_manifest(
+            manifest,
+            source="persistent-latest-cache",
+            min_width=width,
+            min_height=height,
+            max_cloud=max_cloud,
+        )
+        if result:
+            return result
+
+    legacy_manifest_key = _legacy_latest_manifest_key(
+        user_id=user_id,
+        parcel_id=parcel_id,
+        index_key=index_key,
+        width=width,
+        height=height,
+        geometry_hash=geometry_hash,
+    )
+    try:
+        legacy_manifest = download_satellite_latest_manifest(legacy_manifest_key)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        logger.info("Manifest legacy Sentinel-2 no disponible; se continúa con catálogo", exc_info=True)
+        return None
+
+    promoted = _json_safe({
+        **legacy_manifest,
+        "render_width": legacy_manifest.get("render_width") or width,
+        "render_height": legacy_manifest.get("render_height") or height,
+    })
+    result = _result_from_manifest(
+        promoted,
+        source="persistent-latest-cache-migrated",
+        min_width=width,
+        min_height=height,
+        max_cloud=max_cloud,
+    )
+    if not result:
+        return None
+    try:
+        _publish_persistent_cache_metadata(
+            cache_key=str(result.get("cache_key") or promoted.get("cache_key") or ""),
+            metadata=promoted,
+            user_id=user_id,
+            parcel_id=parcel_id,
+            index_key=index_key,
+            width=width,
+            height=height,
+            geometry_hash=geometry_hash,
+        )
+    except Exception:
+        logger.info("No se pudo promover manifest legacy Sentinel-2; la imagen se devolverá igual", exc_info=True)
+    return result
+
+def _read_date_persistent_result(*, user_id: str, parcel_id: str, index_key: str, image_date: str, width: int, height: int, geometry_hash: str) -> dict[str, Any] | None:
+    """Reuse a previously rendered image for the date when it is large enough.
+
+    This makes comparison and zoning instant after the normal 3072px satellite
+    image has already been generated. A smaller render never replaces a larger
+    one and is not reused when the caller explicitly needs more resolution.
+    """
+    manifest_key = _date_manifest_key(
+        user_id=user_id,
+        parcel_id=parcel_id,
+        index_key=index_key,
+        image_date=image_date,
+        geometry_hash=geometry_hash,
+    )
+    try:
+        manifest = download_satellite_date_manifest(manifest_key)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        logger.info("Manifest por fecha Sentinel-2 no disponible; se continúa con cache exacta/STAC", exc_info=True)
+        return None
+    return _result_from_manifest(
+        manifest,
+        source="persistent-date-cache",
+        min_width=width,
+        min_height=height,
+    )
+
+
+def _manifest_rank(metadata: dict[str, Any]) -> tuple[str, int]:
+    image_date = str(metadata.get("date") or "")[:10]
+    width, height = _metadata_render_size(metadata)
+    return image_date, width * height
+
+
+def _publish_best_manifest(*, read_manifest, write_manifest, manifest_key: str, metadata: dict[str, Any]) -> None:
+    """Advance one GCS pointer only when date/resolution improves."""
+    try:
+        previous = read_manifest(manifest_key)
+    except Exception:
+        previous = None
+    if previous and _manifest_rank(previous) >= _manifest_rank(metadata):
+        return
+    write_manifest(manifest_key, metadata)
+
+
+def _publish_latest_manifest(*, manifest_key: str, metadata: dict[str, Any]) -> None:
+    _publish_best_manifest(
+        read_manifest=download_satellite_latest_manifest,
+        write_manifest=upload_satellite_latest_manifest,
+        manifest_key=manifest_key,
+        metadata=metadata,
+    )
+
+
+def _publish_date_manifest(*, manifest_key: str, metadata: dict[str, Any]) -> None:
+    _publish_best_manifest(
+        read_manifest=download_satellite_date_manifest,
+        write_manifest=upload_satellite_date_manifest,
+        manifest_key=manifest_key,
+        metadata=metadata,
+    )
+
+
+def _publish_persistent_cache_metadata(*, cache_key: str, metadata: dict[str, Any], user_id: str, parcel_id: str, index_key: str, width: int, height: int, geometry_hash: str) -> None:
+    """Persist metadata and shared pointers after the PNG alias is safely stored."""
+    full_metadata = _json_safe({
+        **metadata,
+        "available": True,
+        "cache_key": cache_key,
+        "image_url": local_png_url(cache_key),
+        "geometry_hash": geometry_hash,
+        "render_width": width,
+        "render_height": height,
+        "processing_version": MOSAIC_PROCESSING_VERSION,
+    })
+    upload_satellite_cache_metadata(cache_key, full_metadata)
+    latest_manifest_key = _latest_manifest_key(
+        user_id=user_id,
+        parcel_id=parcel_id,
+        index_key=index_key,
+        geometry_hash=geometry_hash,
+    )
+    date_manifest_key = _date_manifest_key(
+        user_id=user_id,
+        parcel_id=parcel_id,
+        index_key=index_key,
+        image_date=str(full_metadata.get("date") or "")[:10],
+        geometry_hash=geometry_hash,
+    )
+    _publish_latest_manifest(manifest_key=latest_manifest_key, metadata=full_metadata)
+    _publish_date_manifest(manifest_key=date_manifest_key, metadata=full_metadata)
+
+
+def _backfill_persistent_result_pointers(result: dict[str, Any], *, user_id: str, parcel_id: str, index_key: str, width: int, height: int, geometry_hash: str) -> dict[str, Any]:
+    """Promote old cache metadata into shared latest/date pointers once."""
+    metadata = _json_safe({
+        **result,
+        "render_width": result.get("render_width") or width,
+        "render_height": result.get("render_height") or height,
+    })
+    cache_key = str(metadata.get("cache_key") or "")
+    if not cache_key:
+        return result
+    # New metadata already has dimensions and was published by `_store_png`.
+    # Only older entries need the one-time promotion write.
+    if result.get("render_width") and result.get("render_height"):
+        return result
+    try:
+        _publish_persistent_cache_metadata(
+            cache_key=cache_key,
+            metadata=metadata,
+            user_id=user_id,
+            parcel_id=parcel_id,
+            index_key=index_key,
+            width=width,
+            height=height,
+            geometry_hash=geometry_hash,
+        )
+        promoted = _persistent_result_from_metadata(cache_key, metadata, source=str(result.get("source") or "persistent-cache-migrated"))
+        return promoted or result
+    except Exception:
+        logger.info("No se pudo promover metadata Sentinel-2 heredada; la imagen se devolverá igual", exc_info=True)
+        return result
+
+
+def _backfill_existing_png_alias(*, cache_key: str, user_id: str, parcel_id: str, index_key: str, image_date: str, width: int, height: int, geometry_hash: str, parcel_geometry: dict, cloud_coverage: float | None) -> dict[str, Any] | None:
+    """Recover an older immutable PNG alias without reading Sentinel COG bands.
+
+    Deliveries before the JSON manifests already uploaded `cache/<hash>.png`.
+    Download it once into the instance, synthesize lightweight metadata and
+    publish the new pointers. This is still much cheaper than raster generation.
+    """
+    try:
+        content = download_satellite_cache_png_bytes(cache_key)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        logger.info("No se pudo comprobar alias PNG Sentinel-2 heredado", exc_info=True)
+        return None
+    try:
+        local_png_path(cache_key).write_bytes(content)
+        bounds = bounds_from_gdf(geometry_to_gdf(parcel_geometry))
+        metadata = _json_safe({
+            "available": True,
+            "cache_key": cache_key,
+            "date": image_date,
+            "cloud_coverage": cloud_coverage,
+            "bounds": bounds,
+            "statistics": {},
+            "object_path": f"cache://{cache_key}",
+            "source": "persistent-png-alias-migrated",
+            "render_width": width,
+            "render_height": height,
+            "geometry_hash": geometry_hash,
+            "processing_version": MOSAIC_PROCESSING_VERSION,
+            "warnings": ["Se reutilizó un PNG Sentinel-2 heredado. Las estadísticas se completarán al regenerar voluntariamente la fecha."],
+        })
+        _write_local_metadata(cache_key, metadata)
+        _publish_persistent_cache_metadata(
+            cache_key=cache_key,
+            metadata=metadata,
+            user_id=user_id,
+            parcel_id=parcel_id,
+            index_key=index_key,
+            width=width,
+            height=height,
+            geometry_hash=geometry_hash,
+        )
+        return _persistent_result_from_metadata(cache_key, metadata, source="persistent-png-alias-migrated")
+    except Exception:
+        logger.info("No se pudo promover alias PNG Sentinel-2 heredado", exc_info=True)
+        return None
+
+
 def get_cached_db_image(db_session, *, user_id: str, parcel_id: str, index_key: str, target_date: date | None) -> SatelliteImage | None:
     if not DB_CACHE_ENABLED:
         return None
@@ -713,8 +1104,8 @@ def get_cached_db_image(db_session, *, user_id: str, parcel_id: str, index_key: 
 
 
 def image_url_from_object_path(object_path: str) -> str:
-    if object_path.startswith("local://"):
-        cache_key = object_path.split("local://", 1)[1]
+    if object_path.startswith("local://") or object_path.startswith("cache://"):
+        cache_key = object_path.split("://", 1)[1]
         return local_png_url(cache_key)
     return generate_signed_satellite_url(object_path)
 
@@ -723,8 +1114,17 @@ def _store_png(png_bytes: bytes, *, user_id: str, parcel_id: str, index_key: str
     cache_key = _cache_key(user_id=user_id, parcel_id=parcel_id, index_key=index_key, image_date=image_date, width=width, height=height, geometry_hash=geometry_hash)
     path = local_png_path(cache_key)
     path.write_bytes(png_bytes)
-    if metadata is not None:
-        _write_local_metadata(cache_key, metadata)
+    base_metadata = _json_safe({
+        **(metadata or {}),
+        "available": True,
+        "cache_key": cache_key,
+        "date": image_date,
+        "geometry_hash": geometry_hash,
+        "render_width": width,
+        "render_height": height,
+        "processing_version": MOSAIC_PROCESSING_VERSION,
+    })
+    _write_local_metadata(cache_key, base_metadata)
 
     try:
         object_path = upload_satellite_png_bytes(
@@ -735,12 +1135,25 @@ def _store_png(png_bytes: bytes, *, user_id: str, parcel_id: str, index_key: str
             f"{image_date}-{geometry_hash or cache_key[:12]}",
             cache_key=cache_key,
         )
+        persisted_metadata = _json_safe({**base_metadata, "object_path": object_path})
+        _write_local_metadata(cache_key, persisted_metadata)
+        _publish_persistent_cache_metadata(
+            cache_key=cache_key,
+            metadata=persisted_metadata,
+            user_id=user_id,
+            parcel_id=parcel_id,
+            index_key=index_key,
+            width=width,
+            height=height,
+            geometry_hash=geometry_hash,
+        )
         # Return the app cache endpoint instead of a signed GCS URL so CORS,
         # cache busting and auth-free <img> loading stay under our control.
         return object_path, local_png_url(cache_key)
     except Exception:
         # GCS is optional for local/dev. The frontend can load the public cache
         # route without Authorization headers, which is required for imageOverlay.
+        logger.info("No se pudo publicar cache persistente Sentinel-2; se conserva cache local", exc_info=True)
         return f"local://{cache_key}", local_png_url(cache_key)
 
 
@@ -756,12 +1169,65 @@ def generate_or_get_layer(
     width: int = 1024,
     height: int = 1024,
     force_refresh: bool = False,
+    revalidate_latest: bool = False,
 ) -> dict[str, Any]:
     index_key = normalize_index_key(index_key)
     geometry_fingerprint = _geometry_hash(parcel_geometry)
     definition = INDEX_DEFINITIONS.get(index_key)
     if not definition:
         raise ValueError(f"Índice no soportado: {index_key}")
+
+    # Persistent GCS manifests make generated rasters reusable after logout,
+    # browser-data deletion and Cloud Run instance replacement. For latest
+    # requests the UI gets an instant first paint; a lightweight background
+    # revalidation can later ask STAC whether a newer date exists.
+    if not force_refresh and target_date is None and not revalidate_latest:
+        latest_cached = _read_latest_persistent_result(
+            user_id=user_id,
+            parcel_id=parcel_id,
+            index_key=index_key,
+            width=width,
+            height=height,
+            geometry_hash=geometry_fingerprint,
+            max_cloud=max_cloud,
+        )
+        if latest_cached:
+            return latest_cached
+
+    # An exact date is immutable. Resolve it from the persistent hash alias
+    # before any STAC catalog or remote COG request.
+    if not force_refresh and target_date is not None:
+        exact_cache_key = _cache_key(
+            user_id=user_id,
+            parcel_id=parcel_id,
+            index_key=index_key,
+            image_date=target_date.isoformat(),
+            width=width,
+            height=height,
+            geometry_hash=geometry_fingerprint,
+        )
+        exact_cached = _read_persistent_cache_result(exact_cache_key)
+        if exact_cached:
+            return _backfill_persistent_result_pointers(
+                exact_cached,
+                user_id=user_id,
+                parcel_id=parcel_id,
+                index_key=index_key,
+                width=width,
+                height=height,
+                geometry_hash=geometry_fingerprint,
+            )
+        reusable_date_cached = _read_date_persistent_result(
+            user_id=user_id,
+            parcel_id=parcel_id,
+            index_key=index_key,
+            image_date=target_date.isoformat(),
+            width=width,
+            height=height,
+            geometry_hash=geometry_fingerprint,
+        )
+        if reusable_date_cached:
+            return reusable_date_cached
 
     cached = None
     if not force_refresh and DB_CACHE_ENABLED:
@@ -780,7 +1246,12 @@ def generate_or_get_layer(
             except Exception:
                 pass
     cached_stats = cached.statistics if cached and isinstance(cached.statistics, dict) else {}
-    if cached and cached.image_object_path and cached_stats.get("processing_version") == MOSAIC_PROCESSING_VERSION:
+    if (
+        cached
+        and cached.image_object_path
+        and cached_stats.get("processing_version") == MOSAIC_PROCESSING_VERSION
+        and _metadata_has_enough_resolution(cached_stats, min_width=width, min_height=height)
+    ):
         return _json_safe({
             "available": True,
             "date": cached.image_date.date().isoformat(),
@@ -809,13 +1280,6 @@ def generate_or_get_layer(
         }
 
     image_date = primary_scene.datetime.date()
-    # Once the date is chosen, collect every intersecting same-day tile even if
-    # one tile exceeds the cloud threshold. Excluding a cloudy boundary tile
-    # creates a transparent half-lot. SCL masking below marks its unusable pixels
-    # in gray while retaining any valid observations.
-    scenes = scenes_for_date(bbox=bbox, target_date=image_date, max_cloud=None, limit=MOSAIC_CATALOG_LIMIT)
-    if not scenes:
-        scenes = [primary_scene]
     cache_key = _cache_key(
         user_id=user_id,
         parcel_id=parcel_id,
@@ -825,31 +1289,45 @@ def generate_or_get_layer(
         height=height,
         geometry_hash=geometry_fingerprint,
     )
+
+    # Revalidation may need one STAC catalog lookup to discover the latest date,
+    # but it must still avoid remote band reads when that immutable date was
+    # already generated by any previous Cloud Run instance.
+    if not force_refresh:
+        persistent_cached = _read_persistent_cache_result(cache_key)
+        if persistent_cached:
+            return _backfill_persistent_result_pointers(
+                persistent_cached,
+                user_id=user_id,
+                parcel_id=parcel_id,
+                index_key=index_key,
+                width=width,
+                height=height,
+                geometry_hash=geometry_fingerprint,
+            )
+        reusable_date_cached = _read_date_persistent_result(
+            user_id=user_id,
+            parcel_id=parcel_id,
+            index_key=index_key,
+            image_date=image_date.isoformat(),
+            width=width,
+            height=height,
+            geometry_hash=geometry_fingerprint,
+        )
+        if reusable_date_cached:
+            return reusable_date_cached
+
     local_path = local_png_path(cache_key)
     if not force_refresh and local_path.exists():
         cached_meta = _read_local_metadata(cache_key)
-        # Backfill the GCS hash alias for local-cache hits. This is important
-        # after enabling GCS in production because older /tmp files may exist on
-        # one Cloud Run instance while other instances need cache/<hash>.png.
-        try:
-            upload_satellite_png_bytes(
-                local_path.read_bytes(),
-                user_id,
-                parcel_id,
-                index_key,
-                f"{image_date.isoformat()}-{geometry_fingerprint or cache_key[:12]}",
-                cache_key=cache_key,
-            )
-        except Exception:
-            logger.info("No se pudo respaldar local-cache Sentinel-2 en GCS; se usará cache local", exc_info=True)
-        return _json_safe({
+        local_result = _json_safe({
             "available": True,
             "date": cached_meta.get("date") or image_date.isoformat(),
             "cloud_coverage": cached_meta.get("cloud_coverage", primary_scene.cloud_cover),
             "bounds": cached_meta.get("bounds") or bounds_from_gdf(geometry_to_gdf(parcel_geometry)),
             "statistics": cached_meta.get("statistics") or {},
             "image_url": local_png_url(cache_key),
-            "object_path": f"local://{cache_key}",
+            "object_path": cached_meta.get("object_path") or f"local://{cache_key}",
             "source": "local-cache",
             "scene_id": cached_meta.get("scene_id") or primary_scene.id,
             "scene_ids": cached_meta.get("scene_ids") or [primary_scene.id],
@@ -860,7 +1338,62 @@ def generate_or_get_layer(
             "quality_placeholder_applied": bool(cached_meta.get("quality_placeholder_applied", False)),
             "quality_mask_applied": bool(cached_meta.get("quality_mask_applied", False)),
             "processing_version": cached_meta.get("processing_version") or MOSAIC_PROCESSING_VERSION,
+            "warnings": cached_meta.get("warnings") or [],
+            "render_width": cached_meta.get("render_width") or width,
+            "render_height": cached_meta.get("render_height") or height,
         })
+        # Backfill the GCS hash alias and metadata for local-cache hits. This is
+        # important when an older instance generated the PNG before persistent
+        # manifests were enabled.
+        try:
+            object_path = upload_satellite_png_bytes(
+                local_path.read_bytes(),
+                user_id,
+                parcel_id,
+                index_key,
+                f"{image_date.isoformat()}-{geometry_fingerprint or cache_key[:12]}",
+                cache_key=cache_key,
+            )
+            published = _json_safe({**local_result, "object_path": object_path})
+            _write_local_metadata(cache_key, published)
+            _publish_persistent_cache_metadata(
+                cache_key=cache_key,
+                metadata=published,
+                user_id=user_id,
+                parcel_id=parcel_id,
+                index_key=index_key,
+                width=width,
+                height=height,
+                geometry_hash=geometry_fingerprint,
+            )
+            return published
+        except Exception:
+            logger.info("No se pudo respaldar local-cache Sentinel-2 en GCS; se usará cache local", exc_info=True)
+        return local_result
+
+    if not force_refresh:
+        migrated_alias = _backfill_existing_png_alias(
+            cache_key=cache_key,
+            user_id=user_id,
+            parcel_id=parcel_id,
+            index_key=index_key,
+            image_date=image_date.isoformat(),
+            width=width,
+            height=height,
+            geometry_hash=geometry_fingerprint,
+            parcel_geometry=parcel_geometry,
+            cloud_coverage=primary_scene.cloud_cover,
+        )
+        if migrated_alias:
+            return migrated_alias
+
+    # Once the date is chosen, collect every intersecting same-day tile even if
+    # one tile exceeds the cloud threshold. Excluding a cloudy boundary tile
+    # creates a transparent half-lot. SCL masking below marks its unusable pixels
+    # in gray while retaining any valid observations.
+    scenes = scenes_for_date(bbox=bbox, target_date=image_date, max_cloud=None, limit=MOSAIC_CATALOG_LIMIT)
+    if not scenes:
+        scenes = [primary_scene]
 
     bands, _meta, used_scene_ids, mosaic_warnings, quality_mask_scene_count = _load_required_bands_mosaic(
         scenes,
@@ -891,6 +1424,8 @@ def generate_or_get_layer(
         "candidate_scene_count": len(scenes),
         "quality_mask_applied": quality_mask_applied,
         "quality_mask_scene_count": quality_mask_scene_count,
+        "render_width": width,
+        "render_height": height,
     })
     png_bytes = _fit_png_to_display_size(
         render_index_png(index_key, arr, unavailable_mask=inside_mask),
