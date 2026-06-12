@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import mimetypes
+import re
 import os
 import secrets
 import shutil
@@ -17,12 +18,14 @@ from pathlib import Path
 from threading import RLock
 from time import monotonic
 from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 from fastapi import APIRouter, Body, File, Form, Header, HTTPException, UploadFile
 from starlette.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from jose import ExpiredSignatureError, JWTError, jwt
 from pydantic import BaseModel
+import httpx
 
 try:
     import psycopg2
@@ -643,28 +646,23 @@ def find_existing_user_parcel(rows: List[Dict[str, Any]], row: Dict[str, Any], u
     return None
 
 
-def replace_user_parcels_with(db: Dict[str, Any], user_id: str, row: Dict[str, Any]) -> None:
-    """Keep exactly one loaded parcel per user in compat storage."""
-    parcel_rows = table(db, "parcels")
-    previous_ids = {
-        str(existing.get("id"))
-        for existing in parcel_rows
-        if str(existing.get("user_id") or "") == user_id and existing.get("id") and str(existing.get("id")) != str(row.get("id"))
-    }
-    db["tables"]["parcels"] = [
-        existing
-        for existing in parcel_rows
-        if str(existing.get("user_id") or "") != user_id
-    ]
-    table(db, "parcels").append(row)
+def upsert_user_parcel(db: Dict[str, Any], user_id: str, row: Dict[str, Any]) -> Dict[str, Any]:
+    """Insert a parcel without deleting the user's other lots.
 
-    if previous_ids:
-        for child_table in PARCEL_CHILD_TABLES:
-            db["tables"][child_table] = [
-                child
-                for child in table(db, child_table)
-                if str(child.get("parcel_id") or "") not in previous_ids
-            ]
+    If a lot with the same normalized name/code already exists, update it in-place
+    so child records keep referencing the same parcel id.
+    """
+    parcel_rows = table(db, "parcels")
+    existing = find_existing_user_parcel(parcel_rows, row, user_id)
+    if existing is not None:
+        preserved_id = existing.get("id") or row.get("id")
+        existing.clear()
+        existing.update(row)
+        existing["id"] = preserved_id
+        existing["user_id"] = user_id
+        return existing
+    parcel_rows.append(row)
+    return row
 
 
 def cmp_value(value: Any, op: str, expected: Any) -> bool:
@@ -1329,7 +1327,7 @@ async def upload_parcel_from_satellite(
         })
         with LOCK:
             db = read_db()
-            replace_user_parcels_with(db, user["id"], row)
+            row = upsert_user_parcel(db, user["id"], row)
             write_db(db)
         return {"data": {"parcel": row}, "error": None}
     except ValueError as exc:
@@ -1354,6 +1352,127 @@ async def upload_parcel_from_satellite(
                 ),
             )
         raise HTTPException(status_code=500, detail=f"Error subiendo parcela: {raw_message}")
+
+
+_GOOGLE_MAPS_ALLOWED_HOSTS = {
+    "maps.app.goo.gl",
+    "goo.gl",
+    "maps.google.com",
+    "www.google.com",
+    "google.com",
+}
+_GOOGLE_MAPS_COORD_PATTERNS = [
+    re.compile(r"/@(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)"),
+    re.compile(r"!3d(-?\d+(?:\.\d+)?)!4d(-?\d+(?:\.\d+)?)"),
+    re.compile(r"[?&](?:q|query|ll|destination|center)=(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)", re.IGNORECASE),
+]
+
+def _is_allowed_google_maps_url(value: str) -> bool:
+    try:
+        parsed = urlparse(value)
+    except Exception:
+        return False
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    return hostname in _GOOGLE_MAPS_ALLOWED_HOSTS or hostname.endswith(".google.com") or hostname.endswith(".goo.gl")
+
+def _extract_google_maps_coordinates(value: str) -> Optional[Dict[str, float]]:
+    decoded = unquote(str(value or ""))
+    for pattern in _GOOGLE_MAPS_COORD_PATTERNS:
+        match = pattern.search(decoded)
+        if not match:
+            continue
+        lat = float(match.group(1))
+        lng = float(match.group(2))
+        if -90 <= lat <= 90 and -180 <= lng <= 180:
+            return {"lat": lat, "lng": lng}
+    try:
+        query = parse_qs(urlparse(decoded).query)
+    except Exception:
+        query = {}
+    for key in ("q", "query", "ll", "destination", "center"):
+        raw = str((query.get(key) or [""])[0]).strip()
+        match = re.search(r"(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)", raw)
+        if match:
+            lat, lng = float(match.group(1)), float(match.group(2))
+            if -90 <= lat <= 90 and -180 <= lng <= 180:
+                return {"lat": lat, "lng": lng}
+    return None
+
+async def _resolve_google_maps_url(value: str) -> tuple[str, Optional[Dict[str, float]]]:
+    current = str(value or "").strip()
+    if not _is_allowed_google_maps_url(current):
+        raise HTTPException(status_code=400, detail="Ingresa un enlace válido de Google Maps")
+    direct = _extract_google_maps_coordinates(current)
+    if direct:
+        return current, direct
+
+    async with httpx.AsyncClient(timeout=8.0, follow_redirects=False, headers={"User-Agent": "Dataris/1.0"}) as client:
+        for _ in range(6):
+            if not _is_allowed_google_maps_url(current):
+                raise HTTPException(status_code=400, detail="El enlace redirige fuera de Google Maps")
+            response = await client.get(current)
+            location = response.headers.get("location")
+            if location and response.status_code in {301, 302, 303, 307, 308}:
+                current = urljoin(current, location)
+                coords = _extract_google_maps_coordinates(current)
+                if coords:
+                    return current, coords
+                continue
+            coords = _extract_google_maps_coordinates(str(response.url)) or _extract_google_maps_coordinates(response.text)
+            return str(response.url), coords
+    return current, _extract_google_maps_coordinates(current)
+
+@router.post("/maps/resolve")
+async def resolve_google_maps_link(
+    payload: Dict[str, Any] = Body(default_factory=dict),
+    authorization: Optional[str] = Header(default=None),
+):
+    user = bearer_user(authorization)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    url = str(payload.get("url") or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="Ingresa un enlace de Google Maps")
+    resolved_url, coords = await _resolve_google_maps_url(url)
+    if not coords:
+        raise HTTPException(status_code=422, detail="No se encontraron coordenadas en el enlace. Abre la ubicación exacta en Google Maps y copia el enlace nuevamente.")
+    return {"data": {"url": resolved_url, **coords}, "error": None}
+
+@router.post("/parcels/create-manual")
+def create_manual_parcel(
+    payload: Dict[str, Any] = Body(default_factory=dict),
+    authorization: Optional[str] = Header(default=None),
+):
+    user = bearer_user(authorization)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    name = str(payload.get("name") or "").strip()
+    geometry = payload.get("geometry")
+    if not name:
+        raise HTTPException(status_code=400, detail="Nombre de lote requerido")
+    if not geometry:
+        raise HTTPException(status_code=400, detail="Dibuja al menos tres puntos para crear el lote")
+
+    t = now()
+    row = normalize_record_geometries("parcels", {
+        "id": str(uuid.uuid4()),
+        "user_id": user["id"],
+        "name": name,
+        "geometry": geometry,
+        "geometry_geojson": geometry,
+        "source": "manual_map",
+        "created_at": t,
+        "updated_at": t,
+    })
+    if not row.get("geometry_geojson") or not row.get("area"):
+        raise HTTPException(status_code=400, detail="El polígono dibujado no es válido. Revisa los puntos e intenta nuevamente.")
+    with LOCK:
+        db = read_db()
+        row = upsert_user_parcel(db, user["id"], row)
+        write_db(db)
+    return {"data": {"parcel": row}, "error": None}
 
 
 @router.post("/storage/{bucket}/upload")
