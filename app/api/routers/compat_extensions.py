@@ -28,6 +28,7 @@ from app.services.digiforms_company_config import (
     safe_mappings,
 )
 from app.services.digiforms_data_api import DigiformsDataAPI, DigiformsDataAPIError
+from app.services.commercial_demo_seed import DEMO_COMPANY_ID, is_commercial_demo_user
 
 router = APIRouter(prefix="/compat/extensions", tags=["Compatibility Extensions"])
 
@@ -662,6 +663,8 @@ def require_company_admin_scope(db: Dict[str, Any], user: Dict[str, Any], reques
 
 
 def _company_runtime_connection(db: Dict[str, Any], company_id: Optional[str]) -> Dict[str, str]:
+    if str(company_id or "") == DEMO_COMPANY_ID:
+        return {"client_id": "DEMO-CLIENT", "api_user": "demo-api-user", "api_password": "demo-api-password"}
     row = connection_for_company(db, company_id)
     if row:
         try:
@@ -860,6 +863,8 @@ def save_digiforms_company_config(payload: Dict[str, Any] = Body(default_factory
 @router.post("/digiforms/company-config/test")
 async def test_digiforms_company_config(payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
     user = require_user(authorization)
+    if is_commercial_demo_user(user):
+        return {"data": {"client_id": "DEMO-CLIENT", "api_user": "demo-api-user", "user_api": {"ok": True, "response": {"mode": "commercial_demo"}}, "data_api": [{"form_type": "harvest", "form_id": "DEMO-HARVEST-01", "ok": True, "records_received": 18}, {"form_type": "pest_weed", "form_id": "DEMO-PEST-01", "ok": True, "records_received": 4}], "data_api_ok": True, "ok": True, "demo": True}, "error": None}
     with LOCK:
         db = read_db()
         scope = require_company_admin_scope(db, user, str(payload.get("company_id") or "") or None)
@@ -915,6 +920,8 @@ async def test_digiforms_company_config(payload: Dict[str, Any] = Body(default_f
 @router.get("/digiforms/connection-test")
 async def test_digiforms_connection(authorization: Optional[str] = Header(default=None)):
     user = require_user(authorization)
+    if is_commercial_demo_user(user):
+        return {"data": {"configured": True, "client_id": "DEMO-CLIENT", "api_user": "demo-api-user", "base_url": settings.DIGIFORMS_BASE_URL, "portal_url": settings.DIGIFORMS_PORTAL_URL, "provisioning_enabled": True, "external_ok": True, "external_status": "demo_ready", "source": "commercial_demo_dataset", "message": "Conexión simulada lista para demostración."}, "error": None}
     with LOCK:
         db = read_db()
         scope = current_link_scope(db, user)

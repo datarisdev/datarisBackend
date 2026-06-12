@@ -37,6 +37,7 @@ from app.services.digiforms_company_config import (
     mappings_for_company,
 )
 from app.api.routers.compat_extensions import company_for_user, extension_enabled_for
+from app.services.commercial_demo_seed import is_commercial_demo_user
 
 router = APIRouter(prefix="/compat/sig-agricola", tags=["SIG Agrícola compatibility"])
 
@@ -969,6 +970,30 @@ def integration_status(authorization: Optional[str] = Header(default=None)):
     with LOCK:
         db = read_db()
         company_id = _company_id_for_user(db, user_id)
+        if is_commercial_demo_user(user):
+            imports = [row for row in table(db, "sig_import_runs") if _same_company_or_legacy_user(row, company_id=company_id, user_id=user_id)]
+            latest = max(imports, key=lambda row: str(row.get("created_at") or ""), default=None)
+            cursors = [_cursor_public(row) for row in table(db, "sig_sync_cursors") if _same_company_or_legacy_user(row, company_id=company_id, user_id=user_id)]
+            mappings = safe_mappings(mappings_for_company(db, company_id))
+            return {
+                "data": {
+                    "company_id": company_id,
+                    "capture_platform": "DigiformsApp",
+                    "active_results_channel": "commercial_demo_dataset",
+                    "active_results_channel_label": "Dataset comercial precargado · sincronización DigiForms simulada",
+                    "automatic_forms_results_api_enabled": True,
+                    "automatic_forms_results_api_status": "demo_ready",
+                    "automatic_forms_results_api_message": "La demo utiliza un dataset aislado con respuestas, georreferencias y formularios precargados. La sincronización se simula sin consumir servicios externos.",
+                    "user_api_scope": "Entorno de demostración aislado: cosecha, malezas y plagas disponibles para recorrido comercial.",
+                    "connection": {"company_id": company_id, "client_id": "DEMO-CLIENT", "api_user": "demo-api-user", "has_password": True, "connection_status": "demo_ready", "auto_sync_enabled": True},
+                    "form_mappings": mappings,
+                    "configured_form_types": [HARVEST_FORM_TYPE, PEST_WEED_FORM_TYPE],
+                    "configured_forms": {HARVEST_FORM_TYPE: "DEMO-HARVEST-01", PEST_WEED_FORM_TYPE: "DEMO-PEST-01"},
+                    "cursors": cursors,
+                    "latest_import": latest,
+                },
+                "error": None,
+            }
         connection = connection_for_company(db, company_id)
         api = _data_api_for_company(db, company_id)
         configured_types = _configured_form_types(db, company_id)
@@ -1016,6 +1041,13 @@ async def sync_from_digiforms_api(
 ):
     user = _require_user(authorization)
     user_id = str(user.get("id") or "")
+    if is_commercial_demo_user(user):
+        with LOCK:
+            db = read_db()
+            company_id = _company_id_for_user(db, user_id)
+            rows = [row for row in table(db, "sig_import_runs") if _same_company_or_legacy_user(row, company_id=company_id, user_id=user_id)]
+            rows.sort(key=lambda row: str(row.get("created_at") or ""), reverse=True)
+        return {"data": {"runs": rows[:2], "errors": [], "demo": True}, "error": None, "message": "Dataset comercial DigiForms actualizado sin consumir servicios externos."}
     with LOCK:
         db = read_db()
         company_id = _company_id_for_user(db, user_id)
@@ -1056,6 +1088,8 @@ def list_sync_cursors(authorization: Optional[str] = Header(default=None)):
 @router.post("/sync/test")
 async def test_digiforms_data_api(payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
     user = _require_user(authorization); user_id = str(user.get("id") or "")
+    if is_commercial_demo_user(user):
+        return {"data": {"ok": True, "records_received": 22, "form_id": "DEMO-HARVEST-01", "form_type": str(payload.get("form_type") or HARVEST_FORM_TYPE), "demo": True, "message": "Conexión simulada disponible para el recorrido comercial."}, "error": None}
     with LOCK:
         db = read_db(); company_id = _company_id_for_user(db, user_id)
         form_type = _safe_text(payload.get("form_type") or HARVEST_FORM_TYPE)

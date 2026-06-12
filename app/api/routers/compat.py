@@ -17,7 +17,7 @@ from email.message import EmailMessage
 from pathlib import Path
 from threading import RLock
 from time import monotonic
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 from fastapi import APIRouter, Body, File, Form, Header, HTTPException, UploadFile
@@ -36,6 +36,7 @@ from app.core.config import settings
 from app.services.telemetry.helicopter_processor import process_helicopter_zip
 from app.services.telemetry.aerial_copilot import process_aerial_copilot
 from app.utils.geojson_normalizer import normalize_record_geometries
+from app.services.commercial_demo_seed import ensure_commercial_demo, is_commercial_demo_user
 
 router = APIRouter(prefix="/compat", tags=["Frontend Compatibility"])
 
@@ -68,18 +69,19 @@ STATE_KEY = os.getenv("DATARIS_COMPAT_STATE_KEY", "default")
 
 TABLES = [
     "profiles", "user_roles", "admin_users", "companies", "platform_modules",
-    "company_modules", "user_modules", "parcels", "satellite_images", "satellite_comparisons",
+    "company_modules", "user_modules", "parcels", "satellite_images", "satellite_comparisons", "satellite_jobs",
     "field_notes", "parcel_crops", "aerial_analyses", "analysis_sessions",
     "analysis_data_points", "laborapp_registros", "laborapp_empleados_foto",
     "extension_requests", "digiforms_accounts", "digiforms_user_links", "digiforms_operation_logs",
     "digiforms_connections", "digiforms_form_mappings",
-    "sig_import_runs", "sig_harvest_records", "sig_pest_weed_records", "sig_harvest_overrides", "sig_sync_cursors",
+    "sig_import_runs", "sig_harvest_records", "sig_pest_weed_records", "sig_harvest_overrides", "sig_sync_cursors", "digiforms_raw_submissions",
 ]
 
 USER_SCOPED_TABLES = {
     "parcels",
     "satellite_images",
     "satellite_comparisons",
+    "satellite_jobs",
     "field_notes",
     "parcel_crops",
     "aerial_analyses",
@@ -96,11 +98,13 @@ USER_SCOPED_TABLES = {
     "sig_pest_weed_records",
     "sig_harvest_overrides",
     "sig_sync_cursors",
+    "digiforms_raw_submissions",
 }
 
 PARCEL_CHILD_TABLES = {
     "satellite_images",
     "satellite_comparisons",
+    "satellite_jobs",
     "field_notes",
     "parcel_crops",
     "analysis_sessions",
@@ -108,13 +112,16 @@ PARCEL_CHILD_TABLES = {
 
 DEFAULT_MODULES = [
     ("dashboard", "Dashboard", "Panel principal", "LayoutDashboard"),
+    ("analytics", "Analytics", "Indicadores gerenciales y modelos predictivos", "TrendingUp"),
     ("satelite", "Monitoreo Satelital", "Análisis satelital", "Satellite"),
     ("mapeo", "Mapeo", "Mapeo y análisis geoespacial", "Map"),
     ("telemetria", "Telemetría", "Indicadores y métricas", "Activity"),
+    ("ortofoto-analysis", "Análisis de ortofotos", "Procesamiento visual de ortomosaicos", "Image"),
     ("sig-agricola", "SIG Agrícola", "Análisis agrícola", "Sprout"),
     ("aplicaciones-aereas", "Aplicaciones Aéreas", "Control de aplicaciones", "Plane"),
     ("tareas", "Tareas", "Tablero Kanban", "Kanban"),
     ("personal", "Personal de Campo", "Control biométrico y georreferenciado", "Users"),
+    ("alertas", "Alertas inteligentes", "Detección proactiva de riesgos operativos", "Bell"),
 ]
 
 EXTENSION_MODULES = [
@@ -535,6 +542,7 @@ def normalize_db(db: Dict[str, Any]) -> Dict[str, Any]:
                 "updated_at": t,
             })
 
+    ensure_commercial_demo(db, password_hash=password_hash, reset=False)
     return db
 
 def table(db: Dict[str, Any], name: str) -> List[Dict[str, Any]]:
@@ -816,6 +824,15 @@ def sign_in(payload: Dict[str, Any] = Body(default_factory=dict)):
     user = next((u for u in db["users"] if u.get("email", "").lower() == email), None)
     if not user or not verify_password(password, user.get("password_hash", "")) or not user.get("is_active", True):
         raise HTTPException(status_code=401, detail="Invalid login credentials")
+    # Every commercial-demo login starts from the same curated, isolated state.
+    # The seeder follows only the demo tenant graph, including interactive rows,
+    # and leaves records belonging to real users and companies untouched.
+    if is_commercial_demo_user(user):
+        with LOCK:
+            db = read_db()
+            ensure_commercial_demo(db, password_hash=password_hash, reset=True)
+            write_db(db)
+            user = next((item for item in db["users"] if item.get("id") == user.get("id")), user)
     session = session_for(user)
     return {"data": {"user": session["user"], "session": session}, "error": None}
 
