@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Header, HTTPException
 
 from app.api.routers.compat import LOCK, bearer_user, read_db, table, write_db, now
+from app.services.commercial_demo_seed import is_commercial_demo_user
 from app.api.routers.compat_extensions import (
     ensure_extension_catalog,
     extension_enabled_for,
@@ -139,11 +140,18 @@ def get_current_access(authorization: Optional[str] = Header(default=None)):
         admin_user_id = admin.get("id") or None
         company_id = admin.get("company_id") or company_for_user(db, user_id)
         is_superadmin = admin_role == "superadmin"
+        is_demo = is_commercial_demo_user(user)
 
-        active_modules = [row for row in table(db, "platform_modules") if row.get("is_active", True) is not False]
+        # The commercial tenant is an isolated showcase.  It intentionally sees
+        # the complete product catalog even if an operator disabled a module for
+        # normal tenants while testing a rollout.
+        active_modules = [
+            row for row in table(db, "platform_modules")
+            if is_demo or row.get("is_active", True) is not False
+        ]
         active_platform_ids = _unique([item for row in active_modules for item in [row.get("id"), row.get("name")]])
 
-        if is_superadmin:
+        if is_demo or is_superadmin:
             effective_ids = _unique(["dashboard", *active_platform_ids])
         else:
             company_module_ids = _unique([
@@ -164,7 +172,7 @@ def get_current_access(authorization: Optional[str] = Header(default=None)):
         modules = []
         for row in active_modules:
             expanded = _unique([row.get("id"), row.get("name")])
-            if is_superadmin or any(module_id in effective_ids for module_id in expanded):
+            if is_demo or is_superadmin or any(module_id in effective_ids for module_id in expanded):
                 modules.append({
                     "id": _normalize_module_id(row.get("id") or row.get("name")),
                     "name": row.get("name") or row.get("id"),
@@ -207,6 +215,7 @@ def get_current_access(authorization: Optional[str] = Header(default=None)):
                 "first_name": profile.get("first_name"),
                 "last_name": profile.get("last_name"),
                 "company_name": profile.get("company_name"),
+                "is_demo": is_demo,
             },
             "userId": user_id,
             "adminUserId": admin_user_id,
