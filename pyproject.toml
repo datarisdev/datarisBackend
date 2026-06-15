@@ -37,3 +37,6 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["app*", "api*"]
 exclude = ["alembic*", "scripts*", "tests*", ".github*", ".idea*"]
+
+[tool.setuptools.package-data]
+"app" = ["data/demo/*.json"]
