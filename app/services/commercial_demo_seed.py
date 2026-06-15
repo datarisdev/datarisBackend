@@ -9,12 +9,16 @@ not call routers or external services, which keeps bootstrap deterministic in
 Cloud Run and in local development.
 """
 
+import json
 import math
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List
 from urllib.parse import quote
+
+_DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "demo"
 
 DEMO_TAG = "commercial-demo-v1"
 DEMO_EMAIL = os.getenv("DATARIS_DEMO_EMAIL", "demo@dataris.app").strip().lower()
@@ -180,6 +184,62 @@ def _parcel_rows() -> List[Dict[str, Any]]:
                 }
             )
         )
+    return rows
+
+
+def _real_parcel_rows() -> List[Dict[str, Any]]:
+    """Load pre-processed real parcels from ZIP-derived JSON files.
+
+    Files are generated once by scripts/generate_demo_parcels.py and committed
+    to the repository.  Each file contains an array of parcel specs with
+    WGS-84 GeoJSON geometries.  If a file is absent the source is silently
+    skipped so the rest of the demo remains functional.
+    """
+    sources = [
+        ("lotes_salgado.json", "lotes_salgado"),
+        ("palo_gordo.json", "palo_gordo"),
+    ]
+    rows: List[Dict[str, Any]] = []
+    for filename, source_tag in sources:
+        path = _DATA_DIR / filename
+        if not path.exists():
+            continue
+        try:
+            specs: List[Dict[str, Any]] = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        for idx, spec in enumerate(specs):
+            parcel_id = _id(f"real-parcel:{source_tag}:{spec.get('key', idx)}")
+            geometry = spec.get("geometry")
+            bounds = spec.get("bounds") or {}
+            center = spec.get("center") or {}
+            rows.append(
+                _tag(
+                    {
+                        "id": parcel_id,
+                        "user_id": DEMO_USER_ID,
+                        "company_id": DEMO_COMPANY_ID,
+                        "name": spec.get("name", ""),
+                        "finca": spec.get("finca", ""),
+                        "lote": spec.get("lote", ""),
+                        "codigo": spec.get("codigo"),
+                        "external_id": spec.get("external_id"),
+                        "crop": None,
+                        "variety": None,
+                        "area": spec.get("area"),
+                        "area_ha": spec.get("area"),
+                        "hectares": spec.get("area"),
+                        "geometry": geometry,
+                        "geometry_geojson": geometry,
+                        "bounds": bounds,
+                        "geometry_bounds": bounds,
+                        "geometry_center": center,
+                        "source": f"real_demo_{source_tag}",
+                        "created_at": _iso(100 + idx),
+                        "updated_at": _iso(1),
+                    }
+                )
+            )
     return rows
 
 
@@ -655,6 +715,10 @@ def _base_rows(password_hash: Callable[[str], str]) -> Dict[str, List[Dict[str, 
 
 def _seed_rows(password_hash: Callable[[str], str]) -> Dict[str, List[Dict[str, Any]]]:
     parcels = _parcel_rows()
+    # Real lots from customer shapefiles — appended after the synthetic parcels
+    # so all rich demo data (satellite, notes, etc.) tied to the synthetic parcel
+    # IDs remains intact.
+    real_parcels = _real_parcel_rows()
     satellite_images, comparisons, jobs = _satellite_rows(parcels)
     aerial = _aerial_rows(parcels)
     sessions, points = _mapping_rows(parcels)
@@ -662,7 +726,7 @@ def _seed_rows(password_hash: Callable[[str], str]) -> Dict[str, List[Dict[str, 
     rows = _base_rows(password_hash)
     rows.update(
         {
-            "parcels": parcels,
+            "parcels": parcels + real_parcels,
             "parcel_crops": _crop_rows(parcels),
             "satellite_images": satellite_images,
             "satellite_comparisons": comparisons,
