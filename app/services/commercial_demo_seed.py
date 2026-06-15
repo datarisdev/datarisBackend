@@ -142,7 +142,61 @@ def _avatar(name: str) -> str:
     return f"https://api.dicebear.com/9.x/initials/svg?seed={quote(name)}&backgroundType=gradientLinear"
 
 
+def _featured_real_specs() -> List[Dict[str, Any]]:
+    """Load top-3-by-area specs from each shapefile-derived JSON file.
+
+    Returns up to 6 specs with real WGS-84 geometry plus derived lat/lng/dlat/dlng
+    fields needed by the data-generation helpers.  Returns an empty list when the
+    JSON files are absent so the caller can fall back to synthetic rectangles.
+    """
+    result: List[Dict[str, Any]] = []
+    for filename in ("lotes_salgado.json", "palo_gordo.json"):
+        path = _DATA_DIR / filename
+        if not path.exists():
+            continue
+        try:
+            raw: List[Dict[str, Any]] = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        top3 = sorted(raw, key=lambda s: s.get("area") or 0, reverse=True)[:3]
+        for item in top3:
+            bounds = item.get("bounds") or {}
+            center = item.get("center") or {}
+            lat = float(center.get("lat") or 0)
+            lng = float(center.get("lng") or 0)
+            dlat = abs((bounds.get("north", lat + 0.005) - bounds.get("south", lat - 0.005)) / 2)
+            dlng = abs((bounds.get("east", lng + 0.005) - bounds.get("west", lng - 0.005)) / 2)
+            spec = dict(item)
+            spec.update({
+                "lat": lat,
+                "lng": lng,
+                "dlat": dlat,
+                "dlng": dlng,
+                "farm": item.get("finca") or "",
+                "code": item.get("codigo") or item.get("lote") or item["key"],
+            })
+            result.append(spec)
+    return result
+
+
 def _parcel_specs() -> List[Dict[str, Any]]:
+    real = _featured_real_specs()
+    ndvi_vals = [0.78, 0.64, 0.22, 0.71, 0.55, 0.69]
+    crop_configs = [
+        ("Caña de azúcar", "CP72-2086"),
+        ("Caña de azúcar", "CG98-10"),
+        ("Caña de azúcar", "CP73-1547"),
+        ("Caña de azúcar", "Mex79-431"),
+        ("Caña de azúcar", "CG02-163"),
+        ("Caña de azúcar", "CP72-2086"),
+    ]
+    if len(real) >= 6:
+        for i, spec in enumerate(real[:6]):
+            spec["ndvi"] = ndvi_vals[i]
+            spec["crop"] = crop_configs[i][0]
+            spec["variety"] = crop_configs[i][1]
+        return real[:6]
+    # Fallback: synthetic rectangular parcels when JSON files are absent
     return [
         {"key": "aurora-norte", "name": "Lote Aurora Norte", "code": "AN-01", "farm": "Finca Aurora", "area": 72.4, "lat": 14.2948, "lng": -90.7850, "dlat": 0.0042, "dlng": 0.0053, "ndvi": 0.78, "crop": "Caña de azúcar", "variety": "CP72-2086"},
         {"key": "aurora-centro", "name": "Lote Aurora Centro", "code": "AC-02", "farm": "Finca Aurora", "area": 86.1, "lat": 14.2842, "lng": -90.7790, "dlat": 0.0047, "dlng": 0.0058, "ndvi": 0.64, "crop": "Caña de azúcar", "variety": "CG98-10"},
@@ -157,7 +211,9 @@ def _parcel_rows() -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for index, spec in enumerate(_parcel_specs()):
         parcel_id = _id(f"parcel:{spec['key']}")
-        geometry = _rect_geometry(spec["name"], spec["lat"], spec["lng"], spec["dlat"], spec["dlng"])
+        geometry = spec["geometry"] if spec.get("geometry") else _rect_geometry(spec["name"], spec["lat"], spec["lng"], spec["dlat"], spec["dlng"])
+        bounds_val = spec.get("bounds") or _bounds(spec["lat"], spec["lng"], spec["dlat"], spec["dlng"])
+        center_val = spec.get("center") or {"lat": spec["lat"], "lng": spec["lng"]}
         rows.append(
             _tag(
                 {
@@ -165,9 +221,9 @@ def _parcel_rows() -> List[Dict[str, Any]]:
                     "user_id": DEMO_USER_ID,
                     "company_id": DEMO_COMPANY_ID,
                     "name": spec["name"],
-                    "finca": spec["farm"],
-                    "lote": spec["name"],
-                    "codigo": spec["code"],
+                    "finca": spec.get("farm") or "",
+                    "lote": spec.get("lote") or spec["name"],
+                    "codigo": spec.get("code") or spec.get("codigo"),
                     "crop": spec["crop"],
                     "variety": spec["variety"],
                     "area": spec["area"],
@@ -175,10 +231,11 @@ def _parcel_rows() -> List[Dict[str, Any]]:
                     "hectares": spec["area"],
                     "geometry": geometry,
                     "geometry_geojson": geometry,
-                    "bounds": _bounds(spec["lat"], spec["lng"], spec["dlat"], spec["dlng"]),
-                    "geometry_bounds": _bounds(spec["lat"], spec["lng"], spec["dlat"], spec["dlng"]),
-                    "geometry_center": {"lat": spec["lat"], "lng": spec["lng"]},
+                    "bounds": bounds_val,
+                    "geometry_bounds": bounds_val,
+                    "geometry_center": center_val,
                     "source": "commercial_demo",
+                    "demo_featured": True,
                     "created_at": _iso(150 + index),
                     "updated_at": _iso(index + 1),
                 }
@@ -187,14 +244,21 @@ def _parcel_rows() -> List[Dict[str, Any]]:
     return rows
 
 
+def _get_featured_keys() -> set:
+    """Keys already used as featured (data-rich) parcels — skip in real_parcel_rows."""
+    return {spec["key"] for spec in _parcel_specs()}
+
+
 def _real_parcel_rows() -> List[Dict[str, Any]]:
     """Load pre-processed real parcels from ZIP-derived JSON files.
 
     Files are generated once by scripts/generate_demo_parcels.py and committed
     to the repository.  Each file contains an array of parcel specs with
-    WGS-84 GeoJSON geometries.  If a file is absent the source is silently
-    skipped so the rest of the demo remains functional.
+    WGS-84 GeoJSON geometries.  Parcels already promoted as featured are skipped
+    to avoid duplicates.  If a file is absent the source is silently skipped so
+    the rest of the demo remains functional.
     """
+    featured_keys = _get_featured_keys()
     sources = [
         ("lotes_salgado.json", "lotes_salgado"),
         ("palo_gordo.json", "palo_gordo"),
@@ -209,6 +273,8 @@ def _real_parcel_rows() -> List[Dict[str, Any]]:
         except Exception:
             continue
         for idx, spec in enumerate(specs):
+            if spec.get("key") in featured_keys:
+                continue
             parcel_id = _id(f"real-parcel:{source_tag}:{spec.get('key', idx)}")
             geometry = spec.get("geometry")
             bounds = spec.get("bounds") or {}
@@ -265,6 +331,7 @@ def _crop_rows(parcels: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _satellite_side(spec: Dict[str, Any], days_ago: int, ndvi: float, index_type: str = "NDVI") -> Dict[str, Any]:
+    bounds = spec.get("bounds") or _bounds(spec["lat"], spec["lng"], spec["dlat"], spec["dlng"])
     return {
         "date": _date(days_ago),
         "image_date": _date(days_ago),
@@ -280,7 +347,7 @@ def _satellite_side(spec: Dict[str, Any], days_ago: int, ndvi: float, index_type
         },
         "ndvi_mean": round(ndvi, 3) if index_type == "NDVI" else None,
         "average_ndvi": round(ndvi, 3) if index_type == "NDVI" else None,
-        "bounds": _bounds(spec["lat"], spec["lng"], spec["dlat"], spec["dlng"]),
+        "bounds": bounds,
         "coverage_percent": 96.8,
         "unavailable_percent": 3.2,
         "cloud_coverage": 2.4,
@@ -470,7 +537,7 @@ def _mapping_rows(parcels: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], 
                     "responsable": person,
                     "maquinaria": machine,
                     "analysis_type": "variable_rate_mapping",
-                    "file_name": f"{parcel['codigo'].lower()}-{labor}.csv",
+                    "file_name": f"{(parcel.get('codigo') or 'demo').lower()}-{labor}.csv",
                     "variables": variables,
                     "bounds": {"minLat": b["south"], "maxLat": b["north"], "minLng": b["west"], "maxLng": b["east"]},
                     "created_at": _iso(5 + session_index * 6),
