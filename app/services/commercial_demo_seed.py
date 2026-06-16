@@ -150,7 +150,7 @@ def _featured_real_specs() -> List[Dict[str, Any]]:
     JSON files are absent so the caller can fall back to synthetic rectangles.
     """
     result: List[Dict[str, Any]] = []
-    for filename in ("lotes_salgado.json", "palo_gordo.json"):
+    for filename in ("lotes_salgado.json",):
         path = _DATA_DIR / filename
         if not path.exists():
             continue
@@ -190,7 +190,7 @@ def _parcel_specs() -> List[Dict[str, Any]]:
         ("Caña de azúcar", "CG02-163"),
         ("Caña de azúcar", "CP72-2086"),
     ]
-    if len(real) >= 6:
+    if real:
         for i, spec in enumerate(real[:6]):
             spec["ndvi"] = ndvi_vals[i]
             spec["crop"] = crop_configs[i][0]
@@ -261,7 +261,6 @@ def _real_parcel_rows() -> List[Dict[str, Any]]:
     featured_keys = _get_featured_keys()
     sources = [
         ("lotes_salgado.json", "lotes_salgado"),
-        ("palo_gordo.json", "palo_gordo"),
     ]
     rows: List[Dict[str, Any]] = []
     for filename, source_tag in sources:
