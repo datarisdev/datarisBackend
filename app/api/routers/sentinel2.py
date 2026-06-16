@@ -896,3 +896,128 @@ def cache_png(cache_key: str, request: Request) -> Response:
 @router.head("/cache/{cache_key}.png")
 def cache_png_head(cache_key: str, request: Request) -> Response:
     return _cache_png_response(cache_key, request, head_only=True)
+
+
+# ---------------------------------------------------------------------------
+# Commercial demo endpoint — fixed geometry, no auth, persistent GCS cache
+# ---------------------------------------------------------------------------
+
+# Salgado area, Veracruz, Mexico  (same bounds as /public/salgado-sentinel.png)
+_DEMO_PARCEL_GEOMETRY: dict[str, Any] = {
+    "type": "Polygon",
+    "coordinates": [[
+        [-96.248297, 18.575850],
+        [-96.178140, 18.575850],
+        [-96.178140, 18.617478],
+        [-96.248297, 18.617478],
+        [-96.248297, 18.575850],
+    ]],
+}
+_DEMO_USER_ID = "commercial-demo"
+_DEMO_PARCEL_ID = "commercial-demo-salgado"
+
+
+@router.get("/demo/map-layer")
+def demo_map_layer(
+    layer_key: str = Query("NDVI"),
+    force_refresh: bool = Query(False),
+    width: int = Query(2048, ge=128, le=4096),
+    height: int = Query(2048, ge=128, le=4096),
+) -> dict[str, Any]:
+    """Real Sentinel-2 layer for the commercial demo, persistently cached in GCS.
+
+    No authentication required. The geometry is hardcoded (Salgado area, Veracruz)
+    so the backend can cache the raster permanently and serve it in milliseconds
+    on every subsequent request. The same pipeline as production is used: STAC
+    catalog → band download → index formula → geometry mask → PNG render.
+    """
+    index_key = normalize_index_key(layer_key)
+    if index_key not in INDEX_DEFINITIONS:
+        raise HTTPException(status_code=422, detail=f"Índice no soportado: {index_key}")
+
+    db = SessionLocal()
+    try:
+        result = generate_or_get_layer(
+            db,
+            parcel_geometry=_DEMO_PARCEL_GEOMETRY,
+            user_id=_DEMO_USER_ID,
+            parcel_id=_DEMO_PARCEL_ID,
+            index_key=index_key,
+            target_date=None,
+            max_cloud=20.0,
+            width=width,
+            height=height,
+            force_refresh=force_refresh,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"No se pudo generar la capa demo Sentinel-2: {exc}",
+        ) from exc
+    finally:
+        db.close()
+
+    if not result.get("available"):
+        return _json_safe({
+            "data": {
+                "available": False,
+                "reason": result.get("reason") or "No hay imagen satelital para el área demo",
+                "requires_sync": False,
+                "date": None,
+                "layer": {"key": index_key, "wms_layer": index_key, "source": "sentinel-2-l2a"},
+                "overlays": [],
+                "statistics": None,
+                "warnings": [result.get("reason") or "Sin imagen disponible"],
+                "source_count": 0,
+            }
+        })
+
+    overlay = {
+        "id": f"sentinel2-demo-{index_key}-{result.get('date')}",
+        "graniot_parcel_id": None,
+        "image_url": result["image_url"],
+        "bounds": result["bounds"],
+        "date": result.get("date"),
+        "layer": index_key,
+        "source": result.get("source", "sentinel-2-l2a-mosaic"),
+        "coverage_percent": result.get("coverage_percent"),
+        "unavailable_percent": result.get("unavailable_percent"),
+        "is_partial": bool(result.get("is_partial", False)),
+        "quality_placeholder_applied": bool(result.get("quality_placeholder_applied", False)),
+        "quality_mask_applied": bool(result.get("quality_mask_applied", False)),
+    }
+    return _json_safe({
+        "data": {
+            "available": True,
+            "reason": None,
+            "requires_sync": False,
+            "date": result.get("date"),
+            "layer": {
+                "key": index_key,
+                "wms_layer": index_key,
+                "resolution_key": INDEX_DEFINITIONS[index_key].resolution,
+                "source": "sentinel-2-l2a",
+                "family": "Sentinel-2",
+                "auto_selected": True,
+            },
+            "overlays": [overlay],
+            "statistics": {
+                "status": "OK",
+                "data": [
+                    {
+                        "date": result.get("date"),
+                        "cloud_coverage": result.get("cloud_coverage"),
+                        "basicStats": [result.get("statistics") or {}],
+                    }
+                ],
+                **(result.get("statistics") or {}),
+            },
+            "warnings": list(result.get("warnings") or []),
+            "source_count": result.get("source_count", 1),
+            "scene_ids": result.get("scene_ids") or [],
+            "coverage_percent": result.get("coverage_percent"),
+            "unavailable_percent": result.get("unavailable_percent"),
+            "is_partial": bool(result.get("is_partial", False)),
+            "processing_version": result.get("processing_version"),
+        }
+    })
