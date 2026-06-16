@@ -45,7 +45,7 @@ def _prefetch_demo_index(index_key: str) -> None:
             parcel_id=_DEMO_PARCEL_ID,
             index_key=index_key,
             target_date=None,
-            max_cloud=20.0,
+            max_cloud=80.0,
             width=2048,
             height=2048,
         )
@@ -64,8 +64,9 @@ async def _run_demo_prefetch() -> None:
     entre cada uno para no saturar el catálogo STAC ni los COG de S3 al inicio.
     """
     loop = asyncio.get_event_loop()
-    for index_key in _DEMO_PRIORITY_INDICES:
-        await asyncio.sleep(3)
+    for i, index_key in enumerate(_DEMO_PRIORITY_INDICES):
+        if i > 0:
+            await asyncio.sleep(3)  # escalonar para no saturar STAC/S3
         loop.run_in_executor(_demo_prefetch_executor, _prefetch_demo_index, index_key)
 
 
