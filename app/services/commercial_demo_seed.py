@@ -120,6 +120,80 @@ def _line_collection(lat: float, lng: float, dlat: float, dlng: float, *, lines:
     return {"type": "FeatureCollection", "features": features}
 
 
+def _load_real_geodata(filename: str) -> Any:
+    path = _DATA_DIR / filename
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return None
+
+
+def _translate_offsets(offsets: List[List[float]], target_lat: float, target_lng: float) -> List[List[float]]:
+    """Translate normalized [dlat, dlng] offsets to absolute [lat, lng] coordinates."""
+    return [[o[0] + target_lat, o[1] + target_lng] for o in offsets]
+
+
+def _real_drone_geojson(center_lat: float, center_lng: float) -> Dict[str, Any]:
+    """Return GeoJSON FeatureCollection of real DJI drone flight tracks centered over the given location."""
+    raw = _load_real_geodata("real_drone_tracks.json")
+    if not raw:
+        return {"type": "FeatureCollection", "features": []}
+    features: List[Dict[str, Any]] = []
+    for track_idx, offsets in enumerate(raw):
+        coords = _translate_offsets(offsets, center_lat, center_lng)
+        # GeoJSON LineString uses [lng, lat] order
+        features.append({
+            "type": "Feature",
+            "properties": {"line": track_idx + 1, "coverage": "aplicada", "source": "dji_kml"},
+            "geometry": {"type": "LineString", "coordinates": [[p[1], p[0]] for p in coords]},
+        })
+    return {"type": "FeatureCollection", "features": features}
+
+
+def _real_heli_geojson(center_lat: float, center_lng: float) -> Dict[str, Any]:
+    """Return GeoJSON FeatureCollection of real helicopter spray polygon + flight tracks."""
+    raw = _load_real_geodata("real_helicopter_data.json")
+    if not raw:
+        return {"type": "FeatureCollection", "features": []}
+    features: List[Dict[str, Any]] = []
+    # Spray zone polygon
+    poly_coords = _translate_offsets(raw["polygon"], center_lat, center_lng)
+    ring = [[p[1], p[0]] for p in poly_coords]
+    if ring and ring[0] != ring[-1]:
+        ring.append(ring[0])
+    features.append({
+        "type": "Feature",
+        "properties": {"coverage": "zona_aplicacion", "source": "heli_kml"},
+        "geometry": {"type": "Polygon", "coordinates": [ring]},
+    })
+    # Flight track lines
+    for line_idx, offsets in enumerate(raw.get("lines", [])):
+        coords = _translate_offsets(offsets, center_lat, center_lng)
+        features.append({
+            "type": "Feature",
+            "properties": {"line": line_idx + 1, "coverage": "aplicada", "source": "heli_kml"},
+            "geometry": {"type": "LineString", "coordinates": [[p[1], p[0]] for p in coords]},
+        })
+    return {"type": "FeatureCollection", "features": features}
+
+
+def _real_cosecha_points(center_lat: float, center_lng: float) -> List[Dict[str, Any]]:
+    """Return list of GPS track points from real harvest machine CSV, centered over given location."""
+    raw = _load_real_geodata("real_cosecha_track.json")
+    if not raw:
+        return []
+    # Each item: [dlat, dlng, tch, vel]
+    result = []
+    for item in raw:
+        dlat, dlng = item[0], item[1]
+        tch = item[2] if len(item) > 2 else 0.0
+        vel = item[3] if len(item) > 3 else 0.0
+        result.append({"lat": round(dlat + center_lat, 7), "lng": round(dlng + center_lng, 7), "tch": tch, "vel": vel})
+    return result
+
+
 def _point_grid(lat: float, lng: float, dlat: float, dlng: float, count: int, *, offset: float = 0) -> Iterable[tuple[float, float, int]]:
     columns = max(4, int(math.sqrt(count)))
     rows = max(1, math.ceil(count / columns))
@@ -461,17 +535,29 @@ def _field_notes(parcels: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def _aerial_rows(parcels: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     configs = [
-        (0, "drone", 70.8, 97.8, 1.6, 0.7, 3.8, 24.5, "Fertilizante foliar NPK", "12 L/ha", "Carlos Méndez"),
-        (1, "helicoptero", 84.5, 96.9, 2.6, 1.1, 11.7, 92.0, "Madurante agrícola", "1.5 L/ha", "Andrea López"),
-        (3, "avioneta", 95.4, 98.1, 1.8, 0.9, 18.4, 138.0, "Control biológico", "4.0 L/ha", "Luis Ramírez"),
-        (4, "drone", 56.2, 96.4, 2.1, 0.8, 4.1, 22.8, "Herbicida selectivo", "2.2 L/ha", "Carlos Méndez"),
-        (5, "helicoptero", 74.8, 97.3, 2.0, 0.6, 12.2, 95.0, "Fertilizante líquido", "10 L/ha", "Andrea López"),
+        (0, "drone",      70.8, 97.8, 1.6, 0.7,  3.8,  24.5, "Fertilizante foliar NPK",  "12 L/ha", "Carlos Méndez"),
+        (1, "helicoptero",84.5, 96.9, 2.6, 1.1, 11.7,  92.0, "Madurante agrícola",        "1.5 L/ha","Andrea López"),
+        (3, "avioneta",   95.4, 98.1, 1.8, 0.9, 18.4, 138.0, "Control biológico",         "4.0 L/ha","Luis Ramírez"),
+        (4, "drone",      56.2, 96.4, 2.1, 0.8,  4.1,  22.8, "Herbicida selectivo",       "2.2 L/ha","Carlos Méndez"),
+        (5, "helicoptero",74.8, 97.3, 2.0, 0.6, 12.2,  95.0, "Fertilizante líquido",      "10 L/ha", "Andrea López"),
     ]
     rows: List[Dict[str, Any]] = []
     for index, (parcel_index, aircraft, total, pct, uncovered, overlap, altitude, speed, product, dose, pilot) in enumerate(configs):
         parcel = parcels[parcel_index % len(parcels)]
         bounds = parcel["geometry_bounds"]
-        lines = _line_collection(parcel["geometry_center"]["lat"], parcel["geometry_center"]["lng"], (bounds["north"] - bounds["south"]) / 2, (bounds["east"] - bounds["west"]) / 2)
+        center_lat = parcel["geometry_center"]["lat"]
+        center_lng = parcel["geometry_center"]["lng"]
+        dlat = (bounds["north"] - bounds["south"]) / 2
+        dlng = (bounds["east"] - bounds["west"]) / 2
+
+        # Use real flight track geometry for drone and helicopter analyses
+        if aircraft == "drone":
+            tracks = _real_drone_geojson(center_lat, center_lng)
+        elif aircraft == "helicoptero":
+            tracks = _real_heli_geojson(center_lat, center_lng)
+        else:
+            tracks = _line_collection(center_lat, center_lng, dlat, dlng)
+
         rows.append(
             _tag(
                 {
@@ -497,10 +583,11 @@ def _aerial_rows(parcels: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                         {
                             "name": parcel["name"], "totalHa": total, "coveredHa": round(total * pct / 100, 2), "coveredPct": pct,
                             "uncoveredHa": uncovered, "overlapHa": overlap, "avgAltitude": altitude, "avgSpeed": speed,
-                            "uniqueLines": 9, "volume": round(total * float(dose.split()[0]), 1), "coveredGeom": lines,
+                            "uniqueLines": len(tracks.get("features", [])) or 9,
+                            "volume": round(total * float(dose.split()[0]), 1), "coveredGeom": tracks,
                         }
                     ],
-                    "parcel_geometries": {"parcelas": parcel["geometry_geojson"], "sprOnTracks": lines},
+                    "parcel_geometries": {"parcelas": parcel["geometry_geojson"], "sprOnTracks": tracks},
                     "bounds": bounds,
                     "observaciones": "Aplicación dentro de parámetros. Cobertura uniforme verificada con trazabilidad GPS.",
                     "created_at": _iso(3 + index * 4),
@@ -544,17 +631,13 @@ def _mapping_rows(parcels: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], 
                 }
             )
         )
-        for lat, lng, point_index in _point_grid(parcel["geometry_center"]["lat"], parcel["geometry_center"]["lng"], (b["north"] - b["south"]) / 2, (b["east"] - b["west"]) / 2, 42):
-            wave = math.sin(point_index / 5 + session_index)
-            attrs = {
-                "velocidad": round(6.2 + wave * 1.3, 2),
-                "humedad": round(18.5 + math.cos(point_index / 4) * 3.2, 2),
-                "rendimiento": round(92 + wave * 14 + session_index * 2, 2),
-                "compactacion": round(1.25 + abs(wave) * 0.42, 2),
-                "dosis": round(11.8 + wave * 1.7, 2),
-                "rpm": round(1780 + wave * 160, 0),
-                "presion": round(3.2 + wave * 0.35, 2),
-            }
+        # For cosecha sessions use real harvest machine GPS track, for others use synthetic grid
+        if labor == "cosecha" and session_index == 0:
+            real_pts = _real_cosecha_points(parcel["geometry_center"]["lat"], parcel["geometry_center"]["lng"])
+            pt_source = [(p["lat"], p["lng"], i, {"velocidad": round(p["vel"], 2), "tch": round(p["tch"], 2), "humedad": round(16.5 + math.sin(i * 0.3) * 2.5, 2), "rendimiento": round(p["tch"] * 0.95 + session_index * 2, 2), "compactacion": round(1.2 + abs(math.sin(i * 0.2)) * 0.4, 2), "dosis": 0.0, "rpm": round(1750 + math.cos(i * 0.25) * 120, 0), "presion": round(3.1 + math.sin(i * 0.4) * 0.3, 2)}) for i, p in enumerate(real_pts)]
+        else:
+            pt_source = [(lat, lng, point_index, {"velocidad": round(6.2 + math.sin(point_index / 5 + session_index) * 1.3, 2), "humedad": round(18.5 + math.cos(point_index / 4) * 3.2, 2), "rendimiento": round(92 + math.sin(point_index / 5 + session_index) * 14 + session_index * 2, 2), "compactacion": round(1.25 + abs(math.sin(point_index / 5 + session_index)) * 0.42, 2), "dosis": round(11.8 + math.sin(point_index / 5 + session_index) * 1.7, 2), "rpm": round(1780 + math.sin(point_index / 5 + session_index) * 160, 0), "presion": round(3.2 + math.sin(point_index / 5 + session_index) * 0.35, 2)}) for lat, lng, point_index in _point_grid(parcel["geometry_center"]["lat"], parcel["geometry_center"]["lng"], (b["north"] - b["south"]) / 2, (b["east"] - b["west"]) / 2, 42)]
+        for lat, lng, point_index, attrs in pt_source:
             points.append(
                 _tag(
                     {
