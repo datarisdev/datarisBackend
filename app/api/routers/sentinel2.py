@@ -944,7 +944,7 @@ def demo_map_layer(
             parcel_id=_DEMO_PARCEL_ID,
             index_key=index_key,
             target_date=None,
-            max_cloud=20.0,
+            max_cloud=80.0,
             width=width,
             height=height,
             force_refresh=force_refresh,
