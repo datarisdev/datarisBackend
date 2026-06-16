@@ -533,30 +533,50 @@ def _field_notes(parcels: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return rows
 
 
+def _load_kml_analysis(filename: str) -> Dict[str, Any]:
+    """Load a pre-processed KML/geometry JSON file for an aerial analysis."""
+    data = _load_real_geodata(filename) or {}
+    return {
+        "geojson": data.get("geojson") or {"type": "FeatureCollection", "features": []},
+        "bounds": data.get("bounds") or {},
+        "name": data.get("name") or filename.replace(".json", ""),
+    }
+
+
+def _bounds_from_kml(kml_bounds: Dict[str, Any]) -> Dict[str, float]:
+    """Convert KML bounds dict to seed bounds format."""
+    if not kml_bounds:
+        return {}
+    return {
+        "south": kml_bounds.get("south", 0),
+        "north": kml_bounds.get("north", 0),
+        "west": kml_bounds.get("west", 0),
+        "east": kml_bounds.get("east", 0),
+    }
+
+
 def _aerial_rows(parcels: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    configs = [
-        (0, "drone",      70.8, 97.8, 1.6, 0.7,  3.8,  24.5, "Fertilizante foliar NPK",  "12 L/ha", "Carlos Méndez"),
-        (1, "helicoptero",84.5, 96.9, 2.6, 1.1, 11.7,  92.0, "Madurante agrícola",        "1.5 L/ha","Andrea López"),
-        (3, "avioneta",   95.4, 98.1, 1.8, 0.9, 18.4, 138.0, "Control biológico",         "4.0 L/ha","Luis Ramírez"),
-        (4, "drone",      56.2, 96.4, 2.1, 0.8,  4.1,  22.8, "Herbicida selectivo",       "2.2 L/ha","Carlos Méndez"),
-        (5, "helicoptero",74.8, 97.3, 2.0, 0.6, 12.2,  95.0, "Fertilizante líquido",      "10 L/ha", "Andrea López"),
+    # Real analyses from actual KML/ZIP files — one row per farm/project.
+    # Coordinates are real GPS data from the field; map will zoom to the real location.
+    real_configs = [
+        # (file, aircraft, ha, pct, uncovered, overlap, alt, speed, product, dose, pilot, days_ago)
+        ("drone_jiboa.json",       "drone",       70.8, 97.8, 1.6, 0.7,  3.8,  24.5, "Fertilizante foliar NPK",   "12 L/ha", "Carlos Méndez",  3),
+        ("drone_sandiego1.json",   "drone",       56.2, 96.4, 2.1, 0.8,  4.1,  22.8, "Herbicida selectivo",       "2.2 L/ha","Carlos Méndez",  7),
+        ("drone_sandiego2.json",   "drone",       48.9, 95.8, 2.4, 1.0,  4.0,  23.1, "Maduración química",        "3.5 L/ha","Pedro Alvarado", 11),
+        ("drone_launion.json",     "drone",       83.4, 98.1, 1.3, 0.5,  4.2,  25.0, "Urea foliar",               "8 L/ha",  "Carlos Méndez",  15),
+        ("drone_madretierra.json", "drone",       64.7, 96.9, 2.0, 0.9,  3.9,  24.8, "Fertilizante nitrogenado",  "6 L/ha",  "Pedro Alvarado", 19),
+        ("helicopter_sandiego.json","helicoptero",84.5, 96.9, 2.6, 1.1, 11.7,  92.0, "Madurante agrícola",        "1.5 L/ha","Andrea López",   23),
     ]
     rows: List[Dict[str, Any]] = []
-    for index, (parcel_index, aircraft, total, pct, uncovered, overlap, altitude, speed, product, dose, pilot) in enumerate(configs):
-        parcel = parcels[parcel_index % len(parcels)]
-        bounds = parcel["geometry_bounds"]
-        center_lat = parcel["geometry_center"]["lat"]
-        center_lng = parcel["geometry_center"]["lng"]
-        dlat = (bounds["north"] - bounds["south"]) / 2
-        dlng = (bounds["east"] - bounds["west"]) / 2
+    for index, (filename, aircraft, total, pct, uncovered, overlap, altitude, speed, product, dose, pilot, days_ago) in enumerate(real_configs):
+        kml = _load_kml_analysis(filename)
+        geojson = kml["geojson"]
+        kml_bounds = kml["bounds"]
+        farm_name = kml["name"]
+        parcel = parcels[index % len(parcels)]
 
-        # Use real flight track geometry for drone and helicopter analyses
-        if aircraft == "drone":
-            tracks = _real_drone_geojson(center_lat, center_lng)
-        elif aircraft == "helicoptero":
-            tracks = _real_heli_geojson(center_lat, center_lng)
-        else:
-            tracks = _line_collection(center_lat, center_lng, dlat, dlng)
+        # Use actual KML bounds; fall back to parcel bounds if data missing
+        bounds = _bounds_from_kml(kml_bounds) if kml_bounds else parcel["geometry_bounds"]
 
         rows.append(
             _tag(
@@ -565,9 +585,9 @@ def _aerial_rows(parcels: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     "user_id": DEMO_USER_ID,
                     "lote_id": parcel["id"],
                     "parcel_id": parcel["id"],
-                    "parcel_name": parcel["name"],
+                    "parcel_name": farm_name,
                     "aircraft_type": aircraft,
-                    "fecha_aplicacion": _date(3 + index * 4),
+                    "fecha_aplicacion": _date(days_ago),
                     "piloto": pilot,
                     "producto": product,
                     "dosis": dose,
@@ -581,17 +601,20 @@ def _aerial_rows(parcels: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     "avg_speed": speed,
                     "parcel_results": [
                         {
-                            "name": parcel["name"], "totalHa": total, "coveredHa": round(total * pct / 100, 2), "coveredPct": pct,
-                            "uncoveredHa": uncovered, "overlapHa": overlap, "avgAltitude": altitude, "avgSpeed": speed,
-                            "uniqueLines": len(tracks.get("features", [])) or 9,
-                            "volume": round(total * float(dose.split()[0]), 1), "coveredGeom": tracks,
+                            "name": farm_name, "totalHa": total,
+                            "coveredHa": round(total * pct / 100, 2), "coveredPct": pct,
+                            "uncoveredHa": uncovered, "overlapHa": overlap,
+                            "avgAltitude": altitude, "avgSpeed": speed,
+                            "uniqueLines": len(geojson.get("features", [])),
+                            "volume": round(total * float(dose.split()[0]), 1),
+                            "coveredGeom": geojson,
                         }
                     ],
-                    "parcel_geometries": {"parcelas": parcel["geometry_geojson"], "sprOnTracks": tracks},
+                    "parcel_geometries": {"parcelas": parcel["geometry_geojson"], "sprOnTracks": geojson},
                     "bounds": bounds,
                     "observaciones": "Aplicación dentro de parámetros. Cobertura uniforme verificada con trazabilidad GPS.",
-                    "created_at": _iso(3 + index * 4),
-                    "updated_at": _iso(2 + index * 4),
+                    "created_at": _iso(days_ago),
+                    "updated_at": _iso(days_ago - 1),
                 }
             )
         )
