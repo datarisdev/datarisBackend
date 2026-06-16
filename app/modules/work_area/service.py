@@ -14,7 +14,6 @@ from app.api.routers.dashboard import (
     _geometry,
     _has_geometry,
     _iso,
-    _role_for_user,
     _scoped_rows,
     _status,
 )
@@ -286,28 +285,29 @@ def build_work_area_layers_response(
 ) -> Dict[str, Any]:
     user_id = _user_id_from_current(current_user)
     db = read_db()
-    role = _role_for_user(db, user_id)
-    admin_mode = role == "admin"
+    # La zona de trabajo es personal: cada usuario ve únicamente sus propios análisis,
+    # independientemente del rol. Nunca se usa admin_mode para evitar que usuarios
+    # con rol "admin" en el JSON-db vean datos del tenant demo u otros usuarios.
     wanted = {s.strip().lower() for s in sources.split(",")} if sources else {"aerial", "mapeo", "satellite"}
 
-    parcels = _scoped_rows(db, "parcels", user_id, admin_mode)
+    parcels = _scoped_rows(db, "parcels", user_id, False)
     parcel_by_id = _parcel_lookup(parcels)
 
     layers: List[Dict[str, Any]] = []
     if "aerial" in wanted:
-        layers.extend(_aerial_layers(_scoped_rows(db, "aerial_analyses", user_id, admin_mode)))
+        layers.extend(_aerial_layers(_scoped_rows(db, "aerial_analyses", user_id, False)))
     if "mapeo" in wanted:
-        sessions = _scoped_rows(db, "analysis_sessions", user_id, admin_mode)
+        sessions = _scoped_rows(db, "analysis_sessions", user_id, False)
         sessions_by_id = {str(session.get("id")): session for session in sessions}
         points = [
             dict(row)
             for row in table(db, "analysis_data_points")
             if (session := sessions_by_id.get(str(row.get("session_id") or "")))
-            and (admin_mode or _belongs_to_user(session, user_id, admin_mode))
+            and _belongs_to_user(session, user_id, False)
         ]
         layers.extend(_mapeo_layers(sessions, points, parcel_by_id, max_points_per_layer))
     if "satellite" in wanted:
-        layers.extend(_satellite_layers(_scoped_rows(db, "satellite_comparisons", user_id, admin_mode), parcel_by_id))
+        layers.extend(_satellite_layers(_scoped_rows(db, "satellite_comparisons", user_id, False), parcel_by_id))
 
     layers = sorted(layers, key=_sort_key, reverse=True)[:limit]
     counts: Dict[str, int] = {}
