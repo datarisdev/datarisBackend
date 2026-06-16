@@ -432,7 +432,7 @@ def _field_notes(parcels: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     ]
     rows: List[Dict[str, Any]] = []
     for index, (parcel_index, title, content, note_type, status, tags) in enumerate(specs):
-        parcel = parcels[parcel_index]
+        parcel = parcels[parcel_index % len(parcels)]
         center = parcel["geometry_center"]
         rows.append(
             _tag(
@@ -469,7 +469,7 @@ def _aerial_rows(parcels: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     ]
     rows: List[Dict[str, Any]] = []
     for index, (parcel_index, aircraft, total, pct, uncovered, overlap, altitude, speed, product, dose, pilot) in enumerate(configs):
-        parcel = parcels[parcel_index]
+        parcel = parcels[parcel_index % len(parcels)]
         bounds = parcel["geometry_bounds"]
         lines = _line_collection(parcel["geometry_center"]["lat"], parcel["geometry_center"]["lng"], (bounds["north"] - bounds["south"]) / 2, (bounds["east"] - bounds["west"]) / 2)
         rows.append(
@@ -521,7 +521,7 @@ def _mapping_rows(parcels: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], 
     sessions: List[Dict[str, Any]] = []
     points: List[Dict[str, Any]] = []
     for session_index, (parcel_index, name, labor, machine, person, variables) in enumerate(configs):
-        parcel = parcels[parcel_index]
+        parcel = parcels[parcel_index % len(parcels)]
         session_id = _id(f"mapping-session:{session_index}")
         b = parcel["geometry_bounds"]
         sessions.append(
@@ -585,7 +585,7 @@ def _labor_rows(parcels: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], Li
     ]
     rows: List[Dict[str, Any]] = []
     for index, (code, name, parcel_index) in enumerate(workers):
-        parcel = parcels[parcel_index]
+        parcel = parcels[parcel_index % len(parcels)]
         center = parcel["geometry_center"]
         day = 0 if index < 6 else 1
         start_hour = 6 + (index % 3)
