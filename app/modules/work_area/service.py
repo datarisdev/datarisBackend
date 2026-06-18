@@ -5,6 +5,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from app.api.routers.compat import read_db, table
 from app.services.sentinel2.history import representative_satellite_comparison_side, satellite_comparison_sides
+from app.utils.geojson_normalizer import geometry_bounds as _geojson_bounds
 from app.api.routers.dashboard import (
     _aircraft_type,
     _as_datetime,
@@ -147,9 +148,9 @@ def _aerial_layers(rows: List[Dict[str, Any]], parcel_by_id: Optional[Dict[str, 
                 raw_geom = {}
         geometry = None
         if isinstance(raw_geom, dict):
-            # Try each key in priority order; skip empty FeatureCollections so the
-            # next candidate is tried (e.g. sprOnTracks when parcelas is empty).
-            for key in ("parcelas", "sprOnTracks", "sprOn", "overlapGeom"):
+            # Prefer application-specific tracks over the parcel boundary so that
+            # manual drawings and spray tracks are shown instead of just the parcel shape.
+            for key in ("sprOnTracks", "sprOn", "overlapGeom", "parcelas"):
                 geometry = _nonempty_geojson(raw_geom.get(key))
                 if geometry:
                     break
@@ -173,6 +174,19 @@ def _aerial_layers(rows: List[Dict[str, Any]], parcel_by_id: Optional[Dict[str, 
         if geometry is None and parcel:
             geometry = _nonempty_geojson(_geometry(parcel))
 
+        explicit_bounds = _bounds(row) or _bounds(parcel or {})
+        if explicit_bounds is None and geometry:
+            gb = _geojson_bounds(geometry)
+            if gb:
+                explicit_bounds = {"south": gb["south"], "north": gb["north"], "west": gb["west"], "east": gb["east"]}
+
+        explicit_center = _center(row) or _center(parcel or {})
+        if explicit_center is None and explicit_bounds:
+            explicit_center = {
+                "lat": (explicit_bounds["south"] + explicit_bounds["north"]) / 2,
+                "lng": (explicit_bounds["west"] + explicit_bounds["east"]) / 2,
+            }
+
         layers.append(
             _layer(
                 id=f"aerial:{row.get('id')}",
@@ -183,8 +197,8 @@ def _aerial_layers(rows: List[Dict[str, Any]], parcel_by_id: Optional[Dict[str, 
                 date=_date_value(row, "fecha_aplicacion", "created_at"),
                 status=_status(row),
                 geometry=geometry,
-                bounds=_bounds(row) or _bounds(parcel or {}),
-                center=_center(row) or _center(parcel or {}),
+                bounds=explicit_bounds,
+                center=explicit_center,
                 metrics={
                     "Área total": row.get("total_ha"),
                     "Cobertura": row.get("covered_pct"),
