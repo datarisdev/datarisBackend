@@ -54,6 +54,16 @@ def _normalize_geojson(value: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _nonempty_geojson(value: Any) -> Optional[Dict[str, Any]]:
+    """Like _normalize_geojson but returns None for empty FeatureCollections."""
+    fc = _normalize_geojson(value)
+    if not fc:
+        return None
+    if fc.get("type") == "FeatureCollection" and not fc.get("features"):
+        return None
+    return fc
+
+
 def _first(*values: Any) -> Any:
     for value in values:
         if value is not None and value != "":
@@ -118,7 +128,7 @@ def _layer(
         "geometry": geometry,
         "bounds": bounds,
         "center": center,
-        "has_geometry": bool(geometry),
+        "has_geometry": bool(geometry and (geometry.get("type") != "FeatureCollection" or geometry.get("features"))),
         "metrics": metrics or {},
         "metadata": metadata or {},
     }
@@ -137,7 +147,12 @@ def _aerial_layers(rows: List[Dict[str, Any]], parcel_by_id: Optional[Dict[str, 
                 raw_geom = {}
         geometry = None
         if isinstance(raw_geom, dict):
-            geometry = _normalize_geojson(raw_geom.get("parcelas") or raw_geom.get("sprOnTracks") or raw_geom.get("sprOn") or raw_geom.get("overlapGeom"))
+            # Try each key in priority order; skip empty FeatureCollections so the
+            # next candidate is tried (e.g. sprOnTracks when parcelas is empty).
+            for key in ("parcelas", "sprOnTracks", "sprOn", "overlapGeom"):
+                geometry = _nonempty_geojson(raw_geom.get(key))
+                if geometry:
+                    break
         if geometry is None:
             results = row.get("parcel_results") if isinstance(row.get("parcel_results"), list) else []
             features: List[Dict[str, Any]] = []
@@ -145,7 +160,7 @@ def _aerial_layers(rows: List[Dict[str, Any]], parcel_by_id: Optional[Dict[str, 
                 if not isinstance(result, dict):
                     continue
                 for key in ("coveredGeom", "uncoveredGeom", "overlapGeom", "geometry"):
-                    fc = _normalize_geojson(result.get(key))
+                    fc = _nonempty_geojson(result.get(key))
                     if fc:
                         for feature in fc.get("features", []):
                             feature = dict(feature)
@@ -156,7 +171,7 @@ def _aerial_layers(rows: List[Dict[str, Any]], parcel_by_id: Optional[Dict[str, 
         parcel_id = str(row.get("parcel_id") or row.get("lote_id") or row.get("lot_id") or "")
         parcel = (parcel_by_id or {}).get(parcel_id) if parcel_id else None
         if geometry is None and parcel:
-            geometry = _normalize_geojson(_geometry(parcel))
+            geometry = _nonempty_geojson(_geometry(parcel))
 
         layers.append(
             _layer(
