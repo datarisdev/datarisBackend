@@ -124,7 +124,7 @@ def _layer(
     }
 
 
-def _aerial_layers(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _aerial_layers(rows: List[Dict[str, Any]], parcel_by_id: Optional[Dict[str, Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
     layers: List[Dict[str, Any]] = []
     for row in rows:
         raw_geom = row.get("parcel_geometries") or {}
@@ -153,6 +153,11 @@ def _aerial_layers(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                             features.append(feature)
             geometry = _feature_collection(features)
 
+        parcel_id = str(row.get("parcel_id") or row.get("lote_id") or row.get("lot_id") or "")
+        parcel = (parcel_by_id or {}).get(parcel_id) if parcel_id else None
+        if geometry is None and parcel:
+            geometry = _normalize_geojson(_geometry(parcel))
+
         layers.append(
             _layer(
                 id=f"aerial:{row.get('id')}",
@@ -163,15 +168,15 @@ def _aerial_layers(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 date=_date_value(row, "fecha_aplicacion", "created_at"),
                 status=_status(row),
                 geometry=geometry,
-                bounds=_bounds(row),
-                center=_center(row),
+                bounds=_bounds(row) or _bounds(parcel or {}),
+                center=_center(row) or _center(parcel or {}),
                 metrics={
                     "Área total": row.get("total_ha"),
                     "Cobertura": row.get("covered_pct"),
                     "Sin cubrir": row.get("uncovered_ha"),
                     "Sobre-aplicado": row.get("overlap_ha"),
                 },
-                metadata={"aircraft_type": _aircraft_type(row), "raw_id": row.get("id")},
+                metadata={"aircraft_type": _aircraft_type(row), "raw_id": row.get("id"), "parcel_id": parcel_id or None},
             )
         )
     return layers
@@ -295,7 +300,7 @@ def build_work_area_layers_response(
 
     layers: List[Dict[str, Any]] = []
     if "aerial" in wanted:
-        layers.extend(_aerial_layers(_scoped_rows(db, "aerial_analyses", user_id, False)))
+        layers.extend(_aerial_layers(_scoped_rows(db, "aerial_analyses", user_id, False), parcel_by_id))
     if "mapeo" in wanted:
         sessions = _scoped_rows(db, "analysis_sessions", user_id, False)
         sessions_by_id = {str(session.get("id")): session for session in sessions}
