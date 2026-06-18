@@ -443,6 +443,10 @@ def normalize_record_geometries(table_name: str, row: Dict[str, Any]) -> Dict[st
             result = {k: normalize_nested(v) for k, v in value.items()}
             for key in ("geometry", "geojson", "coveredGeom", "uncoveredGeom", "overlapGeom", "parcelas", "sprOn", "sprOff", "sprOnTracks", "sprOffTracks"):
                 if key in result:
+                    # Never overwrite the geometry field of a GeoJSON Feature/FeatureCollection —
+                    # that would replace a raw geometry object with a FeatureCollection, producing invalid GeoJSON.
+                    if key == "geometry" and result.get("type") in ("Feature", "FeatureCollection"):
+                        continue
                     fc = normalize_geojson(result[key])
                     if fc:
                         result[key] = fc
