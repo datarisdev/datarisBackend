@@ -1,5 +1,6 @@
 from app.models.user import User
 from app.models.parcel import Parcel
+from app.models.harvest import HarvestSession, HarvestPoint
 from app.models.satellite_job import SatelliteJob
 from app.models.satellite_image import SatelliteImage
 from app.models.platform_module import PlatformModule

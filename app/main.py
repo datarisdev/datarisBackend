@@ -99,6 +99,15 @@ include_api_routers(fastapi_app)
 
 
 @fastapi_app.on_event("startup")
+async def startup_create_tables() -> None:
+    """Crea tablas nuevas que no existan todavía (idempotente gracias a checkfirst=True)."""
+    from app.models.base import Base
+    from app.db.session import engine
+    import app.models  # noqa: registra todos los modelos incluyendo harvest
+    Base.metadata.create_all(bind=engine, checkfirst=True)
+
+
+@fastapi_app.on_event("startup")
 async def startup_demo_prefetch() -> None:
     """Al arrancar el servidor lanza el pre-calentamiento del caché demo en background.
 
