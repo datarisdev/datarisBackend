@@ -16,6 +16,7 @@ from app.api.routers import (
     dashboard,
     field_notes,
     graniot,
+    harvest,
     me_access,
     parcel_crops,
     parcels,
@@ -57,6 +58,7 @@ API_ROUTERS: tuple[RouterRegistration, ...] = (
     RouterRegistration(me_access.router, settings.API_V1_STR),
     RouterRegistration(dashboard.router, settings.API_V1_STR),
     RouterRegistration(sentinel2.router, settings.API_V1_STR),
+    RouterRegistration(harvest.router, settings.API_V1_STR),
 )
 
 
