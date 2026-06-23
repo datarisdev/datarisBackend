@@ -50,7 +50,7 @@ def _get_owned_parcel(db: Session, parcel_id: UUID | str, current_user: dict[str
     The production app stores frontend-compatible data in the compat JSON state
     table (dataris_compat_state), not in a normalized SQL table named
     `parcels`. The previous Sentinel-2 router queried the ORM Parcel model and
-    failed in Cloud Run with: relation "parcels" does not exist.
+    failed in Azure Container Apps with: relation "parcels" does not exist.
 
     Reading from compat storage keeps this endpoint aligned with the parcels the
     user sees in the current frontend. The SQLAlchemy session is intentionally
@@ -878,9 +878,9 @@ def _cache_png_response(cache_key: str, request: Request, *, head_only: bool = F
     try:
         content = download_satellite_cache_png_bytes(cache_key)
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail="Imagen no encontrada en cache Sentinel-2/GCS") from exc
+        raise HTTPException(status_code=404, detail="Imagen no encontrada en cache Sentinel-2/Azure Blob Storage") from exc
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"No se pudo leer cache Sentinel-2/GCS: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"No se pudo leer cache Sentinel-2/Azure Blob Storage: {exc}") from exc
 
     headers["Content-Length"] = str(len(content))
     if head_only:
@@ -899,7 +899,7 @@ def cache_png_head(cache_key: str, request: Request) -> Response:
 
 
 # ---------------------------------------------------------------------------
-# Commercial demo endpoint — fixed geometry, no auth, persistent GCS cache
+# Commercial demo endpoint — fixed geometry, no auth, persistent Azure Blob cache
 # ---------------------------------------------------------------------------
 
 # Salgado area, Veracruz, Mexico  (same bounds as /public/salgado-sentinel.png)
@@ -924,7 +924,7 @@ def demo_map_layer(
     width: int = Query(2048, ge=128, le=4096),
     height: int = Query(2048, ge=128, le=4096),
 ) -> dict[str, Any]:
-    """Real Sentinel-2 layer for the commercial demo, persistently cached in GCS.
+    """Real Sentinel-2 layer for the commercial demo, persistently cached in Azure Blob Storage.
 
     No authentication required. The geometry is hardcoded (Salgado area, Veracruz)
     so the backend can cache the raster permanently and serve it in milliseconds

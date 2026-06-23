@@ -27,9 +27,9 @@ _DEMO_PRIORITY_INDICES = [
 
 
 def _prefetch_demo_index(index_key: str) -> None:
-    """Genera y cachea en GCS la capa demo para un índice.
+    """Genera y cachea en Azure Blob Storage la capa demo para un índice.
 
-    Si el resultado ya existe en GCS (caché persistente), la llamada a
+    Si el resultado ya existe en Azure Blob Storage (caché persistente), la llamada a
     generate_or_get_layer() termina en < 1 s sin re-procesar nada.
     """
     from app.api.routers.sentinel2 import _DEMO_PARCEL_GEOMETRY, _DEMO_USER_ID, _DEMO_PARCEL_ID
@@ -111,7 +111,7 @@ async def startup_create_tables() -> None:
 async def startup_demo_prefetch() -> None:
     """Al arrancar el servidor lanza el pre-calentamiento del caché demo en background.
 
-    Si GCS ya tiene los PNG generados la tarea termina en segundos sin re-procesar.
+    Si Azure Blob Storage ya tiene los PNG generados la tarea termina en segundos sin re-procesar.
     Si es la primera vez (instancia nueva / bucket vacío) los genera silenciosamente
     sin bloquear ningún request de usuario.
     """

@@ -6,7 +6,7 @@ The demo tenant is intentionally isolated from real tenants.  Rows created here
 carry ``demo_seed`` and can be rebuilt safely whenever a seller starts a new
 presentation.  The seeder mutates the compatibility JSON document only; it does
 not call routers or external services, which keeps bootstrap deterministic in
-Cloud Run and in local development.
+Azure Container Apps and in local development.
 """
 
 import json

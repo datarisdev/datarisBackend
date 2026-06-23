@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 
 CACHE_DIR = Path(os.getenv("SENTINEL_LOCAL_CACHE_DIR", str(Path(tempfile.gettempdir()) / "dataris_sentinel2_cache")))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
-SENTINEL_CACHE_URL_VERSION = os.getenv("SENTINEL_CACHE_URL_VERSION", "sentinel-gcs-20260605-persistent-manifest-cache-2")
+SENTINEL_CACHE_URL_VERSION = os.getenv("SENTINEL_CACHE_URL_VERSION", "sentinel-azure-blob-20260623-persistent-manifest-cache-1")
 
 
 DEFAULT_MAX_CLOUD = float(os.getenv("SENTINEL_DEFAULT_MAX_CLOUD", "80"))
@@ -783,7 +783,7 @@ def _metadata_cloud_is_acceptable(metadata: dict[str, Any], max_cloud: float | N
 
 
 def _persistent_result_from_metadata(cache_key: str, metadata: dict[str, Any], *, source: str) -> dict[str, Any] | None:
-    """Convert persisted GCS metadata into the regular map-layer result."""
+    """Convert persisted Azure Blob metadata into the regular map-layer result."""
     if not isinstance(metadata, dict):
         return None
     if metadata.get("processing_version") != MOSAIC_PROCESSING_VERSION:
@@ -803,13 +803,13 @@ def _persistent_result_from_metadata(cache_key: str, metadata: dict[str, Any], *
 
 
 def _read_persistent_cache_result(cache_key: str) -> dict[str, Any] | None:
-    """Read a generated immutable raster from GCS without touching STAC bands."""
+    """Read a generated immutable raster from Azure Blob Storage without touching STAC bands."""
     try:
         metadata = download_satellite_cache_metadata(cache_key)
     except FileNotFoundError:
         return None
     except Exception:
-        logger.info("Cache persistente Sentinel-2 no disponible; se continúa con cache local/STAC", exc_info=True)
+        logger.info("Cache persistente Sentinel-2 de Azure Blob no disponible; se continúa con cache local/STAC", exc_info=True)
         return None
     return _persistent_result_from_metadata(cache_key, metadata, source="persistent-cache")
 
@@ -826,7 +826,7 @@ def _result_from_manifest(manifest: dict[str, Any], *, source: str, min_width: i
         return None
     # Prefer the complete adjacent metadata object. The pointer also carries a
     # copy so a temporary metadata-read failure does not force expensive raster
-    # work. Both objects are stored in GCS and survive instance replacement.
+    # work. Both objects are stored in Azure Blob Storage and survive instance replacement.
     persisted = _read_persistent_cache_result(cache_key)
     if persisted and _metadata_has_enough_resolution(persisted, min_width=min_width, min_height=min_height):
         if _metadata_cloud_is_acceptable(persisted, max_cloud):
@@ -836,7 +836,7 @@ def _result_from_manifest(manifest: dict[str, Any], *, source: str, min_width: i
 
 
 def _read_latest_persistent_result(*, user_id: str, parcel_id: str, index_key: str, width: int, height: int, geometry_hash: str, max_cloud: float | None = None) -> dict[str, Any] | None:
-    """Return a recent generated raster pointer from GCS for instant first paint.
+    """Return a recent generated raster pointer from Azure Blob Storage for instant first paint.
 
     The second lookup migrates manifests created by the previous delivery, whose
     latest pointer still included render dimensions. That lets already processed
@@ -854,7 +854,7 @@ def _read_latest_persistent_result(*, user_id: str, parcel_id: str, index_key: s
     except FileNotFoundError:
         manifest = None
     except Exception:
-        logger.info("Manifest latest Sentinel-2 no disponible; se continúa con catálogo", exc_info=True)
+        logger.info("Manifest latest Sentinel-2 de Azure Blob no disponible; se continúa con catálogo", exc_info=True)
 
     if manifest:
         result = _result_from_manifest(
@@ -880,7 +880,7 @@ def _read_latest_persistent_result(*, user_id: str, parcel_id: str, index_key: s
     except FileNotFoundError:
         return None
     except Exception:
-        logger.info("Manifest legacy Sentinel-2 no disponible; se continúa con catálogo", exc_info=True)
+        logger.info("Manifest legacy Sentinel-2 de Azure Blob no disponible; se continúa con catálogo", exc_info=True)
         return None
 
     promoted = _json_safe({
@@ -931,7 +931,7 @@ def _read_date_persistent_result(*, user_id: str, parcel_id: str, index_key: str
     except FileNotFoundError:
         return None
     except Exception:
-        logger.info("Manifest por fecha Sentinel-2 no disponible; se continúa con cache exacta/STAC", exc_info=True)
+        logger.info("Manifest por fecha Sentinel-2 de Azure Blob no disponible; se continúa con cache exacta/STAC", exc_info=True)
         return None
     return _result_from_manifest(
         manifest,
@@ -948,7 +948,7 @@ def _manifest_rank(metadata: dict[str, Any]) -> tuple[str, int]:
 
 
 def _publish_best_manifest(*, read_manifest, write_manifest, manifest_key: str, metadata: dict[str, Any]) -> None:
-    """Advance one GCS pointer only when date/resolution improves."""
+    """Advance one Azure Blob pointer only when date/resolution improves."""
     try:
         previous = read_manifest(manifest_key)
     except Exception:
@@ -1050,7 +1050,7 @@ def _backfill_existing_png_alias(*, cache_key: str, user_id: str, parcel_id: str
     except FileNotFoundError:
         return None
     except Exception:
-        logger.info("No se pudo comprobar alias PNG Sentinel-2 heredado", exc_info=True)
+        logger.info("No se pudo comprobar alias PNG Sentinel-2 en Azure Blob Storage", exc_info=True)
         return None
     try:
         local_png_path(cache_key).write_bytes(content)
@@ -1147,13 +1147,13 @@ def _store_png(png_bytes: bytes, *, user_id: str, parcel_id: str, index_key: str
             height=height,
             geometry_hash=geometry_hash,
         )
-        # Return the app cache endpoint instead of a signed GCS URL so CORS,
+        # Return the app cache endpoint instead of a signed Azure Blob URL so CORS,
         # cache busting and auth-free <img> loading stay under our control.
         return object_path, local_png_url(cache_key)
     except Exception:
-        # GCS is optional for local/dev. The frontend can load the public cache
+        # Azure Blob Storage is optional only when explicitly disabled for local troubleshooting. The frontend can load the public cache
         # route without Authorization headers, which is required for imageOverlay.
-        logger.info("No se pudo publicar cache persistente Sentinel-2; se conserva cache local", exc_info=True)
+        logger.info("No se pudo publicar cache persistente Sentinel-2 en Azure Blob Storage; se conserva cache local", exc_info=True)
         return f"local://{cache_key}", local_png_url(cache_key)
 
 
@@ -1177,8 +1177,8 @@ def generate_or_get_layer(
     if not definition:
         raise ValueError(f"Índice no soportado: {index_key}")
 
-    # Persistent GCS manifests make generated rasters reusable after logout,
-    # browser-data deletion and Cloud Run instance replacement. For latest
+    # Persistent Azure Blob manifests make generated rasters reusable after logout,
+    # browser-data deletion and Azure Container Apps replica replacement. For latest
     # requests the UI gets an instant first paint; a lightweight background
     # revalidation can later ask STAC whether a newer date exists.
     if not force_refresh and target_date is None and not revalidate_latest:
@@ -1292,7 +1292,7 @@ def generate_or_get_layer(
 
     # Revalidation may need one STAC catalog lookup to discover the latest date,
     # but it must still avoid remote band reads when that immutable date was
-    # already generated by any previous Cloud Run instance.
+    # already generated by any previous Azure Container Apps replica.
     if not force_refresh:
         persistent_cached = _read_persistent_cache_result(cache_key)
         if persistent_cached:
@@ -1342,7 +1342,7 @@ def generate_or_get_layer(
             "render_width": cached_meta.get("render_width") or width,
             "render_height": cached_meta.get("render_height") or height,
         })
-        # Backfill the GCS hash alias and metadata for local-cache hits. This is
+        # Backfill the Azure Blob hash alias and metadata for local-cache hits. This is
         # important when an older instance generated the PNG before persistent
         # manifests were enabled.
         try:
@@ -1368,7 +1368,7 @@ def generate_or_get_layer(
             )
             return published
         except Exception:
-            logger.info("No se pudo respaldar local-cache Sentinel-2 en GCS; se usará cache local", exc_info=True)
+            logger.info("No se pudo respaldar local-cache Sentinel-2 en Azure Blob Storage; se usará cache local", exc_info=True)
         return local_result
 
     if not force_refresh:

@@ -12,7 +12,7 @@ from app.models.user_roles import UserRole, AppRole
 from app.api.deps import get_current_user
 from app.schemas.user_admin import AdminUserOut
 from app.schemas.user import UserOut, UserUpdate
-from app.utils.gcs import delete_user_avatars
+from app.utils.storage_avatars import delete_user_avatars, resolve_avatar_url
 from app.utils.storage_parcels import delete_parcel_files
 
 router = APIRouter(prefix="/users", tags=["users"])
@@ -57,7 +57,7 @@ def get_me(user_id: str = Depends(get_current_user), db: Session = Depends(get_d
         "assigned_hectares": profile.hectareas if profile else None,
         "phone": profile.phone if profile else None,
         "location": profile.location if profile else None,
-        "avatar_url": profile.avatar_url if profile else None,
+        "avatar_url": resolve_avatar_url(profile.avatar_url) if profile else None,
         "roles": roles,
         "modules":modules,
         "max_users": profile.max_users if profile else None,
@@ -124,9 +124,9 @@ def delete_user(user_id: str, db: Session = Depends(get_db)):
         parcels = db.query(Parcel).filter(Parcel.user_id == user_id).all()
         for parcel in parcels:
             try:
-                delete_parcel_files(parcel.file_url)  # Delete the file in cloud storage
+                delete_parcel_files(str(user.id), str(parcel.id))
             except Exception as e:
-                print(f"Failed to delete parcel file {parcel.file_url}: {e}")
+                print(f"Failed to delete parcel files for {parcel.id}: {e}")
             db.delete(parcel)  # Delete from DB
 
     db.delete(user)

@@ -9,7 +9,7 @@ from urllib.parse import quote
 
 from pystac_client import Client
 
-# Earth Search usually exposes public COGs through s3:// hrefs. In Cloud Run,
+# Earth Search usually exposes public COGs through s3:// hrefs. In Azure Container Apps,
 # unsigned S3 reads can fail unless GDAL receives these flags. We also normalize
 # s3:// hrefs to HTTPS in the raster service, which avoids AWS credentials.
 os.environ.setdefault("AWS_NO_SIGN_REQUEST", "YES")
@@ -74,7 +74,7 @@ def normalize_asset_href(href: str) -> str:
     """Return a rasterio/GDAL friendly URL for public STAC assets.
 
     Earth Search may return s3://sentinel-cogs/... hrefs. Those are public, but
-    Cloud Run containers usually do not have AWS credentials and GDAL may try to
+    Azure Container Apps containers usually do not have AWS credentials and GDAL may try to
     sign S3 requests. Converting to HTTPS makes the request anonymous and avoids
     the common 500 generated while opening the raster.
     """

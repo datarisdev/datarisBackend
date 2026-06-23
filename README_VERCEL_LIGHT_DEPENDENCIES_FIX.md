@@ -25,5 +25,5 @@ Vercel no puede empaquetar ese stack geoespacial completo dentro del límite de 
 
 ## Importante
 
-El procesamiento satelital completo con rasterio/geopandas debe correr en VM/Docker/Cloud Run/Railway/Render, no en Vercel.
+El procesamiento satelital completo con rasterio/geopandas debe correr en VM/Docker/Azure Container Apps, no en Vercel.
 El login, compat, carga básica de parcelas y análisis de helicóptero ligero sí quedan preparados para Vercel.

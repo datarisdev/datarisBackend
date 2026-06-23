@@ -61,7 +61,7 @@ def _float_env(name: str, default: float) -> float:
 
 # This JSON compatibility state can be large. Reading it from PostgreSQL on every
 # authenticated request made login and navigation unnecessarily expensive. The
-# short TTL keeps different Cloud Run workers convergent while allowing repeated
+# short TTL keeps different Azure Container Apps workers convergent while allowing repeated
 # reads inside the same request and rapid section changes to reuse the same state.
 STATE_CACHE_TTL_SECONDS = _float_env("DATARIS_COMPAT_CACHE_TTL_SECONDS", 1.0)
 STATE_TABLE = os.getenv("DATARIS_COMPAT_STATE_TABLE", "dataris_compat_state")
@@ -441,7 +441,7 @@ def read_db(*, force_refresh: bool = False) -> Dict[str, Any]:
 def write_db(db: Dict[str, Any]) -> None:
     """Persist state and immediately refresh the process-local read cache.
 
-    Cloud Run instances still converge through PostgreSQL because the read cache
+    Azure Container Apps instances still converge through PostgreSQL because the read cache
     has a short TTL. Writes performed by the current worker become visible to the
     next request immediately without repeating a database read.
     """

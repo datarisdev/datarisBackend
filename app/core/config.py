@@ -26,14 +26,23 @@ class Settings(BaseSettings):
     # The SQLite fallback exists so the app can boot and the /api/compat layer can work.
     DATABASE_URL: str = _default_sqlite_url()
     BACKEND_CORS_ORIGINS: str = "*"
-    # Optional regex. Useful in Cloud Run when the frontend domain changes or
+    # Optional regex. Useful in Azure Container Apps when the frontend domain changes or
     # when BACKEND_CORS_ORIGINS is left as "*" with credentials enabled.
     BACKEND_CORS_ORIGIN_REGEX: str | None = None
 
-    # Optional Google Cloud Storage config.
-    GCS_BUCKET_NAME: str = "dataris-user-avatars"
-    GCS_SERVICE_ACCOUNT_JSON: str | None = None
-    GOOGLE_CLOUD_PROJECT: str | None = None
+    # Azure Blob Storage. In Azure Container Apps the backend authenticates with
+    # the user-assigned managed identity configured by Terraform. Local work uses
+    # DefaultAzureCredential (normally `az login`) and the same variables.
+    AZURE_STORAGE_ACCOUNT_NAME: str | None = None
+    AZURE_STORAGE_ACCOUNT_URL: str | None = None
+    AZURE_STORAGE_CONTAINER_NAME: str | None = None
+    AZURE_PARCELS_STORAGE_CONTAINER: str | None = None
+    AZURE_SATELLITE_STORAGE_CONTAINER: str | None = None
+    AZURE_AVATARS_STORAGE_CONTAINER: str | None = None
+    AZURE_CLIENT_ID: str | None = None
+    DISABLE_AZURE_BLOB_STORAGE: bool = False
+    AZURE_BLOB_STORAGE_STRICT: bool = False
+    AZURE_BLOB_READ_SAS_TTL_HOURS: int = 1
 
     DATARIS_COMPAT_STORAGE_DIR: str | None = None
 
@@ -59,7 +68,7 @@ class Settings(BaseSettings):
     GRANIOT_DEBUG_LOG_FILE: str | None = None
     GRANIOT_DEBUG_MAX_BODY_CHARS: int = 30000
     # These diagnostics are intentionally separate from full debug logs:
-    # they only print important WMS/Graniot failures to Cloud Run stdout so a
+    # they only print important WMS/Graniot failures to Azure Container Apps stdout so a
     # browser 502 can be traced without enabling noisy file logs.
     GRANIOT_DEBUG_IMPORTANT_LOGS_TO_STDOUT: bool = True
     GRANIOT_WMS_DIAGNOSTIC_LOGS_ENABLED: bool = True

@@ -39,7 +39,7 @@ _wms_cloud_logger = logging.getLogger("uvicorn.error")
 # ---------------------------------------------------------------------------
 # Graniot performance cache
 # ---------------------------------------------------------------------------
-# Cloud Run instances are ephemeral, but keeping a small /tmp cache still helps a
+# Azure Container Apps instances are ephemeral, but keeping a small /tmp cache still helps a
 # lot because the same satellite layer/date is usually requested many times by
 # the same customer during a work session. The cache is intentionally local to
 # the running instance: no Redis/Memorystore is required, so the MVP remains
@@ -283,7 +283,7 @@ def _wms_json_safe(value: Any) -> Any:
 
 
 def _wms_token_info(value: Any) -> Dict[str, Any]:
-    """Log token shape only. Never write the full Graniot access key to Cloud Run."""
+    """Log token shape only. Never write the full Graniot access key to Azure Container Apps."""
     try:
         text = str(value or "").strip()
         return {
@@ -299,7 +299,7 @@ def _wms_token_info(value: Any) -> Dict[str, Any]:
 
 
 def _wms_cloud_log(level: int, event: str, **fields: Any) -> None:
-    """Write compact WMS diagnostics to Cloud Run stdout/stderr.
+    """Write compact WMS diagnostics to Azure Container Apps stdout/stderr.
 
     This function must never raise. The previous diagnostic version could fail
     before reaching Graniot, producing a fast 500 instead of the useful cause.
@@ -316,7 +316,7 @@ def _wms_cloud_log(level: int, event: str, **fields: Any) -> None:
 
 
 def _wms_cloud_exception(event: str, exc: Exception, **fields: Any) -> None:
-    """Write a traceback to Cloud Run without allowing logging itself to fail."""
+    """Write a traceback to Azure Container Apps without allowing logging itself to fail."""
     try:
         payload = _wms_json_safe({
             **fields,
@@ -2464,7 +2464,7 @@ def _public_parcel(row: Dict[str, Any]) -> Dict[str, Any]:
 @router.get("/status")
 def status():
     # Public diagnostic endpoint: it never exposes the API key.
-    # Useful for checking local/Cloud Run configuration directly from the browser.
+    # Useful for checking local/Azure Container Apps configuration directly from the browser.
     client = GraniotClient()
     return {
         "data": {
@@ -3877,7 +3877,7 @@ async def prefetch_satellite_cache(
     The frontend calls this endpoint in the background. It resolves the same
     map-layer payload used by the UI and then asks the local WMS proxy to fetch
     each raster once. Subsequent ImageOverlay requests are served from /tmp cache
-    on the Cloud Run instance instead of hitting Graniot again.
+    on the Azure Container Apps instance instead of hitting Graniot again.
     """
     user = _require_user(authorization)
     requested_ids = payload.get("parcel_ids") or payload.get("parcelIds") or []
@@ -3946,7 +3946,7 @@ async def prefetch_satellite_cache(
 
     # Warm a handful of parcels concurrently. The frontend does not wait for this
     # request, but keeping it real work instead of a detached task avoids relying
-    # on Cloud Run CPU after response.
+    # on Azure Container Apps CPU after response.
     results = await asyncio.gather(*(warm_parcel(parcel) for parcel in selected))
     image_count = sum(int(item.get("image_count") or 0) for item in results if isinstance(item, dict))
     return {
@@ -4098,7 +4098,7 @@ async def wms_proxy(
         raise HTTPException(
             status_code=500,
             detail={
-                "message": "Error interno en WMS proxy. Busca este request_id en Cloud Run con WMS_PROXY.",
+                "message": "Error interno en WMS proxy. Busca este request_id en Azure Container Apps con WMS_PROXY.",
                 "request_id": request_id,
                 "exception_type": type(exc).__name__,
                 "error": str(exc),

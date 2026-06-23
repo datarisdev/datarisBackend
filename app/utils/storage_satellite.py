@@ -9,35 +9,24 @@ from typing import Any
 import numpy as np
 import rasterio
 
-from app.utils.gcs import get_storage_client
+from app.utils.azure_blob import (
+    delete_blob,
+    delete_blobs_with_prefix,
+    download_blob_bytes,
+    generate_blob_read_url,
+    satellite_container_name,
+    upload_blob_bytes,
+    upload_blob_file,
+)
 
-try:
-    from google.api_core.exceptions import NotFound as GoogleCloudNotFound
-except Exception:  # pragma: no cover - optional in local environments
-    class GoogleCloudNotFound(Exception):
-        pass
 
-BUCKET_NAME = os.getenv("GCS_SATELLITE_BUCKET_NAME", "dataris-satellite")
-
-
-def _bucket():
-    """Return the satellite bucket lazily.
-
-    This prevents Vercel from crashing while importing app/main.py when Google
-    credentials are not configured. Only routes that actually need GCS will fail
-    with a clear error.
-    """
-    client = get_storage_client()
-    if client is None:
-        raise RuntimeError(
-            "Google Cloud Storage credentials are not configured. "
-            "Set GCS_SERVICE_ACCOUNT_JSON or GOOGLE_APPLICATION_CREDENTIALS in Vercel."
-        )
-    return client.bucket(os.getenv("GCS_SATELLITE_BUCKET_NAME") or BUCKET_NAME)
+def _container_name() -> str:
+    """Resolve the Azure Blob container dedicated to persistent Sentinel-2 data."""
+    return satellite_container_name()
 
 
 def safe_satellite_cache_key(cache_key: str) -> str:
-    """Keep deterministic hash-based cache aliases safe for local disk and GCS."""
+    """Keep deterministic hash-based cache aliases safe for local disk and Azure Blob."""
     return "".join(ch for ch in str(cache_key).lower() if ch in "0123456789abcdef")[:80]
 
 
@@ -75,14 +64,7 @@ def satellite_catalog_manifest_object_path(manifest_key: str) -> str:
 
 
 def _download_json_blob(object_path: str) -> dict[str, Any]:
-    blob = _bucket().blob(object_path)
-    try:
-        # download_as_bytes already returns 404 when the object does not exist.
-        # Avoid blob.exists() first: it adds one extra GCS round trip to every
-        # login/re-entry cache hit.
-        raw = blob.download_as_bytes()
-    except GoogleCloudNotFound as exc:
-        raise FileNotFoundError(object_path) from exc
+    raw = download_blob_bytes(container_name=_container_name(), object_path=object_path)
     payload = json.loads(raw.decode("utf-8"))
     if not isinstance(payload, dict):
         raise ValueError(f"Invalid JSON object stored at {object_path}")
@@ -90,40 +72,30 @@ def _download_json_blob(object_path: str) -> dict[str, Any]:
 
 
 def _upload_json_blob(object_path: str, payload: dict[str, Any], *, cache_control: str = "no-cache") -> None:
-    blob = _bucket().blob(object_path)
-    blob.cache_control = cache_control
-    blob.upload_from_string(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+    upload_blob_bytes(
+        container_name=_container_name(),
+        object_path=object_path,
+        content=json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"),
         content_type="application/json; charset=utf-8",
+        cache_control=cache_control,
     )
 
 
 def download_satellite_cache_png_bytes(cache_key: str) -> bytes:
-    """Read the persistent Sentinel-2 PNG alias from GCS.
-
-    The UI loads /api/satellite-free/cache/<hash>.png. Cloud Run can run with
-    several instances, so the endpoint cannot rely only on /tmp. This alias makes
-    every instance able to serve the same immutable PNG.
-    """
-    object_path = satellite_cache_object_path(cache_key)
-    blob = _bucket().blob(object_path)
-    try:
-        return blob.download_as_bytes()
-    except GoogleCloudNotFound as exc:
-        raise FileNotFoundError(object_path) from exc
+    """Read a persistent Sentinel-2 PNG alias from private Azure Blob Storage."""
+    return download_blob_bytes(
+        container_name=_container_name(),
+        object_path=satellite_cache_object_path(cache_key),
+    )
 
 
 def download_satellite_cache_metadata(cache_key: str) -> dict[str, Any]:
-    """Read metadata for a generated immutable Sentinel-2 PNG from GCS."""
+    """Read metadata for a generated immutable Sentinel-2 PNG from Azure Blob."""
     return _download_json_blob(satellite_cache_metadata_object_path(cache_key))
 
 
 def upload_satellite_cache_metadata(cache_key: str, metadata: dict[str, Any]) -> None:
-    """Persist metadata next to the immutable PNG cache alias.
-
-    Metadata is intentionally revalidatable instead of immutable so older
-    deployments can backfill extra fields without changing the PNG URL.
-    """
+    """Persist metadata next to the immutable PNG cache alias."""
     _upload_json_blob(satellite_cache_metadata_object_path(cache_key), metadata)
 
 
@@ -165,23 +137,20 @@ def upload_satellite_tif(
     index_type: str,
     image_date: str,
 ) -> str:
-    bucket = _bucket()
-
-    object_path = (
-        f"satellite/{user_id}/"
-        f"{parcel_id}/"
-        f"{index_type}/"
-        f"{image_date}.tif"
-    )
+    object_path = f"satellite/{user_id}/{parcel_id}/{index_type}/{image_date}.tif"
 
     fd, tmp_path = tempfile.mkstemp(suffix=".tif")
     os.close(fd)
-
     try:
         with rasterio.open(tmp_path, "w", **meta) as dst:
             dst.write(raster, 1)
-
-        bucket.blob(object_path).upload_from_filename(tmp_path)
+        upload_blob_file(
+            container_name=_container_name(),
+            object_path=object_path,
+            file_path=tmp_path,
+            content_type="image/tiff",
+            cache_control="private, max-age=31536000, immutable",
+        )
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
@@ -197,51 +166,46 @@ def upload_satellite_png_bytes(
     image_date: str,
     cache_key: str | None = None,
 ) -> str:
-    bucket = _bucket()
-    object_path = (
-        f"satellite/{user_id}/"
-        f"{parcel_id}/"
-        f"{index_type}/"
-        f"{image_date}.png"
-    )
-    blob = bucket.blob(object_path)
-    blob.cache_control = "public, max-age=31536000, immutable"
-    blob.upload_from_string(content, content_type="image/png")
+    object_path = f"satellite/{user_id}/{parcel_id}/{index_type}/{image_date}.png"
+    immutable_cache = "private, max-age=31536000, immutable"
+    container_name = _container_name()
 
-    # Also store by the hash exposed by /api/satellite-free/cache/<hash>.png.
-    # Without this, a PNG generated in one Cloud Run instance may not be found
-    # by another instance when the browser loads the image overlay.
+    upload_blob_bytes(
+        container_name=container_name,
+        object_path=object_path,
+        content=content,
+        content_type="image/png",
+        cache_control=immutable_cache,
+    )
+
+    # Alias exposed through /api/satellite-free/cache/<hash>.png. It lets every
+    # Container Apps replica serve an immutable rendered PNG after scale-out or
+    # instance replacement.
     if cache_key:
-        alias_blob = bucket.blob(satellite_cache_object_path(cache_key))
-        alias_blob.cache_control = "public, max-age=31536000, immutable"
-        alias_blob.upload_from_string(content, content_type="image/png")
+        upload_blob_bytes(
+            container_name=container_name,
+            object_path=satellite_cache_object_path(cache_key),
+            content=content,
+            content_type="image/png",
+            cache_control=immutable_cache,
+        )
 
     return object_path
 
 
 def generate_signed_satellite_url(object_path: str) -> str:
-    bucket = _bucket()
-    blob = bucket.blob(object_path)
-
-    return blob.generate_signed_url(
-        version="v4",
-        expiration=timedelta(hours=1),
-        method="GET",
+    """Create a short-lived read URL for a private Sentinel Blob object."""
+    return generate_blob_read_url(
+        container_name=_container_name(),
+        object_path=object_path,
+        expires_in=timedelta(hours=1),
     )
 
 
 def delete_satellite_images_for_parcel(*, user_id: str, parcel_id: str) -> int:
-    bucket = _bucket()
     prefix = f"satellite/{user_id}/{parcel_id}/"
-
-    deleted = 0
-    for blob in bucket.list_blobs(prefix=prefix):
-        blob.delete()
-        deleted += 1
-
-    return deleted
+    return delete_blobs_with_prefix(container_name=_container_name(), prefix=prefix)
 
 
 def delete_satellite_object(object_path: str) -> None:
-    bucket = _bucket()
-    bucket.blob(object_path).delete()
+    delete_blob(container_name=_container_name(), object_path=object_path)

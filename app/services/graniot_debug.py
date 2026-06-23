@@ -182,7 +182,7 @@ def log_event(event: Dict[str, Any]) -> None:
     is_debug_enabled = debug_enabled()
     is_important = _is_important_event(enriched)
 
-    # Keep critical Graniot/WMS failures visible in Cloud Run Logs even when
+    # Keep critical Graniot/WMS failures visible in Azure Container Apps Logs even when
     # full file-based debug logging is disabled. This is what lets us see why
     # the browser only gets a generic 502.
     if is_important and _important_logs_to_stdout_enabled():

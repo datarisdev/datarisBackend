@@ -4,7 +4,7 @@ Frontend (Lovable → later React / Mobile)
    |
    |  HTTPS + JWT
    v
-FastAPI Backend (Cloud Run)
+FastAPI Backend (Azure Container Apps)
    |
    |-- Auth & Roles
    |-- Validation
@@ -17,13 +17,13 @@ Cloud SQL (PostgreSQL)
    |
    |-- PostGIS (later, optional)
 
-## 2️⃣ Google Cloud services
+## 2️⃣ Azure services
 
 | Purpose         | Service                     |
 | --------------- | --------------------------- |
-| Backend runtime | **Cloud Run**               |
+| Backend runtime | **Azure Container Apps**               |
 | API             | **FastAPI**                 |
-| Database        | **Cloud SQL (Postgres 15)** |
+| Database        | **Azure Database for PostgreSQL Flexible Server** |
 | Auth            | **Firebase Auth**           |
 | Secrets         | **Secret Manager**          |
 | Files           | **Cloud Storage**           |
@@ -97,7 +97,7 @@ Frontend
    |
    | POST /satellite/process
    v
-API (Cloud Run)
+API (Azure Container Apps)
    |
    | enqueue task
    v
@@ -105,11 +105,11 @@ Cloud Tasks Queue
    |
    | HTTP push
    v
-Worker Endpoint (Cloud Run)
+Worker Endpoint (Azure Container Apps)
    |
    | process images day-by-day
    v
-GCS + DB
+Azure Blob Storage + PostgreSQL
 
 ## High-level architecture
 

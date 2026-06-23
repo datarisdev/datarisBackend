@@ -2,7 +2,7 @@
 
 ## Target pattern
 
-Dataris backend should remain a modular FastAPI monolith while the product is still evolving quickly. This gives Cloud Run simple deployment and scaling, but keeps business logic isolated by domain.
+Dataris backend should remain a modular FastAPI monolith while the product is still evolving quickly. This gives Azure Container Apps deployment and scaling, but keeps business logic isolated by domain.
 
 Each module should expose a thin router and keep business logic in `app/modules/<moduleName>`.
 
