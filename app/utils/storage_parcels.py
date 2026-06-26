@@ -3,61 +3,55 @@ from __future__ import annotations
 import os
 from datetime import timedelta
 
-from app.core.config import settings
-from app.utils.gcs import get_storage_client
+from app.utils.azure_blob import (
+    azure_blob_reference,
+    delete_blobs_with_prefix,
+    generate_blob_read_url,
+    parcels_container_name,
+    upload_blob_stream,
+)
 
-PARCELS_BUCKET_NAME = os.getenv("GCS_PARCELS_BUCKET_NAME", "dataris-parcels")
 
-
-def _bucket():
-    """Return the parcels bucket lazily.
-
-    Important for Vercel/serverless: never create storage.Client() at import time.
-    If credentials are not configured, routes that do not use GCS should still boot.
-    """
-    client = get_storage_client()
-    if client is None:
-        raise RuntimeError(
-            "Google Cloud Storage credentials are not configured. "
-            "Set GCS_SERVICE_ACCOUNT_JSON or GOOGLE_APPLICATION_CREDENTIALS in Vercel."
-        )
-    return client.bucket(os.getenv("GCS_PARCELS_BUCKET_NAME") or PARCELS_BUCKET_NAME)
+def _container_name() -> str:
+    return parcels_container_name()
 
 
 def upload_parcel_file(file, content_type: str, user_id: str, parcel_id: str) -> str:
-    """
-    Uploads a parcel file (zip/shp/etc) to GCS and returns a signed URL.
-    """
-    bucket = _bucket()
+    """Upload a parcel source file to the private Azure Blob container.
 
+    The database should store the returned ``azureblob://`` reference, not a
+    short-lived SAS URL. Resolve it at the HTTP boundary when a browser needs a
+    temporary download URL.
+    """
     ext = os.path.splitext(file.filename or "")[1].lower() or ".bin"
-    filename = f"parcels/{user_id}/{parcel_id}/original{ext}"
+    object_path = f"parcels/{user_id}/{parcel_id}/original{ext}"
+    upload_blob_stream(
+        container_name=_container_name(),
+        object_path=object_path,
+        stream=file.file,
+        content_type=content_type or "application/octet-stream",
+        cache_control="private, max-age=0, no-store",
+    )
+    return azure_blob_reference(object_path)
 
-    blob = bucket.blob(filename)
-    blob.upload_from_file(
-        file.file,
-        content_type=content_type,
-        rewind=True,
+
+def generate_parcel_file_url(object_path: str) -> str:
+    return generate_blob_read_url(
+        container_name=_container_name(),
+        object_path=object_path,
+        expires_in=timedelta(hours=1),
     )
 
-    return blob.generate_signed_url(
-        version="v4",
-        expiration=timedelta(days=7),
-        method="GET",
+
+def delete_parcel_files(user_id: str, parcel_id: str) -> int:
+    return delete_blobs_with_prefix(
+        container_name=_container_name(),
+        prefix=f"parcels/{user_id}/{parcel_id}/",
     )
 
 
-def delete_parcel_files(user_id: str, parcel_id: str) -> None:
-    bucket = _bucket()
-    prefix = f"parcels/{user_id}/{parcel_id}/"
-
-    for blob in bucket.list_blobs(prefix=prefix):
-        blob.delete()
-
-
-def delete_all_user_parcels(user_id: str) -> None:
-    bucket = _bucket()
-    prefix = f"parcels/{user_id}/"
-
-    for blob in bucket.list_blobs(prefix=prefix):
-        blob.delete()
+def delete_all_user_parcels(user_id: str) -> int:
+    return delete_blobs_with_prefix(
+        container_name=_container_name(),
+        prefix=f"parcels/{user_id}/",
+    )

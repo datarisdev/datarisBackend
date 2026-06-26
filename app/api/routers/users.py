@@ -12,7 +12,7 @@ from app.models.user_roles import UserRole, AppRole
 from app.api.deps import get_current_user
 from app.schemas.user_admin import AdminUserOut
 from app.schemas.user import UserOut, UserUpdate
-from app.utils.gcs import delete_user_avatars
+from app.utils.storage_avatars import delete_user_avatars
 from app.utils.storage_parcels import delete_parcel_files
 
 router = APIRouter(prefix="/users", tags=["users"])
@@ -114,20 +114,22 @@ def delete_user(user_id: str, db: Session = Depends(get_db)):
     except Exception as e:
         # log error, but don't block deletion
         print(f"Failed to delete avatars for user {user_id}: {e}")
+    # Todo usuario puede tener parcelas. Antes de eliminarlo,
+    # se eliminan sus archivos persistentes y sus registros asociados.
+    parcels = db.query(Parcel).filter(Parcel.user_id == user_id).all()
 
-   # 🔹 Check if user has admin role
-    is_admin = any(role.role == AppRole.admin for role in user.roles)
-    
-    if is_admin:
-        print(f"User {user_id} is admin, deleting all parcels")
-        # Fetch parcels
-        parcels = db.query(Parcel).filter(Parcel.user_id == user_id).all()
-        for parcel in parcels:
-            try:
-                delete_parcel_files(parcel.file_url)  # Delete the file in cloud storage
-            except Exception as e:
-                print(f"Failed to delete parcel file {parcel.file_url}: {e}")
-            db.delete(parcel)  # Delete from DB
+    for parcel in parcels:
+        try:
+            delete_parcel_files(
+                user_id=str(parcel.user_id),
+                parcel_id=str(parcel.id),
+            )
+        except Exception as e:
+            # No impedimos borrar al usuario si un blob ya no existe
+            # o si Azure presenta un fallo temporal.
+            print(f"Failed to delete parcel files for {parcel.id}: {e}")
+
+        db.delete(parcel)
 
     db.delete(user)
     db.commit()

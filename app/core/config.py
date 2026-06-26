@@ -31,8 +31,6 @@ class Settings(BaseSettings):
     BACKEND_CORS_ORIGIN_REGEX: str | None = None
 
     # Optional Google Cloud Storage config.
-    GCS_BUCKET_NAME: str = "dataris-user-avatars"
-    GCS_SERVICE_ACCOUNT_JSON: str | None = None
     GOOGLE_CLOUD_PROJECT: str | None = None
 
     DATARIS_COMPAT_STORAGE_DIR: str | None = None
