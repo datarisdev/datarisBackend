@@ -127,39 +127,69 @@ jobs:
 
           echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
 
-      - name: Smoke test backend image
+      - name: Smoke test backend image with disposable PostgreSQL
         shell: bash
         run: |
           set -euo pipefail
 
           IMAGE="${{ steps.image.outputs.image }}"
-
-          docker run -d \
-            --name dataris-backend-smoke \
-            --publish 8080:8080 \
-            --env PORT=8080 \
-            "$IMAGE"
+          NETWORK="dataris-smoke-net"
+          DATABASE_CONTAINER="dataris-smoke-db"
+          APP_CONTAINER="dataris-backend-smoke"
+          SMOKE_DATABASE_URL="postgresql+psycopg2://dataris:dataris@postgres:5432/dataris_smoke"
+          SMOKE_SUCCESS="false"
 
           cleanup() {
-            docker logs dataris-backend-smoke || true
-            docker rm -f dataris-backend-smoke || true
+            if [[ "$SMOKE_SUCCESS" != "true" ]]; then
+              echo "=== Logs del backend smoke ==="
+              docker logs "$APP_CONTAINER" || true
+
+              echo "=== Logs de PostgreSQL smoke ==="
+              docker logs "$DATABASE_CONTAINER" || true
+            fi
+
+            docker rm -f "$APP_CONTAINER" "$DATABASE_CONTAINER" >/dev/null 2>&1 || true
+            docker network rm "$NETWORK" >/dev/null 2>&1 || true
           }
 
           trap cleanup EXIT
 
+          docker network create "$NETWORK"
+
+          docker run -d             --name "$DATABASE_CONTAINER"             --network "$NETWORK"             --network-alias postgres             --env POSTGRES_USER=dataris             --env POSTGRES_PASSWORD=dataris             --env POSTGRES_DB=dataris_smoke             postgres:16-alpine
+
           for ATTEMPT in $(seq 1 30); do
-            if curl --fail --silent --show-error \
-              "http://127.0.0.1:8080/health"
+            if docker exec "$DATABASE_CONTAINER"               pg_isready               --username dataris               --dbname dataris_smoke               >/dev/null 2>&1
             then
-              echo "Smoke test local correcto."
-              exit 0
+              echo "PostgreSQL smoke listo."
+              break
             fi
 
-            echo "Esperando health local: ${ATTEMPT}/30"
+            echo "Esperando PostgreSQL smoke: ${ATTEMPT}/30"
             sleep 2
           done
 
-          echo "::error::El contenedor local no respondió en /health."
+          if ! docker exec "$DATABASE_CONTAINER"             pg_isready             --username dataris             --dbname dataris_smoke             >/dev/null 2>&1
+          then
+            echo "::error::PostgreSQL smoke no inició correctamente."
+            exit 1
+          fi
+
+          docker run -d             --name "$APP_CONTAINER"             --network "$NETWORK"             --publish 8080:8080             --env PORT=8080             --env DATABASE_URL="$SMOKE_DATABASE_URL"             "$IMAGE"
+
+          for ATTEMPT in $(seq 1 45); do
+            if curl --fail --silent --show-error               "http://127.0.0.1:8080/health"
+            then
+              SMOKE_SUCCESS="true"
+              echo "Smoke test con PostgreSQL correcto."
+              exit 0
+            fi
+
+            echo "Esperando health local: ${ATTEMPT}/45"
+            sleep 2
+          done
+
+          echo "::error::El contenedor no respondió en /health."
           exit 1
 
       - name: Login to Azure Container Registry
