@@ -1,0 +1,208 @@
+name: Deploy Backend to Azure Container Apps
+
+on:
+  push:
+    branches:
+      - develop
+      - staging
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  resolve-target:
+    name: Resolve deployment target
+    runs-on: ubuntu-latest
+
+    outputs:
+      target: ${{ steps.target.outputs.target }}
+      resource_group: ${{ steps.target.outputs.resource_group }}
+      container_app: ${{ steps.target.outputs.container_app }}
+      acr_name: ${{ steps.target.outputs.acr_name }}
+      acr_login_server: ${{ steps.target.outputs.acr_login_server }}
+      health_url: ${{ steps.target.outputs.health_url }}
+
+    steps:
+      - name: Resolve target from branch
+        id: target
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "${GITHUB_REF_NAME}" in
+            develop)
+              TARGET="dev"
+              RESOURCE_GROUP="datarisjm26-dev-rg"
+              CONTAINER_APP="dataris-api-dev"
+              ACR_NAME="datarisjm26devacr"
+              ACR_LOGIN_SERVER="datarisjm26devacr.azurecr.io"
+              HEALTH_URL="https://dataris-api-dev.victoriousground-16fbb97f.eastus.azurecontainerapps.io/health"
+              ;;
+            staging)
+              TARGET="staging"
+              RESOURCE_GROUP="datarisjm26-staging-rg"
+              CONTAINER_APP="dataris-api-staging"
+              ACR_NAME="datarisjm26stagingacr"
+              ACR_LOGIN_SERVER="datarisjm26stagingacr.azurecr.io"
+              HEALTH_URL="https://dataris-api-staging.lemonforest-501b1b21.eastus.azurecontainerapps.io/health"
+              ;;
+            *)
+              echo "::error::La rama '${GITHUB_REF_NAME}' no está autorizada para despliegues."
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "target=${TARGET}"
+            echo "resource_group=${RESOURCE_GROUP}"
+            echo "container_app=${CONTAINER_APP}"
+            echo "acr_name=${ACR_NAME}"
+            echo "acr_login_server=${ACR_LOGIN_SERVER}"
+            echo "health_url=${HEALTH_URL}"
+          } >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: Build and deploy backend
+    needs: resolve-target
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    concurrency:
+      group: dataris-backend-${{ needs.resolve-target.outputs.target }}
+      cancel-in-progress: false
+
+    env:
+      AZURE_CLIENT_ID: 6c60d8ab-85f9-47b7-8f97-5381fe3f16b7
+      AZURE_TENANT_ID: 2d22a2b4-24fd-4221-9226-0d8fc78a1966
+      AZURE_SUBSCRIPTION_ID: 36a4fab5-58ed-45ae-9284-6fb6e295a55f
+      AZURE_RESOURCE_GROUP: ${{ needs.resolve-target.outputs.resource_group }}
+      AZURE_CONTAINER_APP: ${{ needs.resolve-target.outputs.container_app }}
+      AZURE_ACR_NAME: ${{ needs.resolve-target.outputs.acr_name }}
+      AZURE_ACR_LOGIN_SERVER: ${{ needs.resolve-target.outputs.acr_login_server }}
+      BACKEND_HEALTH_URL: ${{ needs.resolve-target.outputs.health_url }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Login to Azure through OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install Azure Container Apps extension
+        shell: bash
+        run: |
+          set -euo pipefail
+          az extension add --name containerapp --upgrade --yes
+
+      - name: Build immutable Docker image
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SHORT_SHA="${GITHUB_SHA::12}"
+          IMAGE="${AZURE_ACR_LOGIN_SERVER}/dataris-api:sha-${SHORT_SHA}"
+
+          docker build \
+            --pull \
+            --platform linux/amd64 \
+            --tag "$IMAGE" \
+            .
+
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test backend image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE="${{ steps.image.outputs.image }}"
+
+          docker run -d \
+            --name dataris-backend-smoke \
+            --publish 8080:8080 \
+            --env PORT=8080 \
+            "$IMAGE"
+
+          cleanup() {
+            docker logs dataris-backend-smoke || true
+            docker rm -f dataris-backend-smoke || true
+          }
+
+          trap cleanup EXIT
+
+          for ATTEMPT in $(seq 1 30); do
+            if curl --fail --silent --show-error \
+              "http://127.0.0.1:8080/health"
+            then
+              echo "Smoke test local correcto."
+              exit 0
+            fi
+
+            echo "Esperando health local: ${ATTEMPT}/30"
+            sleep 2
+          done
+
+          echo "::error::El contenedor local no respondió en /health."
+          exit 1
+
+      - name: Login to Azure Container Registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          az acr login --name "$AZURE_ACR_NAME"
+
+      - name: Publish image to Azure Container Registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker push "${{ steps.image.outputs.image }}"
+
+      - name: Deploy image to Azure Container Apps
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          az containerapp update \
+            --name "$AZURE_CONTAINER_APP" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --image "${{ steps.image.outputs.image }}" \
+            --output none
+
+      - name: Verify public health endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for ATTEMPT in $(seq 1 40); do
+            if curl --fail --silent --show-error "$BACKEND_HEALTH_URL"; then
+              {
+                echo "### Backend desplegado"
+                echo "- Ambiente: ${{ needs.resolve-target.outputs.target }}"
+                echo "- Imagen: \`${{ steps.image.outputs.image }}\`"
+                echo "- Health: ${BACKEND_HEALTH_URL}"
+              } >> "$GITHUB_STEP_SUMMARY"
+
+              echo "Backend Azure Container Apps saludable."
+              exit 0
+            fi
+
+            echo "Esperando backend Azure: ${ATTEMPT}/40"
+            sleep 6
+          done
+
+          echo "::error::El backend desplegado no respondió correctamente."
+
+          az containerapp revision list \
+            --name "$AZURE_CONTAINER_APP" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --output table || true
+
+          exit 1
