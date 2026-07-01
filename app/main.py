@@ -133,6 +133,14 @@ async def startup_demo_prefetch() -> None:
     asyncio.create_task(_run_demo_prefetch())
 
 
+@fastapi_app.on_event("shutdown")
+async def shutdown_analytics() -> None:
+    """Flush del cliente PostHog (no-op si está deshabilitado). No afecta /health."""
+    from app.services.analytics.posthog_client import shutdown as _shutdown_analytics
+
+    _shutdown_analytics()
+
+
 @fastapi_app.get("/health")
 def health():
     return {"status": "ok"}

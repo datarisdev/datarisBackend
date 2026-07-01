@@ -16,6 +16,7 @@ from shapely.geometry.base import BaseGeometry
 
 from app.api.routers.compat import LOCK, bearer_user, now, read_db, table, write_db
 from app.core.config import settings
+from app.services.analytics.posthog_client import track_event as _track_analytics_event
 from app.services.digiforms_data_api import (
     DigiformsDataAPI,
     DigiformsDataAPIError,
@@ -1148,8 +1149,12 @@ async def cron_sync_from_digiforms_api(x_dataris_cron_secret: Optional[str] = He
             try:
                 run = await _sync_form_from_api(company_id=company_id, user_id=user_id, form_type=form_type, parcels=parcels)
                 results.append({"company_id": company_id, "user_id": user_id, "form_type": form_type, "run": run})
+                _track_analytics_event("digiforms sync completed", distinct_id=user_id, properties={"result": "success"})
             except HTTPException as exc:
                 errors.append({"company_id": company_id, "user_id": user_id, "form_type": form_type, "message": str(exc.detail)})
+                _track_analytics_event(
+                    "digiforms sync failed", distinct_id=user_id, properties={"error_category": "sync_error"}
+                )
     return {"data": {"runs": results, "errors": errors, "companies_processed": len(targets)}, "error": None}
 
 
