@@ -5,6 +5,7 @@ on:
     branches:
       - develop
       - staging
+      - main
 
   workflow_dispatch:
 
@@ -48,6 +49,14 @@ jobs:
               ACR_NAME="datarisjm26stagingacr"
               ACR_LOGIN_SERVER="datarisjm26stagingacr.azurecr.io"
               HEALTH_URL="https://dataris-api-staging.lemonforest-501b1b21.eastus.azurecontainerapps.io/health"
+              ;;
+            main)
+              TARGET="prod"
+              RESOURCE_GROUP="datarisjm26-prod-rg"
+              CONTAINER_APP="dataris-api-prod"
+              ACR_NAME="datarisjm26prodacr"
+              ACR_LOGIN_SERVER="datarisjm26prodacr.azurecr.io"
+              HEALTH_URL="https://dataris-api-prod.kindpond-6756135b.eastus.azurecontainerapps.io/health"
               ;;
             *)
               echo "::error::La rama '${GITHUB_REF_NAME}' no está autorizada para despliegues."
