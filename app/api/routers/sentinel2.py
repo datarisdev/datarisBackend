@@ -916,6 +916,19 @@ _DEMO_PARCEL_GEOMETRY: dict[str, Any] = {
 _DEMO_USER_ID = "commercial-demo"
 _DEMO_PARCEL_ID = "commercial-demo-salgado"
 
+# Pre-vetted low-cloud dates for _DEMO_PARCEL_GEOMETRY (Salgado, Veracruz), ordered
+# by preference. Verified against the STAC catalog to have < 1% cloud cover, so the
+# commercial demo always shows a clean NDVI image instead of whatever the "most
+# recent" scene happens to be on a given day.
+_DEMO_TARGET_DATES: list[date] = [
+    date(2026, 2, 26),
+    date(2025, 3, 8),
+    date(2025, 4, 2),
+    date(2024, 11, 28),
+    date(2025, 2, 26),
+]
+_DEMO_MAX_CLOUD = 15.0
+
 
 @router.get("/demo/map-layer")
 def demo_map_layer(
@@ -937,18 +950,22 @@ def demo_map_layer(
 
     db = SessionLocal()
     try:
-        result = generate_or_get_layer(
-            db,
-            parcel_geometry=_DEMO_PARCEL_GEOMETRY,
-            user_id=_DEMO_USER_ID,
-            parcel_id=_DEMO_PARCEL_ID,
-            index_key=index_key,
-            target_date=None,
-            max_cloud=80.0,
-            width=width,
-            height=height,
-            force_refresh=force_refresh,
-        )
+        result: dict[str, Any] | None = None
+        for candidate_date in _DEMO_TARGET_DATES:
+            result = generate_or_get_layer(
+                db,
+                parcel_geometry=_DEMO_PARCEL_GEOMETRY,
+                user_id=_DEMO_USER_ID,
+                parcel_id=_DEMO_PARCEL_ID,
+                index_key=index_key,
+                target_date=candidate_date,
+                max_cloud=_DEMO_MAX_CLOUD,
+                width=width,
+                height=height,
+                force_refresh=force_refresh,
+            )
+            if result.get("available"):
+                break
     except Exception as exc:
         raise HTTPException(
             status_code=502,
