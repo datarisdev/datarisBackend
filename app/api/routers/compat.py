@@ -22,7 +22,7 @@ from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 from fastapi import APIRouter, Body, File, Form, Header, HTTPException, UploadFile
 from starlette.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from jose import ExpiredSignatureError, JWTError, jwt
 from pydantic import BaseModel
 import httpx
@@ -37,6 +37,13 @@ from app.services.telemetry.helicopter_processor import process_helicopter_zip
 from app.services.telemetry.aerial_copilot import process_aerial_copilot
 from app.utils.geojson_normalizer import normalize_record_geometries
 from app.services.commercial_demo_seed import ensure_commercial_demo, is_commercial_demo_user
+from app.utils.azure_blob import azure_blob_storage_disabled
+from app.utils.storage_compat import (
+    delete_compat_objects,
+    list_compat_objects,
+    read_compat_object,
+    upload_compat_object,
+)
 
 router = APIRouter(prefix="/compat", tags=["Frontend Compatibility"])
 
@@ -1494,43 +1501,72 @@ def create_manual_parcel(
 
 @router.post("/storage/{bucket}/upload")
 async def storage_upload(bucket: str, path: str, file: UploadFile = File(...)):
-    ensure_storage()
     clean = Path(path.replace("..", "_").lstrip("/"))
-    dest = FILES / bucket / clean
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    with dest.open("wb") as out:
-        shutil.copyfileobj(file.file, out)
-    return {"data": {"path": str(clean).replace("\\", "/"), "fullPath": f"{bucket}/{clean}"}, "error": None}
+    clean_str = str(clean).replace("\\", "/")
+
+    if azure_blob_storage_disabled():
+        ensure_storage()
+        dest = FILES / bucket / clean
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with dest.open("wb") as out:
+            shutil.copyfileobj(file.file, out)
+    else:
+        upload_compat_object(bucket, clean_str, file.file, file.content_type)
+
+    return {"data": {"path": clean_str, "fullPath": f"{bucket}/{clean_str}"}, "error": None}
 
 
 @router.get("/storage/{bucket}/list")
 def storage_list(bucket: str, prefix: str = ""):
-    base = (FILES / bucket / prefix.replace("..", "_").lstrip("/")).resolve()
-    root = (FILES / bucket).resolve()
-    if not str(base).startswith(str(root)) or not base.exists():
-        return {"data": [], "error": None}
-    return {"data": [{"name": p.name, "id": p.name, "updated_at": datetime.fromtimestamp(p.stat().st_mtime, timezone.utc).isoformat()} for p in base.iterdir() if p.is_file()], "error": None}
+    clean_prefix = prefix.replace("..", "_").lstrip("/")
+
+    if azure_blob_storage_disabled():
+        base = (FILES / bucket / clean_prefix).resolve()
+        root = (FILES / bucket).resolve()
+        if not str(base).startswith(str(root)) or not base.exists():
+            return {"data": [], "error": None}
+        return {"data": [{"name": p.name, "id": p.name, "updated_at": datetime.fromtimestamp(p.stat().st_mtime, timezone.utc).isoformat()} for p in base.iterdir() if p.is_file()], "error": None}
+
+    items = list_compat_objects(bucket, clean_prefix)
+    return {"data": [{"name": name, "id": name, "updated_at": updated_at.isoformat() if updated_at else None} for name, updated_at in items], "error": None}
 
 
 @router.post("/storage/{bucket}/remove")
 def storage_remove(bucket: str, payload: Dict[str, Any] = Body(default_factory=dict)):
-    removed = []
-    root = (FILES / bucket).resolve()
-    for raw in payload.get("paths") or []:
-        p = (FILES / bucket / str(raw).replace("..", "_").lstrip("/")).resolve()
-        if str(p).startswith(str(root)) and p.exists():
-            p.unlink()
-            removed.append(str(raw))
+    paths = payload.get("paths") or []
+
+    if azure_blob_storage_disabled():
+        removed = []
+        root = (FILES / bucket).resolve()
+        for raw in paths:
+            p = (FILES / bucket / str(raw).replace("..", "_").lstrip("/")).resolve()
+            if str(p).startswith(str(root)) and p.exists():
+                p.unlink()
+                removed.append(str(raw))
+        return {"data": removed, "error": None}
+
+    clean_paths = [str(raw).replace("..", "_").lstrip("/") for raw in paths]
+    removed = delete_compat_objects(bucket, clean_paths)
     return {"data": removed, "error": None}
 
 
 @router.get("/storage/public/{bucket}/{file_path:path}")
 def storage_public(bucket: str, file_path: str):
-    path = (FILES / bucket / file_path.replace("..", "_").lstrip("/")).resolve()
-    root = (FILES / bucket).resolve()
-    if not str(path).startswith(str(root)) or not path.exists():
+    clean = file_path.replace("..", "_").lstrip("/")
+
+    if azure_blob_storage_disabled():
+        path = (FILES / bucket / clean).resolve()
+        root = (FILES / bucket).resolve()
+        if not str(path).startswith(str(root)) or not path.exists():
+            raise HTTPException(status_code=404, detail="File not found")
+        return FileResponse(path, media_type=mimetypes.guess_type(path.name)[0] or "application/octet-stream")
+
+    try:
+        content = read_compat_object(bucket, clean)
+    except FileNotFoundError:
         raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(path, media_type=mimetypes.guess_type(path.name)[0] or "application/octet-stream")
+    media_type = mimetypes.guess_type(clean)[0] or "application/octet-stream"
+    return Response(content=content, media_type=media_type, headers={"Cache-Control": "private, max-age=300"})
 
 
 @router.get("/health")
