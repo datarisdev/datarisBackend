@@ -22,12 +22,14 @@ from app.services.sentinel2.history import (
     persist_satellite_comparison_record,
     summarize_satellite_comparison_history,
 )
+from app.services.sentinel2.catalog import available_dates
 from app.services.sentinel2.indices import INDEX_DEFINITIONS, normalize_index_key
 from app.utils.storage_satellite import download_satellite_cache_png_bytes, safe_satellite_cache_key
 from app.services.sentinel2.service import (
     DEFAULT_MAX_CLOUD,
     DB_CACHE_ENABLED,
     _json_safe,
+    bbox_from_geometry,
     catalog_dates_for_geometry,
     generate_or_get_layer,
     get_cached_db_image,
@@ -916,18 +918,37 @@ _DEMO_PARCEL_GEOMETRY: dict[str, Any] = {
 _DEMO_USER_ID = "commercial-demo"
 _DEMO_PARCEL_ID = "commercial-demo-salgado"
 
-# Pre-vetted low-cloud dates for _DEMO_PARCEL_GEOMETRY (Salgado, Veracruz), ordered
-# by preference. Verified against the STAC catalog to have < 1% cloud cover, so the
-# commercial demo always shows a clean NDVI image instead of whatever the "most
-# recent" scene happens to be on a given day.
-_DEMO_TARGET_DATES: list[date] = [
-    date(2026, 2, 26),
-    date(2025, 3, 8),
-    date(2025, 4, 2),
-    date(2024, 11, 28),
-    date(2025, 2, 26),
-]
-_DEMO_MAX_CLOUD = 15.0
+# The commercial demo must always show a clean, impressive image — never "the most
+# recent scene", which can be cloudy. Instead of a hardcoded date, scan the whole
+# month asked for by product (June 2026) once via the cheap STAC catalog query
+# (cloud-cover metadata only, no raster rendering), then actually render only the
+# handful of lowest-cloud candidates and keep whichever produces the HIGHEST real
+# pixel coverage over the demo parcel — cheap catalog cloud % is a scene-wide
+# estimate and can disagree with the actual coverage over this specific small bbox.
+_DEMO_COVERAGE_WINDOW_START = date(2026, 6, 1)
+_DEMO_COVERAGE_WINDOW_END = date(2026, 6, 30)
+_DEMO_CANDIDATE_LIMIT = 6
+_DEMO_GOOD_ENOUGH_COVERAGE_PERCENT = 99.0
+
+
+def _demo_best_candidate_dates() -> list[date]:
+    """Cheapest-first shortlist of June-2026 dates for the demo parcel, ranked by
+    catalog-reported cloud cover (no raster rendering — pure STAC metadata)."""
+    bbox = bbox_from_geometry(_DEMO_PARCEL_GEOMETRY)
+    candidates = available_dates(
+        bbox=bbox,
+        start_date=_DEMO_COVERAGE_WINDOW_START,
+        end_date=_DEMO_COVERAGE_WINDOW_END,
+        max_cloud=100.0,
+        limit=140,
+    )
+    candidates.sort(key=lambda item: item.get("cloudCoverage") if item.get("cloudCoverage") is not None else 999.0)
+    in_window = [
+        date.fromisoformat(item["date"])
+        for item in candidates
+        if _DEMO_COVERAGE_WINDOW_START <= date.fromisoformat(item["date"]) <= _DEMO_COVERAGE_WINDOW_END
+    ]
+    return in_window[:_DEMO_CANDIDATE_LIMIT]
 
 
 @router.get("/demo/map-layer")
@@ -950,22 +971,32 @@ def demo_map_layer(
 
     db = SessionLocal()
     try:
-        result: dict[str, Any] | None = None
-        for candidate_date in _DEMO_TARGET_DATES:
-            result = generate_or_get_layer(
+        best_result: dict[str, Any] | None = None
+        best_coverage = -1.0
+        for candidate_date in _demo_best_candidate_dates():
+            candidate_result = generate_or_get_layer(
                 db,
                 parcel_geometry=_DEMO_PARCEL_GEOMETRY,
                 user_id=_DEMO_USER_ID,
                 parcel_id=_DEMO_PARCEL_ID,
                 index_key=index_key,
                 target_date=candidate_date,
-                max_cloud=_DEMO_MAX_CLOUD,
+                max_cloud=100.0,
                 width=width,
                 height=height,
                 force_refresh=force_refresh,
             )
-            if result.get("available"):
+            if not candidate_result.get("available"):
+                continue
+
+            coverage = candidate_result.get("coverage_percent") or 0.0
+            if coverage > best_coverage:
+                best_coverage = coverage
+                best_result = candidate_result
+            if best_coverage >= _DEMO_GOOD_ENOUGH_COVERAGE_PERCENT:
                 break
+
+        result = best_result or {"available": False, "reason": "Sin imagen satelital de junio 2026 disponible para el área demo"}
     except Exception as exc:
         raise HTTPException(
             status_code=502,
