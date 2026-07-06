@@ -18,6 +18,7 @@ from app.api.routers import (
     graniot,
     harvest,
     me_access,
+    ml_training,
     parcel_crops,
     parcels,
     platform_modules,
@@ -59,6 +60,7 @@ API_ROUTERS: tuple[RouterRegistration, ...] = (
     RouterRegistration(dashboard.router, settings.API_V1_STR),
     RouterRegistration(sentinel2.router, settings.API_V1_STR),
     RouterRegistration(harvest.router, settings.API_V1_STR),
+    RouterRegistration(ml_training.router, settings.API_V1_STR),
 )
 
 

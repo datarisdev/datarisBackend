@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, Request
@@ -27,9 +28,9 @@ _DEMO_PRIORITY_INDICES = [
 
 
 def _prefetch_demo_index(index_key: str) -> None:
-    """Genera y cachea en GCS la capa demo para un índice.
+    """Genera y cachea en Azure Blob Storage la capa demo para un índice.
 
-    Si el resultado ya existe en GCS (caché persistente), la llamada a
+    Si el resultado ya existe en Azure Blob Storage (caché persistente), la llamada a
     generate_or_get_layer() termina en < 1 s sin re-procesar nada.
     """
     from app.api.routers.sentinel2 import _DEMO_PARCEL_GEOMETRY, _DEMO_USER_ID, _DEMO_PARCEL_ID
@@ -100,7 +101,14 @@ include_api_routers(fastapi_app)
 
 @fastapi_app.on_event("startup")
 async def startup_create_tables() -> None:
-    """Crea tablas nuevas que no existan todavía (idempotente gracias a checkfirst=True)."""
+    """Crea tablas nuevas que no existan todavía (idempotente gracias a checkfirst=True).
+
+    Gateado por AUTO_CREATE_TABLES (default "true") para poder desactivarlo en un
+    ambiente una vez que Alembic cubra el 100% de las tablas sin romper nada existente.
+    """
+    if os.getenv("AUTO_CREATE_TABLES", "true").lower() != "true":
+        logger.info("AUTO_CREATE_TABLES=false: se omite Base.metadata.create_all().")
+        return
     from app.models.base import Base
     from app.db.session import engine
     import app.models  # noqa: registra todos los modelos incluyendo harvest
@@ -111,11 +119,26 @@ async def startup_create_tables() -> None:
 async def startup_demo_prefetch() -> None:
     """Al arrancar el servidor lanza el pre-calentamiento del caché demo en background.
 
-    Si GCS ya tiene los PNG generados la tarea termina en segundos sin re-procesar.
-    Si es la primera vez (instancia nueva / bucket vacío) los genera silenciosamente
-    sin bloquear ningún request de usuario.
+    Si Azure Blob Storage ya tiene los PNG generados la tarea termina en segundos sin
+    re-procesar. Si es la primera vez (instancia nueva / contenedor vacío) los genera
+    silenciosamente sin bloquear ningún request de usuario.
+
+    Gateado por DEMO_SENTINEL_PREFETCH_ENABLED (default "true") para poder desactivarlo
+    en ambientes donde el caché demo ya está persistido y no hace falta regenerarlo en
+    cada arranque de revisión.
     """
+    if os.getenv("DEMO_SENTINEL_PREFETCH_ENABLED", "true").lower() != "true":
+        logger.info("DEMO_SENTINEL_PREFETCH_ENABLED=false: se omite el prefetch demo Sentinel-2.")
+        return
     asyncio.create_task(_run_demo_prefetch())
+
+
+@fastapi_app.on_event("shutdown")
+async def shutdown_analytics() -> None:
+    """Flush del cliente PostHog (no-op si está deshabilitado). No afecta /health."""
+    from app.services.analytics.posthog_client import shutdown as _shutdown_analytics
+
+    _shutdown_analytics()
 
 
 @fastapi_app.get("/health")

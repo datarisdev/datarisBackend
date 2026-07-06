@@ -7,13 +7,12 @@ from app.api.deps import get_current_user
 from pydantic import BaseModel
 
 from app.schemas.profile import ProfileIn, ProfileOut
-from app.utils.gcs import upload_avatar
+from app.utils.storage_avatars import upload_avatar
 import uuid
 
 router = APIRouter(prefix="/profiles", tags=["profiles"])
 
-# GCS bucket name used by app.utils.gcs.upload_avatar.
-GCS_BUCKET_NAME = "dataris-user-avatars"
+# Azure Blob Storage gestiona los avatares mediante app.utils.storage_avatars.
 
 ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png"}
 MAX_FILE_SIZE = 2 * 1024 * 1024  # 2 MB

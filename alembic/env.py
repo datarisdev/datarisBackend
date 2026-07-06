@@ -17,6 +17,16 @@ from app.models.satellite_image import SatelliteImage
 from app.models.satellite_job import SatelliteJob
 from app.models.field_note import FieldNote
 from app.models.parcel_crop import ParcelCrop
+from app.models.ml_training import (
+    TrainingProject,
+    MLDataset,
+    MLDatasetFile,
+    TrainingJob,
+    ModelVersion,
+    ModelArtifact,
+    MLAuditLog,
+    MLTrainingLimit,
+)
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
