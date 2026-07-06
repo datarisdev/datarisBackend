@@ -96,7 +96,7 @@ async def upload_harvest_csv(
             warnings.append("parcel_id no es un UUID válido; se ignoró.")
 
     session = HarvestSession(
-        user_id=current_user.id,
+        user_id=current_user["id"],
         parcel_id=parcel_uuid,
         name=name,
         source_format=fmt,
@@ -137,7 +137,7 @@ def list_sessions(
 ) -> Any:
     sessions = (
         db.query(HarvestSession)
-        .filter(HarvestSession.user_id == current_user.id)
+        .filter(HarvestSession.user_id == current_user["id"])
         .order_by(HarvestSession.created_at.desc())
         .all()
     )
@@ -154,7 +154,7 @@ def get_session(
 ) -> Any:
     session = (
         db.query(HarvestSession)
-        .filter(HarvestSession.id == session_id, HarvestSession.user_id == current_user.id)
+        .filter(HarvestSession.id == session_id, HarvestSession.user_id == current_user["id"])
         .first()
     )
     if not session:
@@ -181,7 +181,7 @@ def get_harvest_geojson(
     """
     session = (
         db.query(HarvestSession)
-        .filter(HarvestSession.id == session_id, HarvestSession.user_id == current_user.id)
+        .filter(HarvestSession.id == session_id, HarvestSession.user_id == current_user["id"])
         .first()
     )
     if not session:
@@ -257,7 +257,7 @@ def delete_session(
 ) -> None:
     session = (
         db.query(HarvestSession)
-        .filter(HarvestSession.id == session_id, HarvestSession.user_id == current_user.id)
+        .filter(HarvestSession.id == session_id, HarvestSession.user_id == current_user["id"])
         .first()
     )
     if not session:
