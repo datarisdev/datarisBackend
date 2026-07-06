@@ -197,6 +197,10 @@ def ml_training_container_name() -> str:
     return (os.getenv("AZURE_ML_TRAINING_STORAGE_CONTAINER") or app_assets_container_name()).strip()
 
 
+def compat_container_name() -> str:
+    return (os.getenv("AZURE_COMPAT_STORAGE_CONTAINER") or app_assets_container_name()).strip()
+
+
 def get_container_client(container_name: str):
     if not container_name:
         raise AzureBlobStorageError("Azure Blob container name cannot be empty.")
