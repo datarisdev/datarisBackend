@@ -53,6 +53,12 @@ modules = [
         "icon": "Satellite",
         "is_active": True,
     },
+    {
+        "name": "ml_training",
+        "description": "Entrenamiento de modelos de visión por computadora",
+        "icon": "Brain",
+        "is_active": True,
+    },
 ]
 
 def seed_platform_modules():

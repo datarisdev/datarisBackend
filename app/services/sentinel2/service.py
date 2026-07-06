@@ -27,6 +27,7 @@ except Exception:  # Shapely < 2 fallback
 from shapely.ops import unary_union
 
 from app.models.satellite_image import ProcessingStatus, SatelliteImage
+from app.services.analytics.posthog_client import track_event as _track_analytics_event
 from app.services.satellite.utils import featurecollection_to_geometry
 from app.services.sentinel2.catalog import SentinelScene, available_dates, best_scene_for_date, normalize_asset_href, scenes_for_date, sign_item_if_needed
 from app.services.sentinel2.indices import (
@@ -1274,6 +1275,11 @@ def generate_or_get_layer(
     bbox = bbox_from_geometry(parcel_geometry)
     primary_scene = best_scene_for_date(bbox=bbox, target_date=target_date, max_cloud=max_cloud, lookback_days=MAP_LOOKBACK_DAYS)
     if not primary_scene:
+        _track_analytics_event(
+            "satellite analysis failed",
+            distinct_id=user_id,
+            properties={"analysis_type": "satellite", "index_type": index_key, "error_category": "no_scenes_found"},
+        )
         return {
             "available": False,
             "reason": "No se encontraron escenas Sentinel-2 L2A con el nivel de nubosidad solicitado.",
@@ -1502,6 +1508,12 @@ def generate_or_get_layer(
                 db_session.rollback()
             except Exception:
                 pass
+
+    _track_analytics_event(
+        "satellite analysis completed",
+        distinct_id=user_id,
+        properties={"analysis_type": "satellite", "index_type": index_key, "result": "success"},
+    )
 
     return _json_safe({
         "available": True,

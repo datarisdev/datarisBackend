@@ -1,0 +1,10 @@
+# Dependencias fijadas (nunca "latest") para la imagen de entrenamiento.
+# PyTorch + CUDA se instalan desde la imagen base (ver Dockerfile); este
+# archivo cubre el resto del stack de visión por computadora.
+ultralytics==8.3.40
+opencv-python-headless==4.10.0.84
+pillow==10.4.0
+pyyaml==6.0.2
+numpy==1.26.4
+azure-storage-blob==12.22.0
+azure-identity==1.17.1
