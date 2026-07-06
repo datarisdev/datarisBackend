@@ -1,3 +1,4 @@
+import uuid
 from typing import Any
 
 from fastapi import Depends, HTTPException, status
@@ -34,6 +35,32 @@ def _invalid_credentials() -> HTTPException:
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Invalid authentication credentials",
     )
+
+
+def _ensure_mirrored_user(db: Session, compat_user: dict[str, Any]) -> None:
+    """Los usuarios compat solo viven en el JSON de app/storage, pero varias
+    tablas (harvest_sessions, parcels, ml_*, satellite_*) tienen FK real a
+    `users`. Se refleja acá una fila mínima para que esos inserts no truenen
+    con ForeignKeyViolation la primera vez que un usuario compat las usa.
+    """
+    try:
+        user_uuid = uuid.UUID(str(compat_user.get("id")))
+    except (TypeError, ValueError):
+        return
+    if db.query(User).filter(User.id == user_uuid).first():
+        return
+    db.add(
+        User(
+            id=user_uuid,
+            email=compat_user.get("email") or f"{user_uuid}@compat.dataris.local",
+            password_hash=compat_user.get("password_hash") or "",
+            is_active=True,
+        )
+    )
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
 
 
 def get_current_admin(token: str = Depends(oauth2_scheme_admin), db: Session = Depends(get_db)):
@@ -77,6 +104,7 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
             compat_user = next((u for u in compat_db.get("users", []) if u.get("id") == user_id), None)
             if not compat_user or compat_user.get("is_active", True) is False:
                 raise _invalid_credentials()
+            _ensure_mirrored_user(db, compat_user)
         else:
             user = db.query(User).filter(User.id == user_id, User.is_active == True).first()
             if not user:
