@@ -10,12 +10,14 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from fastapi import APIRouter, Body, File, Form, Header, HTTPException, Query, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from openpyxl import load_workbook
 from shapely.geometry import Point, shape
 from shapely.geometry.base import BaseGeometry
 
 from app.api.routers.compat import LOCK, bearer_user, now, read_db, table, write_db
 from app.core.config import settings
+from app.services.telemetry.sig_planning import process_planning_upload
 from app.services.digiforms_data_api import (
     DigiformsDataAPI,
     DigiformsDataAPIError,
@@ -1174,6 +1176,44 @@ def list_imports(form_type: Optional[str] = None, authorization: Optional[str] =
         if form_type: rows = [row for row in rows if row.get("form_type") == form_type]
         rows = sorted(rows, key=lambda row: str(row.get("created_at") or ""), reverse=True)[:100]
     return {"data": rows, "error": None, "count": len(rows)}
+
+
+MAX_PLANNING_SHAPEFILE_BYTES = 30 * 1024 * 1024
+
+
+@router.post("/planning/preview")
+async def preview_planning_upload(
+    shapefile: UploadFile = File(...),
+    excel: UploadFile = File(...),
+    id_field: Optional[str] = Form(default=None),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Cruza un shapefile de lotes (.zip) con un Excel de planificación por ID.
+
+    No persiste nada: devuelve el GeoJSON combinado y los campos categóricos
+    disponibles para que el frontend arme la simbología (color por atributo)
+    y la leyenda, similar a un "categorized renderer" de QGIS/ArcGIS.
+    """
+    _require_user(authorization)
+
+    shapefile_bytes = await shapefile.read()
+    if not shapefile_bytes:
+        raise HTTPException(status_code=400, detail="El archivo de lotes (shapefile) está vacío.")
+    if len(shapefile_bytes) > MAX_PLANNING_SHAPEFILE_BYTES:
+        raise HTTPException(status_code=413, detail="El shapefile supera el límite de 30 MB.")
+
+    excel_bytes = await _read_upload(excel)
+
+    try:
+        result = await run_in_threadpool(
+            process_planning_upload, shapefile_bytes, excel_bytes, id_field or None
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Error procesando los archivos: {exc}")
+
+    return {"data": result, "error": None}
 
 
 @router.post("/imports/harvest")
