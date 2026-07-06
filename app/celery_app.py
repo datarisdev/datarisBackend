@@ -28,6 +28,13 @@ celery_app.conf.beat_schedule = {
         "task": "app.api.task.schedule_daily_satellite_jobs",
         "schedule": crontab(hour=3, minute=0),  # 03:00 UTC
     },
+    # Reconciliación de estado de entrenamientos ML (evita jobs perdidos en
+    # running/queued indefinidamente). Cada 2 minutos: es solo una consulta
+    # ligera a Azure ML, no enciende ni mantiene GPU encendida.
+    "ml-training-job-sync": {
+        "task": "app.api.task.sync_training_job_status",
+        "schedule": 120.0,
+    },
 }
 
 # Import tasks here so Celery registers them

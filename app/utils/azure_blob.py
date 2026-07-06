@@ -193,6 +193,10 @@ def avatars_container_name() -> str:
     return (os.getenv("AZURE_AVATARS_STORAGE_CONTAINER") or app_assets_container_name()).strip()
 
 
+def ml_training_container_name() -> str:
+    return (os.getenv("AZURE_ML_TRAINING_STORAGE_CONTAINER") or app_assets_container_name()).strip()
+
+
 def get_container_client(container_name: str):
     if not container_name:
         raise AzureBlobStorageError("Azure Blob container name cannot be empty.")
@@ -335,6 +339,39 @@ def generate_blob_read_url(
         blob_name=object_path,
         user_delegation_key=delegation_key,
         permission=BlobSasPermissions(read=True),
+        start=now - timedelta(minutes=5),
+        expiry=expiry,
+    )
+    blob_url = get_container_client(container_name).get_blob_client(object_path).url
+    return f"{blob_url}?{sas}"
+
+
+def generate_blob_write_url(
+    *,
+    container_name: str,
+    object_path: str,
+    expires_in: timedelta | None = None,
+    max_ttl_minutes: int = 30,
+) -> str:
+    """Return a short-lived write-only URL for one private Azure Blob.
+
+    Used exclusively by the ml_training module upload-intent flow so large
+    dataset ZIPs go straight to Blob Storage without transiting the FastAPI
+    process. Deliberately capped much shorter than the read SAS TTL and
+    restricted to create+write (no read/delete) to limit blast radius if the
+    URL leaks (e.g. browser history, proxy logs).
+    """
+    _require_azure_sdk()
+    now = datetime.now(timezone.utc)
+    ttl_minutes = max(1, min(max_ttl_minutes, 30))
+    expiry = now + (expires_in or timedelta(minutes=ttl_minutes))
+    delegation_key = _delegation_key_for(expiry)
+    sas = generate_blob_sas(
+        account_name=_account_name(),
+        container_name=container_name,
+        blob_name=object_path,
+        user_delegation_key=delegation_key,
+        permission=BlobSasPermissions(write=True, create=True),
         start=now - timedelta(minutes=5),
         expiry=expiry,
     )

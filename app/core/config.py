@@ -113,6 +113,16 @@ class Settings(BaseSettings):
     OPENAI_CONTEXTUAL_COPILOT_MAX_OUTPUT_TOKENS: int = 1400
     OPENAI_CONTEXTUAL_COPILOT_TIMEOUT_SECONDS: int = 35
 
+    # Módulo de entrenamiento de modelos de visión por computadora (Laboratorio
+    # de IA). ML_TRAINING_ENABLED controla si el módulo se expone en la API;
+    # AZURE_ML_ENABLED (leído directamente por azure_ml_client.py, igual
+    # patrón que AZURE_STORAGE_* en azure_blob.py) controla si se permite
+    # enviar jobs reales a Azure ML. Ambos en false por defecto.
+    ML_TRAINING_ENABLED: bool = False
+    ML_TRAINING_DEFAULT_JOB_TIMEOUT_MINUTES: int = 120
+    ML_TRAINING_DEFAULT_MAX_CONCURRENT_JOBS: int = 1
+    ML_TRAINING_DEFAULT_MAX_DATASET_SIZE_GB: float = 5.0
+
     model_config = {
         "env_file": ".env",
         "extra": "ignore",

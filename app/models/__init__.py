@@ -10,3 +10,13 @@ from app.models.user_roles import UserRole
 from app.models.profiles import Profile
 from app.models.field_note import FieldNote
 from app.models.parcel_crop import ParcelCrop
+from app.models.ml_training import (
+    TrainingProject,
+    MLDataset,
+    MLDatasetFile,
+    TrainingJob,
+    ModelVersion,
+    ModelArtifact,
+    MLAuditLog,
+    MLTrainingLimit,
+)

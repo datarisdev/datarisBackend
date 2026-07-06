@@ -28,7 +28,9 @@ dependencies = [
   "numpy>=1.26",
   "pillow>=10.0",
   "pystac-client>=0.7",
-  "planetary-computer>=1.0"
+  "planetary-computer>=1.0",
+  "pyyaml>=6.0",
+  "azure-ai-ml>=1.19"
 ]
 
 [build-system]
