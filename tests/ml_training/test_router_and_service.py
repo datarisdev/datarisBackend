@@ -1,9 +1,18 @@
+import json
 import uuid
 from datetime import datetime, timezone
 
 import pytest
 
-from app.models.ml_training import DatasetStatus, MLDataset, TrainingJob, TrainingJobStatus
+from app.models.ml_training import (
+    DatasetStatus,
+    MLDataset,
+    ModelArtifact,
+    ModelArtifactType,
+    ModelVersion,
+    TrainingJob,
+    TrainingJobStatus,
+)
 from app.models.user_roles import AppRole, UserRole
 from app.modules.ml_training import service
 
@@ -262,6 +271,140 @@ class TestJobCancellation:
 
         with pytest.raises(service.MLTrainingError, match="no encontrado"):
             service.cancel_training_job(db_session, user_b_id, job.id, is_admin=False)
+
+
+class TestRefreshJobStatusProgressAndModelRegistration:
+    def _make_job(self, user_id, status):
+        return TrainingJob(
+            id=uuid.uuid4(),
+            user_id=user_id,
+            project_id=uuid.uuid4(),
+            dataset_id=uuid.uuid4(),
+            recipe="ultralytics_yolo_detection",
+            task_type="detection",
+            model_base="yolo11n.pt",
+            model_name="m1",
+            config={},
+            status=status,
+            azure_ml_job_id="ml-fake-job",
+            output_storage_prefix="ml/jobs/x/y/z/",
+            timeout_minutes=120,
+        )
+
+    def test_sync_progress_while_running(self, db_session, user_a_id, monkeypatch):
+        job = self._make_job(user_a_id, TrainingJobStatus.RUNNING)
+        db_session.add(job)
+        db_session.commit()
+
+        monkeypatch.setattr(
+            "app.modules.ml_training.service.azure_get_job",
+            lambda _: {"internal_status": TrainingJobStatus.RUNNING},
+        )
+        monkeypatch.setattr("app.modules.ml_training.service.ml_training_container_name", lambda: "ml-training")
+
+        def fake_download(*, container_name, object_path):
+            assert object_path == "ml/jobs/x/y/z/progress.json"
+            return json.dumps({"current_epoch": 5, "total_epochs": 20, "metrics": {"loss": 0.5}}).encode()
+
+        monkeypatch.setattr("app.modules.ml_training.service.download_blob_bytes", fake_download)
+
+        result = service.refresh_job_status(db_session, job)
+        assert result.current_epoch == 5
+        assert result.total_epochs == 20
+        assert result.progress_percent == 25.0
+        assert result.metrics == {"loss": 0.5}
+
+    def test_progress_sync_tolerates_missing_progress_file(self, db_session, user_a_id, monkeypatch):
+        job = self._make_job(user_a_id, TrainingJobStatus.RUNNING)
+        db_session.add(job)
+        db_session.commit()
+
+        monkeypatch.setattr(
+            "app.modules.ml_training.service.azure_get_job",
+            lambda _: {"internal_status": TrainingJobStatus.RUNNING},
+        )
+        monkeypatch.setattr("app.modules.ml_training.service.ml_training_container_name", lambda: "ml-training")
+
+        def raise_not_found(*, container_name, object_path):
+            raise FileNotFoundError(object_path)
+
+        monkeypatch.setattr("app.modules.ml_training.service.download_blob_bytes", raise_not_found)
+
+        result = service.refresh_job_status(db_session, job)
+        assert result.status == TrainingJobStatus.RUNNING
+        assert result.current_epoch is None
+
+    def test_finalize_registers_model_and_artifacts_on_completion(self, db_session, user_a_id, monkeypatch):
+        job = self._make_job(user_a_id, TrainingJobStatus.FINALIZING)
+        db_session.add(job)
+        db_session.commit()
+
+        monkeypatch.setattr(
+            "app.modules.ml_training.service.azure_get_job",
+            lambda _: {"internal_status": TrainingJobStatus.COMPLETED},
+        )
+        monkeypatch.setattr("app.modules.ml_training.service.ml_training_container_name", lambda: "ml-training")
+
+        manifest = {
+            "metrics": {"map50": 0.9},
+            "artifacts": [
+                {"relative_path": "best.pt", "size_bytes": 100},
+                {"relative_path": "metrics.json", "size_bytes": 10},
+                {"relative_path": "unclassified.txt", "size_bytes": 5},
+            ],
+        }
+        monkeypatch.setattr(
+            "app.modules.ml_training.service.download_blob_bytes",
+            lambda **kwargs: json.dumps(manifest).encode(),
+        )
+
+        result = service.refresh_job_status(db_session, job)
+        assert result.status == TrainingJobStatus.COMPLETED
+        assert result.metrics == {"map50": 0.9}
+
+        model_version = db_session.query(ModelVersion).filter(ModelVersion.job_id == job.id).first()
+        assert model_version is not None
+        assert model_version.metrics == {"map50": 0.9}
+
+        artifacts = db_session.query(ModelArtifact).filter(ModelArtifact.model_version_id == model_version.id).all()
+        artifact_types = {a.artifact_type for a in artifacts}
+        # best.pt + metrics.json + manifest.json (registrado aparte, ya que se
+        # autoexcluye de su propia lista) — el archivo sin tipo reconocido se ignora.
+        assert len(artifacts) == 3
+        assert artifact_types == {ModelArtifactType.WEIGHTS_BEST, ModelArtifactType.METRICS, ModelArtifactType.MANIFEST}
+
+    def test_finalize_completed_job_is_idempotent(self, db_session, user_a_id, monkeypatch):
+        job = self._make_job(user_a_id, TrainingJobStatus.COMPLETED)
+        db_session.add(job)
+        db_session.commit()
+
+        manifest = {"metrics": {}, "artifacts": [{"relative_path": "best.pt", "size_bytes": 1}]}
+        monkeypatch.setattr("app.modules.ml_training.service.ml_training_container_name", lambda: "ml-training")
+        monkeypatch.setattr(
+            "app.modules.ml_training.service.download_blob_bytes",
+            lambda **kwargs: json.dumps(manifest).encode(),
+        )
+
+        service._finalize_completed_job(db_session, job)
+        db_session.commit()
+        service._finalize_completed_job(db_session, job)
+        db_session.commit()
+
+        assert db_session.query(ModelVersion).filter(ModelVersion.job_id == job.id).count() == 1
+
+    def test_finalize_handles_missing_manifest_gracefully(self, db_session, user_a_id, monkeypatch):
+        job = self._make_job(user_a_id, TrainingJobStatus.COMPLETED)
+        db_session.add(job)
+        db_session.commit()
+
+        def raise_not_found(**kwargs):
+            raise FileNotFoundError(kwargs["object_path"])
+
+        monkeypatch.setattr("app.modules.ml_training.service.ml_training_container_name", lambda: "ml-training")
+        monkeypatch.setattr("app.modules.ml_training.service.download_blob_bytes", raise_not_found)
+
+        service._finalize_completed_job(db_session, job)  # no debe lanzar
+        assert db_session.query(ModelVersion).filter(ModelVersion.job_id == job.id).count() == 0
 
 
 class TestAuditLog:

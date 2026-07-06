@@ -8,6 +8,7 @@ quedar delgados y delegar aquí, siguiendo ARCHITECTURE.md.
 """
 from __future__ import annotations
 
+import json
 import logging
 import tempfile
 import uuid
@@ -20,13 +21,15 @@ from app.models.ml_training import (
     DatasetSource,
     DatasetStatus,
     MLDataset,
+    ModelArtifactType,
+    ModelVersion,
     TrainingJob,
     TrainingJobStatus,
     TrainingProject,
     TERMINAL_JOB_STATUSES,
 )
 from app.modules.ml_training import repository
-from app.modules.ml_training.artifact_service import register_model_version
+from app.modules.ml_training.artifact_service import register_artifact, register_model_version
 from app.modules.ml_training.azure_ml_client import (
     AzureMLClientError,
     AzureMLJobSpec,
@@ -415,10 +418,142 @@ def cancel_training_job(db: Session, user_id: str, job_id: uuid.UUID, is_admin: 
     return job
 
 
+_ARTIFACT_TYPE_BY_FILENAME: dict[str, ModelArtifactType] = {
+    "best.pt": ModelArtifactType.WEIGHTS_BEST,
+    "last.pt": ModelArtifactType.WEIGHTS_LAST,
+    "metrics.json": ModelArtifactType.METRICS,
+    "config.json": ModelArtifactType.CONFIG,
+    "data.yaml": ModelArtifactType.DATA_YAML,
+    "manifest.json": ModelArtifactType.MANIFEST,
+}
+
+
+def _classify_artifact(relative_path: str) -> ModelArtifactType | None:
+    name = relative_path.rsplit("/", 1)[-1].lower()
+    if name in _ARTIFACT_TYPE_BY_FILENAME:
+        return _ARTIFACT_TYPE_BY_FILENAME[name]
+    if "confusion_matrix" in name:
+        return ModelArtifactType.CONFUSION_MATRIX
+    if name.endswith((".png", ".jpg", ".jpeg")) and any(k in name for k in ("curve", "results", "batch")):
+        return ModelArtifactType.CURVE
+    if name.endswith(".onnx"):
+        return ModelArtifactType.ONNX
+    return None
+
+
+def _sync_job_progress(db: Session, job: TrainingJob) -> None:
+    """Lee progress.json (escrito incrementalmente por train.py en cada época
+    de Ultralytics) desde el blob de salida y actualiza el avance del job.
+    Best-effort: el archivo puede no existir todavía (job recién arrancó) sin
+    que eso deba romper la reconciliación de estado."""
+    progress_path = f"{job.output_storage_prefix}progress.json"
+    try:
+        raw = download_blob_bytes(container_name=ml_training_container_name(), object_path=progress_path)
+    except FileNotFoundError:
+        return
+    except Exception as exc:
+        logger.debug("No se pudo leer progress.json del job %s: %s", job.id, exc)
+        return
+
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return
+
+    current_epoch = payload.get("current_epoch")
+    total_epochs = payload.get("total_epochs")
+    if isinstance(current_epoch, int):
+        job.current_epoch = current_epoch
+    if isinstance(total_epochs, int):
+        job.total_epochs = total_epochs
+    if isinstance(current_epoch, int) and isinstance(total_epochs, int) and total_epochs > 0:
+        job.progress_percent = round(min(current_epoch / total_epochs, 1.0) * 100, 1)
+    live_metrics = payload.get("metrics")
+    if isinstance(live_metrics, dict):
+        job.metrics = live_metrics
+
+
+def _finalize_completed_job(db: Session, job: TrainingJob) -> None:
+    """Al completar un job exitosamente, lee manifest.json del blob de salida
+    y registra el ModelVersion/ModelArtifact correspondiente, cerrando el
+    ciclo entre "entrenamiento terminó" y "modelo descargable". Best-effort:
+    si el manifest no está disponible todavía o el job ya fue registrado en
+    una reconciliación previa, no bloquea la transición de estado."""
+    if db.query(ModelVersion).filter(ModelVersion.job_id == job.id).first() is not None:
+        return
+
+    manifest_path = f"{job.output_storage_prefix}manifest.json"
+    try:
+        raw = download_blob_bytes(container_name=ml_training_container_name(), object_path=manifest_path)
+    except FileNotFoundError:
+        logger.warning("Job %s completado pero no se encontró manifest.json en %s", job.id, manifest_path)
+        return
+    except Exception as exc:
+        logger.warning("No se pudo leer manifest.json del job %s: %s", job.id, exc)
+        return
+
+    try:
+        manifest = json.loads(raw)
+    except ValueError as exc:
+        logger.warning("manifest.json del job %s no es JSON válido: %s", job.id, exc)
+        return
+
+    metrics = manifest.get("metrics") or {}
+    job.metrics = metrics
+    job.progress_percent = 100.0
+
+    model_version = register_model_version(
+        db,
+        user_id=str(job.user_id),
+        project_id=job.project_id,
+        job_id=job.id,
+        dataset_id=job.dataset_id,
+        name=job.model_name,
+        version=job.id.hex[:8],
+        task_type=job.task_type,
+        model_base=job.model_base,
+        recipe=job.recipe,
+        metrics=metrics,
+        docker_image_ref=job.docker_image_ref,
+    )
+
+    for entry in manifest.get("artifacts", []):
+        relative_path = entry.get("relative_path")
+        if not relative_path:
+            continue
+        artifact_type = _classify_artifact(relative_path)
+        if artifact_type is None:
+            continue
+        register_artifact(
+            db,
+            model_version=model_version,
+            artifact_type=artifact_type,
+            blob_path=f"{job.output_storage_prefix}{relative_path}",
+            size_bytes=int(entry.get("size_bytes") or 0),
+        )
+
+    # manifest.json se autoexcluye de su propia lista de artifacts (se
+    # calcula antes de escribirse) — se registra aparte explícitamente.
+    register_artifact(
+        db,
+        model_version=model_version,
+        artifact_type=ModelArtifactType.MANIFEST,
+        blob_path=manifest_path,
+        size_bytes=len(raw),
+    )
+
+    repository.record_audit_event(
+        db, user_id=str(job.user_id), action="model_registered", entity_type="model_version",
+        entity_id=model_version.id, metadata={"job_id": str(job.id)},
+    )
+    logger.info("Modelo registrado automáticamente para el job %s (model_version=%s)", job.id, model_version.id)
+
+
 def refresh_job_status(db: Session, job: TrainingJob) -> TrainingJob:
-    """Reconciliación de estado: traduce el estado real de Azure ML y detecta
-    timeouts. Llamado desde el endpoint de refresh y desde la tarea Celery
-    periódica (app/api/task.py::sync_training_job_status)."""
+    """Reconciliación de estado: traduce el estado real de Azure ML, detecta
+    timeouts, sincroniza el progreso por época mientras corre y registra el
+    modelo automáticamente al completar. Llamado desde el endpoint de refresh
+    y desde la tarea Celery periódica (app/api/task.py::sync_training_job_status)."""
     if job.status in TERMINAL_JOB_STATUSES or not job.azure_ml_job_id:
         return job
 
@@ -447,6 +582,12 @@ def refresh_job_status(db: Session, job: TrainingJob) -> TrainingJob:
         job.status = new_status
         if new_status in TERMINAL_JOB_STATUSES:
             job.finished_at = datetime.now(timezone.utc)
-        db.commit()
-        db.refresh(job)
+
+    if job.status == TrainingJobStatus.RUNNING:
+        _sync_job_progress(db, job)
+    elif job.status == TrainingJobStatus.COMPLETED:
+        _finalize_completed_job(db, job)
+
+    db.commit()
+    db.refresh(job)
     return job

@@ -157,7 +157,11 @@ def submit_training_job(spec: AzureMLJobSpec) -> str:
         environment=env,
         compute=spec.compute_target,
         inputs={"dataset": Input(type=AssetTypes.URI_FOLDER, path=spec.dataset_uri)},
-        outputs={"output": Output(type=AssetTypes.URI_FOLDER, path=spec.output_uri)},
+        # mode="rw_mount" (en vez del default "upload") monta el destino como
+        # sistema de archivos durante el job, para que progress.json escrito
+        # por train.py en cada época se propague a blob storage en vivo en
+        # lugar de subirse recién al terminar el job.
+        outputs={"output": Output(type=AssetTypes.URI_FOLDER, path=spec.output_uri, mode="rw_mount")},
         timeout=spec.timeout_minutes * 60,
         tags=spec.tags,
         environment_variables=spec.environment_variables,

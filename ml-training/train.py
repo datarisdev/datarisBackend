@@ -20,6 +20,7 @@ import json
 import shutil
 import sys
 import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 
 from validate_dataset import validate as validate_dataset
@@ -76,6 +77,32 @@ def _find_data_yaml(dataset_path: Path) -> Path:
     return candidates[0]
 
 
+def _make_progress_callback(output_dir: Path, total_epochs: int):
+    """progress.json se escribe en la raíz de output_dir (no en el subdirectorio
+    del run) en cada fin de época, para que el backend lo lea vía blob storage
+    y muestre avance real (app/modules/ml_training/service.py::_sync_job_progress)."""
+    progress_path = output_dir / "progress.json"
+
+    def _on_train_epoch_end(trainer) -> None:
+        metrics = {}
+        try:
+            metrics = {k: float(v) for k, v in (trainer.metrics or {}).items()}
+        except Exception:
+            pass
+        payload = {
+            "current_epoch": trainer.epoch + 1,
+            "total_epochs": total_epochs,
+            "metrics": metrics,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            progress_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
+
+    return _on_train_epoch_end
+
+
 def main() -> int:
     args = _parse_args()
     output_dir = args.output_path
@@ -96,6 +123,7 @@ def main() -> int:
 
         _log("loading_model", model=args.model)
         model = YOLO(args.model)
+        model.add_callback("on_train_epoch_end", _make_progress_callback(output_dir, args.epochs))
 
         run_name = f"job-{args.job_id}"
         _log("training_started", epochs=args.epochs, imgsz=args.imgsz, batch=args.batch)

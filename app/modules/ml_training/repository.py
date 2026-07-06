@@ -10,6 +10,7 @@ import uuid
 
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.models.ml_training import (
     MLAuditLog,
     MLDataset,
@@ -17,9 +18,12 @@ from app.models.ml_training import (
     ModelArtifact,
     ModelVersion,
     TrainingJob,
+    TrainingJobStatus,
     TrainingProject,
     TERMINAL_JOB_STATUSES,
 )
+
+_ACTIVE_COMPUTE_STATUSES = (TrainingJobStatus.PROVISIONING_COMPUTE, TrainingJobStatus.RUNNING, TrainingJobStatus.FINALIZING)
 
 
 def list_projects(db: Session, user_id: str):
@@ -82,6 +86,17 @@ def list_non_terminal_jobs(db: Session):
     return db.query(TrainingJob).filter(~TrainingJob.status.in_(TERMINAL_JOB_STATUSES)).all()
 
 
+def any_compute_active(db: Session) -> bool:
+    """True si algún job (de cualquier usuario) tiene cómputo GPU aprovisionado
+    en este momento — usado por GET /ml/status para no mentir con gpu_active."""
+    return (
+        db.query(TrainingJob.id)
+        .filter(TrainingJob.status.in_(_ACTIVE_COMPUTE_STATUSES))
+        .first()
+        is not None
+    )
+
+
 def list_model_versions(db: Session, user_id: str, project_id: uuid.UUID | None = None):
     query = db.query(ModelVersion).filter(ModelVersion.user_id == user_id)
     if project_id is not None:
@@ -103,7 +118,12 @@ def get_training_limits(db: Session, user_id: str) -> MLTrainingLimit:
         limit = db.query(MLTrainingLimit).filter(MLTrainingLimit.user_id.is_(None)).first()
     if limit is None:
         # Defaults conservadores si no hay ninguna fila configurada todavía.
-        limit = MLTrainingLimit(user_id=None, max_concurrent_jobs=1, max_dataset_size_gb=5.0, max_job_duration_minutes=180)
+        limit = MLTrainingLimit(
+            user_id=None,
+            max_concurrent_jobs=settings.ML_TRAINING_DEFAULT_MAX_CONCURRENT_JOBS,
+            max_dataset_size_gb=settings.ML_TRAINING_DEFAULT_MAX_DATASET_SIZE_GB,
+            max_job_duration_minutes=settings.ML_TRAINING_DEFAULT_JOB_TIMEOUT_MINUTES,
+        )
     return limit
 
 

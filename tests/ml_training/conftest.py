@@ -20,6 +20,16 @@ def current_user_holder():
     return _CurrentUserHolder()
 
 
+@pytest.fixture(autouse=True)
+def _ml_training_module_enabled():
+    """Las policies exigen settings.ML_TRAINING_ENABLED=True (403 en caso
+    contrario); estos tests validan el comportamiento del módulo habilitado."""
+    original = settings.ML_TRAINING_ENABLED
+    settings.ML_TRAINING_ENABLED = True
+    yield
+    settings.ML_TRAINING_ENABLED = original
+
+
 @pytest.fixture()
 def api_client(db_session, current_user_holder):
     app = FastAPI()

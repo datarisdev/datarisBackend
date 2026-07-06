@@ -13,8 +13,10 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user, get_db
 from app.core.config import settings
 from app.modules.ml_training import artifact_service, repository, service
+from app.modules.ml_training.azure_ml_client import azure_ml_disabled
 from app.modules.ml_training.policies import (
     MLTrainingCapabilities,
+    get_ml_capabilities,
     require_ml_manage,
     require_ml_view,
 )
@@ -43,14 +45,22 @@ def _handle_business_error(exc: MLTrainingError) -> HTTPException:
 
 
 @router.get("/status")
-def get_module_status(caps: MLTrainingCapabilities = Depends(require_ml_view)):
-    """Estado del módulo para el dashboard: nunca enciende GPU, solo informa."""
+def get_module_status(
+    db: Session = Depends(get_db),
+    caps: MLTrainingCapabilities = Depends(get_ml_capabilities),
+):
+    """Estado del módulo para el dashboard: nunca enciende GPU, solo informa.
+    Depende de get_ml_capabilities directamente (no de require_ml_view) para
+    seguir siendo alcanzable con ML_TRAINING_ENABLED=false y poder informarle
+    al frontend "módulo no habilitado" en vez de un 403 sin contexto."""
+    azure_configured = not azure_ml_disabled()
+    gpu_active = azure_configured and repository.any_compute_active(db)
     return {
         "module_enabled": settings.ML_TRAINING_ENABLED,
-        "azure_ml_configured": False,
+        "azure_ml_configured": azure_configured,
         "can_manage": caps.can_manage,
         "can_admin": caps.can_admin,
-        "gpu_active": False,
+        "gpu_active": gpu_active,
         "note": "Abrir este módulo nunca enciende cómputo GPU. El compute solo se aprovisiona al confirmar un entrenamiento.",
     }
 

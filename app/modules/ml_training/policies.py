@@ -11,6 +11,7 @@ from fastapi import Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
+from app.core.config import settings
 from app.models.user_roles import AppRole, UserRole
 
 
@@ -48,9 +49,18 @@ def get_ml_capabilities(
     return MLTrainingCapabilities(roles)
 
 
+def _ensure_module_enabled() -> None:
+    # Deliberadamente NO se aplica dentro de get_ml_capabilities: /ml/status
+    # depende de esa función directamente para poder informar
+    # "module_enabled: false" al frontend en vez de devolver un 403 sin contexto.
+    if not settings.ML_TRAINING_ENABLED:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="El módulo de entrenamiento de IA no está habilitado")
+
+
 def require_ml_view(
     caps: MLTrainingCapabilities = Depends(get_ml_capabilities),
 ) -> MLTrainingCapabilities:
+    _ensure_module_enabled()
     if not caps.can_view:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
     return caps
@@ -59,6 +69,7 @@ def require_ml_view(
 def require_ml_manage(
     caps: MLTrainingCapabilities = Depends(get_ml_capabilities),
 ) -> MLTrainingCapabilities:
+    _ensure_module_enabled()
     if not caps.can_manage:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
     return caps
@@ -67,6 +78,7 @@ def require_ml_manage(
 def require_ml_admin(
     caps: MLTrainingCapabilities = Depends(get_ml_capabilities),
 ) -> MLTrainingCapabilities:
+    _ensure_module_enabled()
     if not caps.can_admin:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
     return caps
