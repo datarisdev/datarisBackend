@@ -85,7 +85,10 @@ class AzureMLJobSpec:
     command_line: str
     docker_image: str
     compute_target: str
-    dataset_uri: str
+    # nombre -> URI de blob folder, montado en el job como ${{inputs.<nombre>}}.
+    # Entrenamiento usa un solo input ("dataset"); inferencia usa dos
+    # ("model" + "image") — de ahí que sea un dict genérico y no un campo fijo.
+    inputs: dict[str, str]
     output_uri: str
     timeout_minutes: int
     tags: dict[str, str] = field(default_factory=dict)
@@ -138,8 +141,10 @@ def default_docker_image() -> str:
     return (os.getenv("AZURE_ML_TRAINING_IMAGE") or "").strip()
 
 
-def submit_training_job(spec: AzureMLJobSpec) -> str:
-    """Envía un command job a Azure ML. Devuelve el nombre del job (== su ID)."""
+def submit_command_job(spec: AzureMLJobSpec) -> str:
+    """Envía un command job a Azure ML (entrenamiento o inferencia — el mismo
+    mecanismo sirve para ambos, solo cambia el script y los inputs montados).
+    Devuelve el nombre del job (== su ID)."""
     if azure_ml_disabled():
         raise AzureMLClientError(
             "El módulo de Azure ML está deshabilitado (AZURE_ML_ENABLED=false). "
@@ -156,11 +161,11 @@ def submit_training_job(spec: AzureMLJobSpec) -> str:
         command=spec.command_line,
         environment=env,
         compute=spec.compute_target,
-        inputs={"dataset": Input(type=AssetTypes.URI_FOLDER, path=spec.dataset_uri)},
+        inputs={name: Input(type=AssetTypes.URI_FOLDER, path=uri) for name, uri in spec.inputs.items()},
         # mode="rw_mount" (en vez del default "upload") monta el destino como
         # sistema de archivos durante el job, para que progress.json escrito
-        # por train.py en cada época se propague a blob storage en vivo en
-        # lugar de subirse recién al terminar el job.
+        # por train.py/predict.py se propague a blob storage en vivo en lugar
+        # de subirse recién al terminar el job.
         outputs={"output": Output(type=AssetTypes.URI_FOLDER, path=spec.output_uri, mode="rw_mount")},
         timeout=spec.timeout_minutes * 60,
         tags=spec.tags,

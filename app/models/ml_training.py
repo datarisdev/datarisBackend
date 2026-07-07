@@ -312,3 +312,93 @@ class MLTrainingLimit(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class InferenceJobStatus(str, Enum):
+    DRAFT = "draft"
+    QUEUED = "queued"
+    PROVISIONING_COMPUTE = "provisioning_compute"
+    RUNNING = "running"
+    FINALIZING = "finalizing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    EXPIRED = "expired"
+
+
+TERMINAL_INFERENCE_STATUSES = {
+    InferenceJobStatus.COMPLETED,
+    InferenceJobStatus.FAILED,
+    InferenceJobStatus.CANCELLED,
+    InferenceJobStatus.EXPIRED,
+}
+
+
+class InferenceInputFormat(str, Enum):
+    PNG = "png"
+    JPG = "jpg"
+    TIFF = "tiff"
+
+
+class InferenceJob(Base):
+    """Probar un modelo ya entrenado (ModelVersion) contra una imagen nueva.
+
+    Espejo deliberado de TrainingJob: mismo Compute Cluster GPU, misma imagen
+    Docker (datarisBackend/ml-training/), mismo mecanismo de envío de command
+    jobs (azure_ml_client.submit_command_job) y el mismo patrón de
+    reconciliación por polling periódico (ver refresh_inference_job_status).
+    No hay un runtime de inferencia nuevo ni cómputo separado: se reutiliza
+    exactamente la misma infraestructura y las mismas limitaciones (incluida
+    la cuota GPU) que el entrenamiento.
+    """
+
+    __tablename__ = "ml_inference_jobs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    model_version_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("ml_model_versions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+    input_blob_path: Mapped[str] = mapped_column(String, nullable=False)
+    input_file_name: Mapped[str] = mapped_column(String, nullable=False)
+    input_format: Mapped[InferenceInputFormat] = mapped_column(
+        SAEnum(InferenceInputFormat, name="ml_inference_input_format"), nullable=False
+    )
+    confidence_threshold: Mapped[float] = mapped_column(Float, nullable=False, default=0.25)
+    iou_threshold: Mapped[float] = mapped_column(Float, nullable=False, default=0.45)
+
+    status: Mapped[InferenceJobStatus] = mapped_column(
+        SAEnum(InferenceJobStatus, name="ml_inference_job_status"), nullable=False, default=InferenceJobStatus.DRAFT, index=True
+    )
+    azure_ml_job_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    azure_ml_job_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    compute_target: Mapped[str | None] = mapped_column(String, nullable=True)
+    docker_image_ref: Mapped[str | None] = mapped_column(String, nullable=True)
+    timeout_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=30)
+
+    progress_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
+    tile_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    tiles_processed: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    detections: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    detection_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    image_width_px: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    image_height_px: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    output_storage_prefix: Mapped[str] = mapped_column(String, nullable=False)
+    output_preview_blob_path: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    error_code: Mapped[str | None] = mapped_column(String, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    model_version = relationship("ModelVersion")

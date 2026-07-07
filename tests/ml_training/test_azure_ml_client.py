@@ -5,7 +5,7 @@ from app.modules.ml_training.azure_ml_client import (
     AzureMLClientError,
     AzureMLJobSpec,
     azure_ml_disabled,
-    submit_training_job,
+    submit_command_job,
     translate_azure_status,
 )
 
@@ -39,7 +39,7 @@ class TestAzureMlDisabledByDefault:
         assert azure_ml_disabled() is False
 
 
-class TestSubmitTrainingJobGuard:
+class TestSubmitCommandJobGuard:
     def test_refuses_to_submit_when_disabled(self, monkeypatch):
         monkeypatch.delenv("AZURE_ML_ENABLED", raising=False)
         spec = AzureMLJobSpec(
@@ -48,9 +48,9 @@ class TestSubmitTrainingJobGuard:
             command_line="python train.py",
             docker_image="acr.azurecr.io/ml-training:latest",
             compute_target="gpu-cluster",
-            dataset_uri="azureml://datastores/x/paths/y",
+            inputs={"dataset": "azureml://datastores/x/paths/y"},
             output_uri="azureml://datastores/x/paths/z",
             timeout_minutes=60,
         )
         with pytest.raises(AzureMLClientError, match="deshabilitado"):
-            submit_training_job(spec)
+            submit_command_job(spec)

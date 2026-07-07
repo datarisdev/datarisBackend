@@ -37,7 +37,7 @@ from app.modules.ml_training.azure_ml_client import (
     default_compute_target,
     default_docker_image,
     get_job as azure_get_job,
-    submit_training_job,
+    submit_command_job,
     translate_azure_status,
 )
 from app.modules.ml_training.dataset_validation import (
@@ -369,7 +369,7 @@ def _launch_job(db: Session, job: TrainingJob, recipe, config: TrainingJobConfig
         ),
         docker_image=docker_image,
         compute_target=compute_target,
-        dataset_uri=f"azureml://datastores/workspaceblobstore/paths/{dataset.storage_prefix if dataset else ''}",
+        inputs={"dataset": f"azureml://datastores/workspaceblobstore/paths/{dataset.storage_prefix if dataset else ''}"},
         output_uri=f"azureml://datastores/workspaceblobstore/paths/{job.output_storage_prefix}",
         timeout_minutes=job.timeout_minutes,
         tags={"user_id": str(job.user_id), "project_id": str(job.project_id), "job_id": str(job.id), "app": "dataris"},
@@ -379,7 +379,7 @@ def _launch_job(db: Session, job: TrainingJob, recipe, config: TrainingJobConfig
     job.compute_target = compute_target
     job.docker_image_ref = docker_image
     try:
-        azure_job_name = submit_training_job(spec)
+        azure_job_name = submit_command_job(spec)
         job.azure_ml_job_id = azure_job_name
         job.azure_ml_job_name = azure_job_name
         job.started_at = datetime.now(timezone.utc)
