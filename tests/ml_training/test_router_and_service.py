@@ -22,8 +22,14 @@ def _grant_manage_role(db_session, user_id: str):
     db_session.commit()
 
 
+def _grant_view_only_role(db_session, user_id: str):
+    db_session.add(UserRole(user_id=user_id, role=AppRole.visualizador))
+    db_session.commit()
+
+
 class TestProjectIsolation:
-    def test_visualizador_cannot_create_project(self, api_client, current_user_holder, user_a_id):
+    def test_visualizador_cannot_create_project(self, api_client, current_user_holder, db_session, user_a_id):
+        _grant_view_only_role(db_session, user_a_id)
         current_user_holder.user_id = user_a_id
         resp = api_client.post("/api/ml/projects", json={"name": "P1", "task_type": "detection"})
         assert resp.status_code == 403
