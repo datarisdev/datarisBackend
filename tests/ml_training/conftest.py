@@ -30,6 +30,25 @@ def _ml_training_module_enabled():
     settings.ML_TRAINING_ENABLED = original
 
 
+@pytest.fixture(autouse=True)
+def _ml_training_default_dataris_superadmin(monkeypatch):
+    """ML Training es una herramienta interna: policies.get_ml_capabilities
+    exige admin_role=="superadmin" en el sistema de cuentas multi-tenant
+    (compat), separado del AppRole por-usuario que estos tests ejercitan.
+    Se mockean las dos dependencias externas de _is_dataris_superadmin
+    (nunca su propia lógica) para que, por defecto, cualquier usuario de
+    estos tests se resuelva como el superadmin real de Dataris — así los
+    tests de aislamiento/roles (ortogonales a este gate) siguen probando lo
+    que probaban, sin tocar la base de datos real del store "compat". Los
+    tests que verifican el gate en sí mismo sobreescriben estos mocks."""
+    monkeypatch.setattr("app.api.routers.compat.read_db", lambda *a, **k: {})
+    monkeypatch.setattr(
+        "app.api.routers.compat_extensions.admin_record_for",
+        lambda db, user_id: {"admin_role": "superadmin"},
+    )
+    monkeypatch.setattr("app.services.commercial_demo_seed.is_commercial_demo_user", lambda user_id: False)
+
+
 @pytest.fixture()
 def api_client(db_session, current_user_holder):
     app = FastAPI()

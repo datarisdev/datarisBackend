@@ -47,7 +47,15 @@ MODULE_ALIASES: Dict[str, List[str]] = {
     "telemetria": ["telemetria", "telemetría", "telemetry"],
     "digiforms": ["digiforms", "digiformsapp", "digiforms-app"],
     "graniot": ["graniot"],
+    "ml-training": ["ml-training", "ml_training", "laboratorio-ia", "laboratorio_ia"],
 }
+
+# "Laboratorio de IA" es una herramienta interna de Dataris (entrena modelos
+# con datos propios de la plataforma) — nunca debe quedar disponible para
+# empresas cliente ni para la cuenta demo, sin importar cómo esté configurado
+# platform_modules/company_modules/user_modules. Se excluye explícitamente
+# de todo cálculo de acceso salvo para el superadmin real de la plataforma.
+INTERNAL_ONLY_MODULE_IDS = {"ml-training"}
 
 
 def _expand_aliases(value: Any) -> List[str]:
@@ -141,6 +149,10 @@ def get_current_access(authorization: Optional[str] = Header(default=None)):
         company_id = admin.get("company_id") or company_for_user(db, user_id)
         is_superadmin = admin_role == "superadmin"
         is_demo = is_commercial_demo_user(user)
+        # El superadmin de la cuenta demo comercial es "company_admin", nunca
+        # "superadmin" (ver commercial_demo_seed.py) — is_demo se revisa aparte
+        # de todas formas para no depender únicamente de ese dato.
+        is_dataris_admin = is_superadmin and not is_demo
 
         # The commercial tenant is an isolated showcase.  It intentionally sees
         # the complete product catalog even if an operator disabled a module for
@@ -169,9 +181,14 @@ def get_current_access(authorization: Optional[str] = Header(default=None)):
                 active_set = set(active_platform_ids)
                 effective_ids = [module_id for module_id in effective_ids if module_id == "dashboard" or module_id in active_set]
 
+        if not is_dataris_admin:
+            effective_ids = [module_id for module_id in effective_ids if module_id not in INTERNAL_ONLY_MODULE_IDS]
+
         modules = []
         for row in active_modules:
             expanded = _unique([row.get("id"), row.get("name")])
+            if not is_dataris_admin and any(module_id in INTERNAL_ONLY_MODULE_IDS for module_id in expanded):
+                continue
             if is_demo or is_superadmin or any(module_id in effective_ids for module_id in expanded):
                 modules.append({
                     "id": _normalize_module_id(row.get("id") or row.get("name")),
