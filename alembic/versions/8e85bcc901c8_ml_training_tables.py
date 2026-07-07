@@ -19,66 +19,87 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    """Upgrade schema."""
+    """Upgrade schema.
+
+    Los labels de los enums van en MAYÚSCULA (nombre del miembro Python: p.ej.
+    DRAFT, no su .value "draft"). SAEnum(PyEnumClass, name=...) en
+    app/models/ml_training.py no usa values_callable, así que SQLAlchemy
+    serializa el NOMBRE del miembro al leer/escribir filas por el ORM —
+    confirmado en vivo comparando contra el esquema real creado por
+    AUTO_CREATE_TABLES (create_all), que usa mayúsculas. Con minúsculas aquí,
+    cualquier escritura real del ORM fallaría con "invalid input value for
+    enum" en cuanto se use esta migración en vez de AUTO_CREATE_TABLES.
+    """
+    # create_type=False en todos: el tipo se crea explícitamente abajo con
+    # checkfirst=True; sin create_type=False, el dispatch automático de
+    # SQLAlchemy al crear cada tabla (before_create del tipo Enum de la
+    # columna) intenta volver a emitir CREATE TYPE y falla con "type already
+    # exists" (probado en vivo). El .create() explícito funciona igual con
+    # create_type=False: ese flag solo desactiva el hook automático ligado al
+    # ciclo de vida de la tabla.
     task_type_detection = postgresql.ENUM(
-        "detection", "segmentation", "classification", name="ml_training_task_type"
+        "DETECTION", "SEGMENTATION", "CLASSIFICATION", name="ml_training_task_type", create_type=False
     )
     task_type_detection.create(op.get_bind(), checkfirst=True)
 
     dataset_task_type = postgresql.ENUM(
-        "detection", "segmentation", "classification", name="ml_dataset_task_type"
+        "DETECTION", "SEGMENTATION", "CLASSIFICATION", name="ml_dataset_task_type", create_type=False
     )
     dataset_task_type.create(op.get_bind(), checkfirst=True)
 
     job_task_type = postgresql.ENUM(
-        "detection", "segmentation", "classification", name="ml_job_task_type"
+        "DETECTION", "SEGMENTATION", "CLASSIFICATION", name="ml_job_task_type", create_type=False
     )
     job_task_type.create(op.get_bind(), checkfirst=True)
 
     model_task_type = postgresql.ENUM(
-        "detection", "segmentation", "classification", name="ml_model_task_type"
+        "DETECTION", "SEGMENTATION", "CLASSIFICATION", name="ml_model_task_type", create_type=False
     )
     model_task_type.create(op.get_bind(), checkfirst=True)
 
-    dataset_source = postgresql.ENUM("upload", "roboflow", "existing", name="ml_dataset_source")
+    dataset_source = postgresql.ENUM("UPLOAD", "ROBOFLOW", "EXISTING", name="ml_dataset_source", create_type=False)
     dataset_source.create(op.get_bind(), checkfirst=True)
 
-    dataset_status = postgresql.ENUM("uploading", "validating", "ready", "error", name="ml_dataset_status")
+    dataset_status = postgresql.ENUM(
+        "UPLOADING", "VALIDATING", "READY", "ERROR", name="ml_dataset_status", create_type=False
+    )
     dataset_status.create(op.get_bind(), checkfirst=True)
 
     job_status = postgresql.ENUM(
-        "draft",
-        "dataset_uploading",
-        "dataset_validating",
-        "ready",
-        "queued",
-        "provisioning_compute",
-        "running",
-        "finalizing",
-        "completed",
-        "failed",
-        "cancelled",
-        "expired",
+        "DRAFT",
+        "DATASET_UPLOADING",
+        "DATASET_VALIDATING",
+        "READY",
+        "QUEUED",
+        "PROVISIONING_COMPUTE",
+        "RUNNING",
+        "FINALIZING",
+        "COMPLETED",
+        "FAILED",
+        "CANCELLED",
+        "EXPIRED",
         name="ml_training_job_status",
+        create_type=False,
     )
     job_status.create(op.get_bind(), checkfirst=True)
 
-    model_version_status = postgresql.ENUM("active", "archived", name="ml_model_version_status")
+    model_version_status = postgresql.ENUM("ACTIVE", "ARCHIVED", name="ml_model_version_status", create_type=False)
     model_version_status.create(op.get_bind(), checkfirst=True)
 
     model_artifact_type = postgresql.ENUM(
-        "weights_best",
-        "weights_last",
-        "metrics",
-        "config",
-        "data_yaml",
-        "manifest",
-        "curve",
-        "confusion_matrix",
-        "preview",
-        "onnx",
-        "log",
+        "WEIGHTS_BEST",
+        "WEIGHTS_LAST",
+        "METRICS",
+        "CONFIG",
+        "DATA_YAML",
+        "MANIFEST",
+        "CURVE",
+        "CONFUSION_MATRIX",
+        "PREVIEW",
+        "ONNX",
+        "LOG",
         name="ml_model_artifact_type",
+        create_type=False,
     )
     model_artifact_type.create(op.get_bind(), checkfirst=True)
 
@@ -109,7 +130,7 @@ def upgrade() -> None:
         sa.Column("name", sa.String(), nullable=False),
         sa.Column("description", sa.Text(), nullable=True),
         sa.Column("source", dataset_source, nullable=False),
-        sa.Column("status", dataset_status, nullable=False, server_default="uploading"),
+        sa.Column("status", dataset_status, nullable=False, server_default="UPLOADING"),
         sa.Column("storage_prefix", sa.String(), nullable=False),
         sa.Column("task_type", dataset_task_type, nullable=False),
         sa.Column("image_count", sa.Integer(), nullable=False, server_default="0"),
@@ -163,7 +184,7 @@ def upgrade() -> None:
         sa.Column("model_base", sa.String(), nullable=False),
         sa.Column("model_name", sa.String(), nullable=False),
         sa.Column("config", sa.JSON(), nullable=False),
-        sa.Column("status", job_status, nullable=False, server_default="draft"),
+        sa.Column("status", job_status, nullable=False, server_default="DRAFT"),
         sa.Column("azure_ml_job_id", sa.String(), nullable=True),
         sa.Column("azure_ml_job_name", sa.String(), nullable=True),
         sa.Column("compute_target", sa.String(), nullable=True),
@@ -217,7 +238,7 @@ def upgrade() -> None:
         sa.Column("storage_prefix", sa.String(), nullable=False),
         sa.Column("azure_ml_model_id", sa.String(), nullable=True),
         sa.Column("docker_image_ref", sa.String(), nullable=True),
-        sa.Column("status", model_version_status, nullable=False, server_default="active"),
+        sa.Column("status", model_version_status, nullable=False, server_default="ACTIVE"),
         sa.Column("notes", sa.Text(), nullable=True),
         sa.Column("tags", sa.JSON(), nullable=True),
         sa.Column("retention_until", sa.DateTime(timezone=True), nullable=True),

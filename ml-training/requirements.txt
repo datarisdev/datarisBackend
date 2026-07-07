@@ -8,3 +8,7 @@ pyyaml==6.0.2
 numpy==1.26.4
 azure-storage-blob==12.22.0
 azure-identity==1.17.1
+# Lector uniforme de PNG/JPG/TIFF para predict.py (troceo en tiles vía
+# rasterio.windows.Window). Misma versión que ya usa el backend principal
+# (datarisBackend/requirements.txt) para leer GeoTIFF grandes.
+rasterio==1.5.0

@@ -22,7 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY train.py validate_dataset.py export_model.py create_manifest.py smoke_test.py ./
+COPY train.py predict.py tiling.py validate_dataset.py export_model.py create_manifest.py smoke_test.py ./
 
 # Azure ML sobreescribe el comando real con el que arma
 # training_recipes.build_train_command() en el backend; este CMD por

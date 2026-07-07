@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.models.ml_training import (
+    InferenceJob,
     MLAuditLog,
     MLDataset,
     MLTrainingLimit,
@@ -20,6 +21,7 @@ from app.models.ml_training import (
     TrainingJob,
     TrainingJobStatus,
     TrainingProject,
+    TERMINAL_INFERENCE_STATUSES,
     TERMINAL_JOB_STATUSES,
 )
 
@@ -125,6 +127,34 @@ def get_training_limits(db: Session, user_id: str) -> MLTrainingLimit:
             max_job_duration_minutes=settings.ML_TRAINING_DEFAULT_JOB_TIMEOUT_MINUTES,
         )
     return limit
+
+
+def list_inference_jobs(db: Session, user_id: str, model_version_id: uuid.UUID | None = None):
+    query = db.query(InferenceJob).filter(InferenceJob.user_id == user_id)
+    if model_version_id is not None:
+        query = query.filter(InferenceJob.model_version_id == model_version_id)
+    return query.order_by(InferenceJob.created_at.desc()).all()
+
+
+def get_inference_job(db: Session, user_id: str, job_id: uuid.UUID) -> InferenceJob | None:
+    return db.query(InferenceJob).filter(InferenceJob.id == job_id, InferenceJob.user_id == user_id).first()
+
+
+def get_inference_job_for_admin(db: Session, job_id: uuid.UUID) -> InferenceJob | None:
+    """Solo para capacidades can_admin (cancelar jobs de otros usuarios)."""
+    return db.query(InferenceJob).filter(InferenceJob.id == job_id).first()
+
+
+def count_active_inference_jobs(db: Session, user_id: str) -> int:
+    return (
+        db.query(InferenceJob)
+        .filter(InferenceJob.user_id == user_id, ~InferenceJob.status.in_(TERMINAL_INFERENCE_STATUSES))
+        .count()
+    )
+
+
+def list_non_terminal_inference_jobs(db: Session):
+    return db.query(InferenceJob).filter(~InferenceJob.status.in_(TERMINAL_INFERENCE_STATUSES)).all()
 
 
 def record_audit_event(

@@ -12,8 +12,9 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
 from app.core.config import settings
-from app.modules.ml_training import artifact_service, repository, service
+from app.modules.ml_training import artifact_service, inference_service, repository, service
 from app.modules.ml_training.azure_ml_client import azure_ml_disabled
+from app.modules.ml_training.inference_service import MLInferenceError
 from app.modules.ml_training.policies import (
     MLTrainingCapabilities,
     get_ml_capabilities,
@@ -25,6 +26,10 @@ from app.modules.ml_training.schemas import (
     DatasetRoboflowImportRequest,
     DatasetUploadIntentRequest,
     DatasetUploadIntentResponse,
+    InferenceJobOut,
+    InferenceJobRunRequest,
+    InferenceUploadIntentRequest,
+    InferenceUploadIntentResponse,
     ModelDownloadUrlResponse,
     ModelVersionOut,
     TrainingJobArtifactOut,
@@ -36,11 +41,16 @@ from app.modules.ml_training.schemas import (
     TrainingProjectUpdate,
 )
 from app.modules.ml_training.service import MLTrainingError
+from app.modules.ml_training.upload_service import create_read_url
 
 router = APIRouter(prefix="/ml", tags=["ML Training"])
 
 
 def _handle_business_error(exc: MLTrainingError) -> HTTPException:
+    return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+def _handle_inference_error(exc: MLInferenceError) -> HTTPException:
     return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
 
@@ -378,3 +388,116 @@ def restore_model(
     db.commit()
     db.refresh(model)
     return model
+
+
+# ---------------------------------------------------------------------------
+# Inference ("probar modelo") — espejo deliberado de Training jobs, ver
+# app/modules/ml_training/inference_service.py
+# ---------------------------------------------------------------------------
+
+@router.post("/inference-jobs/upload-intent", response_model=InferenceUploadIntentResponse)
+def create_inference_upload_intent(
+    payload: InferenceUploadIntentRequest,
+    db: Session = Depends(get_db),
+    current_user: dict[str, Any] = Depends(get_current_user),
+    _: MLTrainingCapabilities = Depends(require_ml_manage),
+):
+    try:
+        return inference_service.create_inference_upload_intent(db, current_user["id"], payload)
+    except MLInferenceError as exc:
+        raise _handle_inference_error(exc) from exc
+
+
+@router.post("/inference-jobs/{inference_job_id}/run", response_model=InferenceJobOut)
+def run_inference_job(
+    inference_job_id: UUID,
+    payload: InferenceJobRunRequest,
+    db: Session = Depends(get_db),
+    current_user: dict[str, Any] = Depends(get_current_user),
+    _: MLTrainingCapabilities = Depends(require_ml_manage),
+):
+    try:
+        return inference_service.run_inference_job(db, current_user["id"], inference_job_id)
+    except MLInferenceError as exc:
+        raise _handle_inference_error(exc) from exc
+
+
+@router.get("/inference-jobs", response_model=list[InferenceJobOut])
+def list_inference_jobs(
+    model_version_id: UUID | None = None,
+    db: Session = Depends(get_db),
+    current_user: dict[str, Any] = Depends(get_current_user),
+    _: MLTrainingCapabilities = Depends(require_ml_view),
+):
+    return repository.list_inference_jobs(db, current_user["id"], model_version_id)
+
+
+@router.get("/inference-jobs/{inference_job_id}", response_model=InferenceJobOut)
+def get_inference_job(
+    inference_job_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: dict[str, Any] = Depends(get_current_user),
+    _: MLTrainingCapabilities = Depends(require_ml_view),
+):
+    job = repository.get_inference_job(db, current_user["id"], inference_job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Prueba de inferencia no encontrada")
+    return job
+
+
+@router.post("/inference-jobs/{inference_job_id}/cancel", response_model=InferenceJobOut)
+def cancel_inference_job(
+    inference_job_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: dict[str, Any] = Depends(get_current_user),
+    caps: MLTrainingCapabilities = Depends(require_ml_manage),
+):
+    try:
+        return inference_service.cancel_inference_job(db, current_user["id"], inference_job_id, is_admin=caps.can_admin)
+    except MLInferenceError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/inference-jobs/{inference_job_id}/refresh", response_model=InferenceJobOut)
+def refresh_inference_job(
+    inference_job_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: dict[str, Any] = Depends(get_current_user),
+    _: MLTrainingCapabilities = Depends(require_ml_view),
+):
+    job = repository.get_inference_job(db, current_user["id"], inference_job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Prueba de inferencia no encontrada")
+    return inference_service.refresh_inference_job_status(db, job)
+
+
+@router.get("/inference-jobs/{inference_job_id}/logs", response_model=TrainingJobLogsResponse)
+def get_inference_job_logs(
+    inference_job_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: dict[str, Any] = Depends(get_current_user),
+    _: MLTrainingCapabilities = Depends(require_ml_view),
+):
+    job = repository.get_inference_job(db, current_user["id"], inference_job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Prueba de inferencia no encontrada")
+    lines = [f"status={job.status.value}"]
+    if job.error_message:
+        lines.append(f"error={job.error_message}")
+    return TrainingJobLogsResponse(job_id=job.id, status=job.status, lines=lines)
+
+
+@router.get("/inference-jobs/{inference_job_id}/output-url")
+def get_inference_output_url(
+    inference_job_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: dict[str, Any] = Depends(get_current_user),
+    _: MLTrainingCapabilities = Depends(require_ml_view),
+):
+    """SAS de lectura corta sobre la imagen anotada (preview.png), mismo
+    mecanismo que GET /models/{model_id}/download-url."""
+    job = repository.get_inference_job(db, current_user["id"], inference_job_id)
+    if job is None or not job.output_preview_blob_path:
+        raise HTTPException(status_code=404, detail="Resultado no disponible todavía")
+    url, expires_at = create_read_url(job.output_preview_blob_path)
+    return {"download_url": url, "expires_at": expires_at}

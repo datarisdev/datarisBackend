@@ -8,6 +8,7 @@ comando real que ejecuta la imagen Docker de entrenamiento
 """
 from __future__ import annotations
 
+import shlex
 from dataclasses import dataclass
 
 from app.models.ml_training import TrainingTaskType
@@ -143,6 +144,35 @@ def build_train_command(
         f"--seed {int(config.seed)} "
         f"--augment {'1' if config.augmentations_enabled else '0'} "
         f"--project-id {project_id} "
+        f"--job-id {job_id} "
+        "--output-path ${{outputs.output}}"
+    )
+
+
+def build_predict_command(
+    *,
+    image_file_name: str,
+    tile_size: int,
+    overlap: float,
+    confidence_threshold: float,
+    iou_threshold: float,
+    job_id: str,
+) -> str:
+    """Genera la línea de comando fija que ejecuta predict.py dentro de la
+    misma imagen Docker de entrenamiento (mismo mecanismo que
+    build_train_command). `image_file_name` es el único valor de esta función
+    que viene del nombre original de un archivo subido por el usuario — se
+    pasa por shlex.quote() para que nunca pueda alterar la línea de comando,
+    aunque ya se sanea antes en inference_service.py."""
+    return (
+        "python predict.py "
+        "--model-path ${{inputs.model}} "
+        "--image-path ${{inputs.image}} "
+        f"--image-file {shlex.quote(image_file_name)} "
+        f"--tile-size {int(tile_size)} "
+        f"--overlap {float(overlap)} "
+        f"--conf {float(confidence_threshold)} "
+        f"--iou {float(iou_threshold)} "
         f"--job-id {job_id} "
         "--output-path ${{outputs.output}}"
     )
