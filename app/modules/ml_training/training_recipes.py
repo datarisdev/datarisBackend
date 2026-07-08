@@ -8,7 +8,6 @@ comando real que ejecuta la imagen Docker de entrenamiento
 """
 from __future__ import annotations
 
-import shlex
 from dataclasses import dataclass
 
 from app.models.ml_training import TrainingTaskType
@@ -118,6 +117,17 @@ def apply_mode_preset(config: TrainingJobConfig) -> TrainingJobConfig:
     return config.model_copy(update=preset)
 
 
+# Rutas locales fijas dentro del contenedor de entrenamiento/inferencia. El
+# wrapper (ml-training/entrypoint.py) descarga cada input de Blob Storage a
+# su carpeta /mnt/<nombre> antes de invocar train.py/predict.py, y sube
+# /mnt/output de vuelta al terminar — Container Apps Jobs, a diferencia de
+# Azure ML, no monta carpetas de blob automáticamente.
+DATASET_MOUNT_PATH = "/mnt/dataset"
+MODEL_MOUNT_PATH = "/mnt/model"
+IMAGE_MOUNT_PATH = "/mnt/image"
+OUTPUT_MOUNT_PATH = "/mnt/output"
+
+
 def build_train_command(
     *,
     recipe: TrainingRecipe,
@@ -125,27 +135,31 @@ def build_train_command(
     config: TrainingJobConfig,
     job_id: str,
     project_id: str,
-) -> str:
-    """Genera la línea de comando fija que ejecuta train.py dentro de la imagen
-    Docker de entrenamiento. Los valores están todos validados por Pydantic /
-    esta misma función — nunca se interpola texto libre del usuario."""
+) -> tuple[list[str], list[str]]:
+    """Genera el (command, args) fijo que ejecuta train.py dentro de la imagen
+    Docker de entrenamiento, como lista de argv (sin shell de por medio, así
+    que no hace falta escapar nada). Los valores están todos validados por
+    Pydantic / esta misma función — nunca se interpola texto libre del
+    usuario."""
     return (
-        "python train.py "
-        "--dataset-path ${{inputs.dataset}} "
-        f"--task {recipe.task_type.value} "
-        f"--recipe {recipe.key} "
-        f"--model {model_base} "
-        f"--epochs {int(config.epochs)} "
-        f"--imgsz {int(config.image_size)} "
-        f"--batch {int(config.batch_size)} "
-        f"--lr {float(config.learning_rate)} "
-        f"--patience {int(config.patience)} "
-        f"--val-split {float(config.val_split)} "
-        f"--seed {int(config.seed)} "
-        f"--augment {'1' if config.augmentations_enabled else '0'} "
-        f"--project-id {project_id} "
-        f"--job-id {job_id} "
-        "--output-path ${{outputs.output}}"
+        ["python", "train.py"],
+        [
+            "--dataset-path", DATASET_MOUNT_PATH,
+            "--task", recipe.task_type.value,
+            "--recipe", recipe.key,
+            "--model", model_base,
+            "--epochs", str(int(config.epochs)),
+            "--imgsz", str(int(config.image_size)),
+            "--batch", str(int(config.batch_size)),
+            "--lr", str(float(config.learning_rate)),
+            "--patience", str(int(config.patience)),
+            "--val-split", str(float(config.val_split)),
+            "--seed", str(int(config.seed)),
+            "--augment", "1" if config.augmentations_enabled else "0",
+            "--project-id", project_id,
+            "--job-id", job_id,
+            "--output-path", OUTPUT_MOUNT_PATH,
+        ],
     )
 
 
@@ -157,22 +171,23 @@ def build_predict_command(
     confidence_threshold: float,
     iou_threshold: float,
     job_id: str,
-) -> str:
-    """Genera la línea de comando fija que ejecuta predict.py dentro de la
+) -> tuple[list[str], list[str]]:
+    """Genera el (command, args) fijo que ejecuta predict.py dentro de la
     misma imagen Docker de entrenamiento (mismo mecanismo que
-    build_train_command). `image_file_name` es el único valor de esta función
-    que viene del nombre original de un archivo subido por el usuario — se
-    pasa por shlex.quote() para que nunca pueda alterar la línea de comando,
-    aunque ya se sanea antes en inference_service.py."""
+    build_train_command). `image_file_name` viene del nombre original de un
+    archivo subido por el usuario; al no pasar por un shell no necesita
+    shlex.quote (ya se sanea igual antes en inference_service.py)."""
     return (
-        "python predict.py "
-        "--model-path ${{inputs.model}} "
-        "--image-path ${{inputs.image}} "
-        f"--image-file {shlex.quote(image_file_name)} "
-        f"--tile-size {int(tile_size)} "
-        f"--overlap {float(overlap)} "
-        f"--conf {float(confidence_threshold)} "
-        f"--iou {float(iou_threshold)} "
-        f"--job-id {job_id} "
-        "--output-path ${{outputs.output}}"
+        ["python", "predict.py"],
+        [
+            "--model-path", MODEL_MOUNT_PATH,
+            "--image-path", IMAGE_MOUNT_PATH,
+            "--image-file", image_file_name,
+            "--tile-size", str(int(tile_size)),
+            "--overlap", str(float(overlap)),
+            "--conf", str(float(confidence_threshold)),
+            "--iou", str(float(iou_threshold)),
+            "--job-id", job_id,
+            "--output-path", OUTPUT_MOUNT_PATH,
+        ],
     )

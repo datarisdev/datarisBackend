@@ -123,10 +123,11 @@ def schedule_daily_satellite_jobs():
     acks_late=True,
 )
 def sync_training_job_status():
-    """Reconcilia el estado de los TrainingJob no terminales contra Azure ML.
+    """Reconcilia el estado de los TrainingJob no terminales contra Azure
+    Container Apps Jobs.
 
     Evita que un job quede indefinidamente en running/queued: traduce el
-    estado real de Azure ML, y refresh_job_status() marca como EXPIRED
+    estado real de la execution, y refresh_job_status() marca como EXPIRED
     cualquier job que exceda su timeout_minutes + margen de tolerancia.
     """
     db = SessionLocal()
@@ -147,12 +148,13 @@ def sync_training_job_status():
     acks_late=True,
 )
 def sync_inference_job_status():
-    """Reconcilia el estado de los InferenceJob no terminales contra Azure ML.
+    """Reconcilia el estado de los InferenceJob no terminales contra Azure
+    Container Apps Jobs.
 
     Calco de sync_training_job_status: la inferencia es un espejo deliberado
-    del entrenamiento (mismo Compute Cluster GPU, mismo mecanismo de
-    command jobs), así que se reconcilia con el mismo patrón de polling
-    periódico ligero — nunca mantiene GPU encendida por sí misma.
+    del entrenamiento (mismo Container App Job de CPU, mismo mecanismo de
+    executions), así que se reconcilia con el mismo patrón de polling
+    periódico ligero.
     """
     db = SessionLocal()
     try:

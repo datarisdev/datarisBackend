@@ -1,14 +1,13 @@
 """Orquestación de inferencia ("probar modelo").
 
-Espejo deliberado del entrenamiento (service.py): un `command` job en el
-mismo Compute Cluster GPU, la misma imagen Docker
+Espejo deliberado del entrenamiento (service.py): una execution del mismo
+Container App Job de CPU, la misma imagen Docker
 (datarisBackend/ml-training/, ahora con predict.py además de train.py), y el
 mismo patrón de reconciliación de estado por polling periódico (ver
 refresh_job_status en service.py y app/api/task.py::sync_training_job_status).
 No hay runtime de inferencia nuevo ni cómputo separado — se reutilizan
-exactamente la misma infraestructura y las mismas limitaciones (incluida la
-cuota GPU) que el entrenamiento. Ver el plan aprobado para el detalle de esta
-decisión de arquitectura.
+exactamente la misma infraestructura y las mismas limitaciones (incluido el
+tope de 2 vCPU/4Gi del plan Consumption) que el entrenamiento.
 """
 from __future__ import annotations
 
@@ -29,12 +28,13 @@ from app.models.ml_training import (
     TERMINAL_INFERENCE_STATUSES,
 )
 from app.modules.ml_training import repository
-from app.modules.ml_training.azure_ml_client import (
-    AzureMLClientError,
-    AzureMLJobSpec,
+from app.modules.ml_training.training_job_client import (
+    TrainingJobClientError,
+    TrainingJobSpec,
+    build_blob_io_env,
     cancel_job as azure_cancel_job,
-    default_compute_target,
     default_docker_image,
+    default_job_resource_name,
     get_job as azure_get_job,
     submit_command_job,
     translate_azure_status,
@@ -154,47 +154,46 @@ def run_inference_job(db: Session, user_id: str, job_id: uuid.UUID) -> Inference
 
 def _launch_inference_job(db: Session, job: InferenceJob, model_version: ModelVersion, tile_size: int) -> None:
     docker_image = default_docker_image()
-    compute_target = default_compute_target()
+    job_resource_name = default_job_resource_name()
     input_prefix = job.input_blob_path.rsplit("/", 1)[0] + "/"
 
-    spec = AzureMLJobSpec(
+    command, args = build_predict_command(
+        image_file_name=job.input_file_name,
+        tile_size=tile_size,
+        overlap=_TILE_OVERLAP,
+        confidence_threshold=job.confidence_threshold,
+        iou_threshold=job.iou_threshold,
+        job_id=str(job.id),
+    )
+    spec = TrainingJobSpec(
         job_name=f"ml-inference-{job.id}",
-        display_name=f"Inferencia {job.input_file_name}",
-        command_line=build_predict_command(
-            image_file_name=job.input_file_name,
-            tile_size=tile_size,
-            overlap=_TILE_OVERLAP,
-            confidence_threshold=job.confidence_threshold,
-            iou_threshold=job.iou_threshold,
-            job_id=str(job.id),
+        command=command,
+        args=args,
+        environment_variables=build_blob_io_env(
+            inputs={
+                "model": model_version.storage_prefix,
+                "image": input_prefix,
+            },
+            output_prefix=job.output_storage_prefix,
         ),
-        docker_image=docker_image,
-        compute_target=compute_target,
-        inputs={
-            "model": f"azureml://datastores/workspaceblobstore/paths/{model_version.storage_prefix}",
-            "image": f"azureml://datastores/workspaceblobstore/paths/{input_prefix}",
-        },
-        output_uri=f"azureml://datastores/workspaceblobstore/paths/{job.output_storage_prefix}",
-        timeout_minutes=job.timeout_minutes,
-        tags={"user_id": str(job.user_id), "inference_job_id": str(job.id), "app": "dataris"},
     )
 
     job.status = InferenceJobStatus.QUEUED
-    job.compute_target = compute_target
+    job.compute_target = job_resource_name
     job.docker_image_ref = docker_image
     try:
         azure_job_name = submit_command_job(spec)
         job.azure_ml_job_id = azure_job_name
         job.azure_ml_job_name = azure_job_name
         job.started_at = datetime.now(timezone.utc)
-    except AzureMLClientError as exc:
-        # Mismo manejo que el entrenamiento: si Azure ML está deshabilitado o
-        # sin cuota GPU, el job queda registrado con el motivo exacto en vez
-        # de fallar silenciosamente o simular una ejecución que no ocurrió.
+    except TrainingJobClientError as exc:
+        # Mismo manejo que el entrenamiento: si el módulo está deshabilitado,
+        # el job queda registrado con el motivo exacto en vez de fallar
+        # silenciosamente o simular una ejecución que no ocurrió.
         job.status = InferenceJobStatus.FAILED
         job.error_code = "azure_ml_unavailable"
         job.error_message = str(exc)
-        logger.warning("No se pudo enviar el job de inferencia %s a Azure ML: %s", job.id, exc)
+        logger.warning("No se pudo enviar el job de inferencia %s a Azure Container Apps: %s", job.id, exc)
     db.commit()
 
 
@@ -208,7 +207,7 @@ def cancel_inference_job(db: Session, user_id: str, job_id: uuid.UUID, is_admin:
     if job.azure_ml_job_id:
         try:
             azure_cancel_job(job.azure_ml_job_id)
-        except AzureMLClientError as exc:
+        except TrainingJobClientError as exc:
             logger.warning("No se pudo cancelar el job de inferencia %s en Azure ML: %s", job.id, exc)
 
     job.status = InferenceJobStatus.CANCELLED
@@ -293,14 +292,14 @@ def refresh_inference_job_status(db: Session, job: InferenceJob) -> InferenceJob
             job.finished_at = datetime.now(timezone.utc)
             try:
                 azure_cancel_job(job.azure_ml_job_id)
-            except AzureMLClientError:
+            except TrainingJobClientError:
                 pass
             db.commit()
             return job
 
     try:
         info = azure_get_job(job.azure_ml_job_id)
-    except AzureMLClientError as exc:
+    except TrainingJobClientError as exc:
         logger.warning("No se pudo sincronizar el job de inferencia %s: %s", job.id, exc)
         return job
 
@@ -314,6 +313,16 @@ def refresh_inference_job_status(db: Session, job: InferenceJob) -> InferenceJob
         job.status = new_status
         if new_status in TERMINAL_INFERENCE_STATUSES:
             job.finished_at = datetime.now(timezone.utc)
+        if new_status == InferenceJobStatus.FAILED and not job.error_message:
+            # Mismo gap que en service.py::refresh_job_status: la API de
+            # Container Apps Jobs no expone el motivo real de una falla
+            # detectada por polling, solo el estado.
+            job.error_code = job.error_code or "azure_ml_job_failed"
+            studio_url = info.get("studio_url")
+            job.error_message = (
+                f"La execution de Azure Container Apps falló (estado: {info.get('status')})."
+                + (f" Detalle: {studio_url}" if studio_url else "")
+            )
 
     if job.status == InferenceJobStatus.RUNNING:
         _sync_inference_progress(db, job)

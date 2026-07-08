@@ -115,9 +115,10 @@ class Settings(BaseSettings):
 
     # Módulo de entrenamiento de modelos de visión por computadora (Laboratorio
     # de IA). ML_TRAINING_ENABLED controla si el módulo se expone en la API;
-    # AZURE_ML_ENABLED (leído directamente por azure_ml_client.py, igual
-    # patrón que AZURE_STORAGE_* en azure_blob.py) controla si se permite
-    # enviar jobs reales a Azure ML. Ambos en false por defecto.
+    # TRAINING_JOB_ENABLED (leído directamente por training_job_client.py,
+    # igual patrón que AZURE_STORAGE_* en azure_blob.py) controla si se
+    # permite enviar jobs reales al Container App Job de entrenamiento. Ambos
+    # en false por defecto.
     ML_TRAINING_ENABLED: bool = False
     ML_TRAINING_DEFAULT_JOB_TIMEOUT_MINUTES: int = 120
     ML_TRAINING_DEFAULT_MAX_CONCURRENT_JOBS: int = 1
