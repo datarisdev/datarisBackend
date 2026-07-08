@@ -28,6 +28,7 @@ Exit code 0 si todo pasa, 1 si algo falla.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -400,9 +401,36 @@ def check_entrypoint_blob_io() -> bool:
     return True
 
 
+def check_child_env_thread_limits() -> bool:
+    print("[9/10] Verificando entrypoint.py::_child_env (límites de hilos OMP/MKL/OpenBLAS)...")
+    import entrypoint
+
+    old_value = os.environ.pop("CONTAINER_CPU_LIMIT", None)
+    try:
+        env = entrypoint._child_env()
+        for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+            if env.get(var) != "2":
+                print(f"  FAIL: {var}={env.get(var)!r}, se esperaba '2' (default sin CONTAINER_CPU_LIMIT)")
+                return False
+
+        os.environ["CONTAINER_CPU_LIMIT"] = "4.0"
+        env = entrypoint._child_env()
+        if env.get("OMP_NUM_THREADS") != "4":
+            print(f"  FAIL: OMP_NUM_THREADS={env.get('OMP_NUM_THREADS')!r}, se esperaba '4' con CONTAINER_CPU_LIMIT=4.0")
+            return False
+    finally:
+        if old_value is None:
+            os.environ.pop("CONTAINER_CPU_LIMIT", None)
+        else:
+            os.environ["CONTAINER_CPU_LIMIT"] = old_value
+
+    print("  OK")
+    return True
+
+
 def check_train_end_to_end_with_relative_data_yaml() -> bool:
     print(
-        "[9/9] Verificando train.py de punta a punta (1 época real, CPU, "
+        "[10/10] Verificando train.py de punta a punta (1 época real, CPU, "
         "data.yaml sin 'path:' como en un export de Roboflow/YOLO)..."
     )
 
@@ -480,6 +508,7 @@ def main() -> int:
         check_predict_cli_validation,
         check_predict_end_to_end,
         check_entrypoint_blob_io,
+        check_child_env_thread_limits,
         check_train_end_to_end_with_relative_data_yaml,
     ]
     results = [check() for check in checks]

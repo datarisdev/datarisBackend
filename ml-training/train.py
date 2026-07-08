@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 import traceback
@@ -138,7 +139,15 @@ def main() -> int:
         data_yaml_path = _find_data_yaml(args.dataset_path)
         _ensure_absolute_dataset_path(data_yaml_path)
 
+        import torch
         from ultralytics import YOLO
+
+        # Defensa en profundidad además de las OMP_NUM_THREADS/etc. que fija
+        # entrypoint.py antes de arrancar este proceso: torch.set_num_threads
+        # es la API que PyTorch documenta para su propio pool de hilos
+        # internos, que no siempre respeta las env vars de OpenMP al 100%.
+        cpu_limit = max(1, int(float(os.environ.get("CONTAINER_CPU_LIMIT") or "2")))
+        torch.set_num_threads(cpu_limit)
 
         _log("loading_model", model=args.model)
         model = YOLO(args.model)
