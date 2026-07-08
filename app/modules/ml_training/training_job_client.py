@@ -117,6 +117,21 @@ def default_docker_image() -> str:
     return (os.getenv("TRAINING_JOB_IMAGE") or "").strip()
 
 
+def _default_job_resources() -> dict[str, object]:
+    """cpu/memory de la execution. La API de start reemplaza la definición
+    completa del container (no la combina con la del recurso Job, igual que
+    con "image"), así que se envían explícitos en cada submit — con el
+    mismo default (2.0 vCPU / 4Gi) que ml_training_job.tf, por si las env
+    vars no están configuradas."""
+    cpu_raw = (os.getenv("TRAINING_JOB_CPU") or "2.0").strip()
+    try:
+        cpu = float(cpu_raw)
+    except ValueError:
+        cpu = 2.0
+    memory = (os.getenv("TRAINING_JOB_MEMORY") or "4Gi").strip()
+    return {"cpu": cpu, "memory": memory}
+
+
 def default_job_resource_name() -> str:
     """Nombre del Container App Job (mostrado en la UI como "compute" del
     job, ver TrainingJob.compute_target — se conserva ese nombre de columna
@@ -172,14 +187,24 @@ def submit_command_job(spec: TrainingJobSpec) -> str:
             "Actívalo solo tras aprobar la infraestructura correspondiente."
         )
 
+    # La API de start reemplaza la definición completa del container, no la
+    # combina con la del recurso Job — "image" es obligatorio en el override
+    # aunque sea el mismo que ya está configurado en el Job (confirmado
+    # contra el error real: ContainerAppImageRequired).
+    image = default_docker_image()
+    if not image:
+        raise TrainingJobClientError("TRAINING_JOB_IMAGE no está configurada.")
+
     url = f"{_ARM_BASE_URL}{_job_resource_id()}/start?api-version={_ARM_API_VERSION}"
     body = {
         "containers": [
             {
                 "name": "ml-training",
+                "image": image,
                 "command": ["python", "entrypoint.py"],
                 "args": ["--", *spec.command, *spec.args],
                 "env": [{"name": k, "value": v} for k, v in spec.environment_variables.items()],
+                "resources": _default_job_resources(),
             }
         ]
     }

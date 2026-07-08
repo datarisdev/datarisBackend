@@ -73,6 +73,7 @@ def _training_job_env(monkeypatch):
     monkeypatch.setenv("TRAINING_JOB_SUBSCRIPTION_ID", "sub-1")
     monkeypatch.setenv("TRAINING_JOB_RESOURCE_GROUP", "rg-1")
     monkeypatch.setenv("TRAINING_JOB_NAME", "job-1")
+    monkeypatch.setenv("TRAINING_JOB_IMAGE", "acr.azurecr.io/dataris-ml-training:test")
     monkeypatch.setattr(
         "app.modules.ml_training.training_job_client._auth_headers",
         lambda: {"Authorization": "Bearer fake"},
@@ -97,9 +98,30 @@ class TestSubmitCommandJob:
         assert captured["method"] == "POST"
         assert "/jobs/job-1/start" in captured["url"]
         container = captured["json"]["containers"][0]
+        assert container["image"] == "acr.azurecr.io/dataris-ml-training:test"
         assert container["command"] == ["python", "entrypoint.py"]
         assert container["args"] == ["--", "python", "train.py", "--dataset-path", "/mnt/dataset"]
         assert {"name": "FOO", "value": "bar"} in container["env"]
+        assert container["resources"] == {"cpu": 2.0, "memory": "4Gi"}
+
+    def test_raises_when_image_not_configured(self, monkeypatch):
+        monkeypatch.delenv("TRAINING_JOB_IMAGE", raising=False)
+        with pytest.raises(TrainingJobClientError, match="TRAINING_JOB_IMAGE"):
+            submit_command_job(_spec())
+
+    def test_uses_custom_resources_from_env(self, monkeypatch):
+        monkeypatch.setenv("TRAINING_JOB_CPU", "1.5")
+        monkeypatch.setenv("TRAINING_JOB_MEMORY", "3Gi")
+        captured = {}
+        monkeypatch.setattr(
+            httpx,
+            "request",
+            lambda method, url, headers=None, json=None, timeout=None: (
+                captured.update(json=json) or _FakeResponse(200, {"name": "job-1-abc123"})
+            ),
+        )
+        submit_command_job(_spec())
+        assert captured["json"]["containers"][0]["resources"] == {"cpu": 1.5, "memory": "3Gi"}
 
     def test_raises_when_azure_returns_error(self, monkeypatch):
         monkeypatch.setattr(
