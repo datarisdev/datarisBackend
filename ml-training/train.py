@@ -6,7 +6,8 @@ Este script SOLO acepta parámetros ya validados por el backend
 ejecuta código ni comandos arbitrarios: cada argumento tiene un tipo y un
 rango fijos vía argparse, igual que TrainingJobConfig en el backend.
 
-Uso real (generado por Azure ML, ver azure_ml_client.py):
+Uso real (generado por el backend vía entrypoint.py, ver
+app/modules/ml_training/training_job_client.py::submit_command_job):
     python train.py --dataset-path <input> --task detection \
         --recipe ultralytics_yolo_detection --model yolo11n.pt \
         --epochs 50 --imgsz 640 --batch 16 --lr 0.01 --patience 20 \

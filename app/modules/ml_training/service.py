@@ -2,8 +2,8 @@
 
 Este servicio es el único punto que combina DB (repository.py), Azure Blob
 (upload_service.py), Roboflow (roboflow_service.py), validación de dataset
-(dataset_validation.py), recetas (training_recipes.py) y Azure ML
-(azure_ml_client.py). Los routers (app/api/routers/ml_training.py) deben
+(dataset_validation.py), recetas (training_recipes.py) y Azure Container
+Apps Jobs (training_job_client.py). Los routers (app/api/routers/ml_training.py) deben
 quedar delgados y delegar aquí, siguiendo ARCHITECTURE.md.
 """
 from __future__ import annotations
@@ -30,15 +30,15 @@ from app.models.ml_training import (
 )
 from app.modules.ml_training import repository
 from app.modules.ml_training.artifact_service import register_artifact, register_model_version
-from app.modules.ml_training.azure_ml_client import (
-    AzureMLClientError,
-    AzureMLJobSpec,
+from app.modules.ml_training.training_job_client import (
+    TrainingJobClientError,
+    TrainingJobSpec,
+    build_blob_io_env,
     cancel_job as azure_cancel_job,
-    default_compute_target,
     default_docker_image,
+    default_job_resource_name,
     get_job as azure_get_job,
     submit_command_job,
-    translate_azure_status,
 )
 from app.modules.ml_training.dataset_validation import (
     DatasetSecurityError,
@@ -358,40 +358,40 @@ def create_training_job(db: Session, user_id: str, payload: TrainingJobCreate) -
 
 def _launch_job(db: Session, job: TrainingJob, recipe, config: TrainingJobConfig) -> None:
     docker_image = default_docker_image()
-    compute_target = default_compute_target()
+    job_resource_name = default_job_resource_name()
     dataset = repository.get_dataset(db, str(job.user_id), job.dataset_id)
 
-    spec = AzureMLJobSpec(
+    command, args = build_train_command(
+        recipe=recipe, model_base=job.model_base, config=config, job_id=str(job.id), project_id=str(job.project_id)
+    )
+    spec = TrainingJobSpec(
         job_name=f"ml-{job.id}",
-        display_name=job.model_name,
-        command_line=build_train_command(
-            recipe=recipe, model_base=job.model_base, config=config, job_id=str(job.id), project_id=str(job.project_id)
+        command=command,
+        args=args,
+        environment_variables=build_blob_io_env(
+            inputs={"dataset": dataset.storage_prefix if dataset else ""},
+            output_prefix=job.output_storage_prefix,
         ),
-        docker_image=docker_image,
-        compute_target=compute_target,
-        inputs={"dataset": f"azureml://datastores/workspaceblobstore/paths/{dataset.storage_prefix if dataset else ''}"},
-        output_uri=f"azureml://datastores/workspaceblobstore/paths/{job.output_storage_prefix}",
-        timeout_minutes=job.timeout_minutes,
-        tags={"user_id": str(job.user_id), "project_id": str(job.project_id), "job_id": str(job.id), "app": "dataris"},
     )
 
     job.status = TrainingJobStatus.QUEUED
-    job.compute_target = compute_target
+    job.compute_target = job_resource_name
     job.docker_image_ref = docker_image
     try:
         azure_job_name = submit_command_job(spec)
         job.azure_ml_job_id = azure_job_name
         job.azure_ml_job_name = azure_job_name
         job.started_at = datetime.now(timezone.utc)
-    except AzureMLClientError as exc:
-        # El módulo de Azure ML no está habilitado en este ambiente todavía
-        # (AZURE_ML_ENABLED=false por defecto — ver datarisInfra). El job
-        # queda registrado en DB con el motivo exacto en vez de fallar
-        # silenciosamente o simular una ejecución que no ocurrió.
+    except TrainingJobClientError as exc:
+        # El módulo de entrenamiento no está habilitado en este ambiente
+        # todavía (TRAINING_JOB_ENABLED=false por defecto — ver
+        # datarisInfra). El job queda registrado en DB con el motivo exacto
+        # en vez de fallar silenciosamente o simular una ejecución que no
+        # ocurrió.
         job.status = TrainingJobStatus.FAILED
         job.error_code = "azure_ml_unavailable"
         job.error_message = str(exc)
-        logger.warning("No se pudo enviar el job %s a Azure ML: %s", job.id, exc)
+        logger.warning("No se pudo enviar el job %s a Azure Container Apps: %s", job.id, exc)
     db.commit()
 
 
@@ -405,7 +405,7 @@ def cancel_training_job(db: Session, user_id: str, job_id: uuid.UUID, is_admin: 
     if job.azure_ml_job_id:
         try:
             azure_cancel_job(job.azure_ml_job_id)
-        except AzureMLClientError as exc:
+        except TrainingJobClientError as exc:
             logger.warning("No se pudo cancelar el job %s en Azure ML: %s", job.id, exc)
 
     job.status = TrainingJobStatus.CANCELLED
@@ -550,10 +550,11 @@ def _finalize_completed_job(db: Session, job: TrainingJob) -> None:
 
 
 def refresh_job_status(db: Session, job: TrainingJob) -> TrainingJob:
-    """Reconciliación de estado: traduce el estado real de Azure ML, detecta
-    timeouts, sincroniza el progreso por época mientras corre y registra el
-    modelo automáticamente al completar. Llamado desde el endpoint de refresh
-    y desde la tarea Celery periódica (app/api/task.py::sync_training_job_status)."""
+    """Reconciliación de estado: traduce el estado real de la execution del
+    Container App Job, detecta timeouts, sincroniza el progreso por época
+    mientras corre y registra el modelo automáticamente al completar. Llamado
+    desde el endpoint de refresh y desde la tarea Celery periódica
+    (app/api/task.py::sync_training_job_status)."""
     if job.status in TERMINAL_JOB_STATUSES or not job.azure_ml_job_id:
         return job
 
@@ -566,14 +567,14 @@ def refresh_job_status(db: Session, job: TrainingJob) -> TrainingJob:
             job.finished_at = datetime.now(timezone.utc)
             try:
                 azure_cancel_job(job.azure_ml_job_id)
-            except AzureMLClientError:
+            except TrainingJobClientError:
                 pass
             db.commit()
             return job
 
     try:
         info = azure_get_job(job.azure_ml_job_id)
-    except AzureMLClientError as exc:
+    except TrainingJobClientError as exc:
         logger.warning("No se pudo sincronizar el job %s: %s", job.id, exc)
         return job
 
@@ -583,15 +584,15 @@ def refresh_job_status(db: Session, job: TrainingJob) -> TrainingJob:
         if new_status in TERMINAL_JOB_STATUSES:
             job.finished_at = datetime.now(timezone.utc)
         if new_status == TrainingJobStatus.FAILED and not job.error_message:
-            # A diferencia de la falla síncrona en _launch_job, Azure ML no
-            # expone el motivo real de una falla detectada por polling a
-            # través de MLClient.jobs.get() (solo el estado). Se deja al
-            # menos el estado crudo de Azure y el link a Studio para que el
-            # job no quede "Fallido" sin ninguna pista para el usuario.
+            # A diferencia de la falla síncrona en _launch_job, la API de
+            # Container Apps Jobs no expone el motivo real de una falla
+            # detectada por polling (solo el estado de la execution). Se deja
+            # al menos el estado crudo de Azure y el link al recurso en el
+            # portal para que el job no quede "Fallido" sin ninguna pista.
             job.error_code = job.error_code or "azure_ml_job_failed"
             studio_url = info.get("studio_url")
             job.error_message = (
-                f"Azure ML marcó el job como fallido (estado: {info.get('status')})."
+                f"La execution de Azure Container Apps falló (estado: {info.get('status')})."
                 + (f" Detalle: {studio_url}" if studio_url else "")
             )
 

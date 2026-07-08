@@ -170,7 +170,7 @@ class TestTrainingJobCreation:
         assert "validado" in resp.json()["detail"]
 
     def test_job_creation_fails_cleanly_when_azure_ml_disabled(self, api_client, current_user_holder, db_session, user_a_id, monkeypatch):
-        monkeypatch.delenv("AZURE_ML_ENABLED", raising=False)
+        monkeypatch.delenv("TRAINING_JOB_ENABLED", raising=False)
         _grant_manage_role(db_session, user_a_id)
         current_user_holder.user_id = user_a_id
 

@@ -289,6 +289,80 @@ def check_predict_end_to_end() -> bool:
     return True
 
 
+class _FakeBlobDownload:
+    def __init__(self, content: bytes):
+        self._content = content
+
+    def readinto(self, stream) -> None:
+        stream.write(self._content)
+
+
+class _FakeBlobItem:
+    def __init__(self, name: str):
+        self.name = name
+
+
+class _FakeContainerClient:
+    """Reemplazo en memoria de azure.storage.blob.ContainerClient, sin red,
+    para probar la lógica de descarga/subida de entrypoint.py."""
+
+    def __init__(self):
+        self.blobs: dict[str, bytes] = {}
+
+    def list_blobs(self, name_starts_with: str = ""):
+        return [_FakeBlobItem(name) for name in self.blobs if name.startswith(name_starts_with)]
+
+    def download_blob(self, name: str):
+        return _FakeBlobDownload(self.blobs[name])
+
+    def upload_blob(self, name: str, data, overwrite: bool = True) -> None:  # noqa: ARG002
+        content = data.read() if hasattr(data, "read") else data
+        self.blobs[name] = content
+
+
+def check_entrypoint_blob_io() -> bool:
+    print("[8/8] Verificando entrypoint.py (descarga/subida de Blob Storage, sin red real)...")
+    import entrypoint
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        fake = _FakeContainerClient()
+        fake.blobs["ml/datasets/u1/d1/raw/data.yaml"] = b"names: [weed]\n"
+        fake.blobs["ml/datasets/u1/d1/raw/images/i1.jpg"] = b"fake-image-bytes"
+
+        dataset_dir = root / "dataset"
+        entrypoint.download_prefix(fake, "ml/datasets/u1/d1/raw/", dataset_dir)
+        if not (dataset_dir / "data.yaml").exists() or not (dataset_dir / "images" / "i1.jpg").exists():
+            print("  FAIL: download_prefix no reconstruyó la estructura de carpetas esperada")
+            return False
+        if (dataset_dir / "data.yaml").read_bytes() != b"names: [weed]\n":
+            print("  FAIL: download_prefix corrompió el contenido descargado")
+            return False
+
+        try:
+            entrypoint.download_prefix(fake, "ml/datasets/no-existe/", root / "vacio")
+            print("  FAIL: download_prefix no lanzó FileNotFoundError con un prefijo vacío")
+            return False
+        except FileNotFoundError:
+            pass
+
+        output_dir = root / "output"
+        output_dir.mkdir()
+        (output_dir / "manifest.json").write_text('{"ok": true}')
+        (output_dir / "weights" / "best.pt").parent.mkdir(parents=True)
+        (output_dir / "weights" / "best.pt").write_bytes(b"fake-weights")
+        entrypoint.upload_dir(fake, output_dir, "ml/jobs/u1/j1/")
+        if fake.blobs.get("ml/jobs/u1/j1/manifest.json") != b'{"ok": true}':
+            print("  FAIL: upload_dir no subió manifest.json con el contenido correcto")
+            return False
+        if fake.blobs.get("ml/jobs/u1/j1/weights/best.pt") != b"fake-weights":
+            print("  FAIL: upload_dir no preservó la subcarpeta weights/ al subir")
+            return False
+
+    print("  OK")
+    return True
+
+
 def main() -> int:
     checks = [
         check_imports,
@@ -298,6 +372,7 @@ def main() -> int:
         check_tiling,
         check_predict_cli_validation,
         check_predict_end_to_end,
+        check_entrypoint_blob_io,
     ]
     results = [check() for check in checks]
     if all(results):
