@@ -151,6 +151,30 @@ def _progress_uploader(container_client, blob_prefix: str, stop_event: threading
             print(f"[entrypoint] no se pudo subir progress.json: {exc}", flush=True)
 
 
+def _child_env() -> dict[str, str]:
+    """Limita los hilos de OpenMP/MKL/OpenBLAS/NumExpr al CPU real asignado
+    al Container App Job (CONTAINER_CPU_LIMIT, ver
+    training_job_client.submit_command_job). Sin esto, PyTorch/OpenCV
+    detectan el CPU del nodo físico donde Azure agenda el job (nodos de
+    muchos cores, ej. AMD EPYC de 64 cores) en vez del cupo real de 2 vCPU
+    del container — confirmado: `torch.get_num_threads()` da 10 dentro de un
+    contenedor con --cpus=2 en una máquina de 12 cores. Ese sobre-uso de
+    hilos (cada uno con su propio overhead de memoria) causó un OOMKilled
+    real incluso después de bajar dataloader workers a 2. Debe fijarse ANTES
+    de que el proceso hijo importe numpy/torch/cv2 — por eso va en el env
+    del subprocess, no como una llamada de Python dentro de train.py."""
+    cpu_limit = max(1, int(float(os.environ.get("CONTAINER_CPU_LIMIT") or "2")))
+    limit = str(cpu_limit)
+    return {
+        **os.environ,
+        "OMP_NUM_THREADS": limit,
+        "MKL_NUM_THREADS": limit,
+        "OPENBLAS_NUM_THREADS": limit,
+        "NUMEXPR_NUM_THREADS": limit,
+        "VECLIB_MAXIMUM_THREADS": limit,
+    }
+
+
 def main() -> int:
     argv = sys.argv[1:]
     if "--" not in argv:
@@ -188,7 +212,7 @@ def main() -> int:
     uploader.start()
 
     print(f"[entrypoint] ejecutando: {real_command}", flush=True)
-    result = subprocess.run(real_command)
+    result = subprocess.run(real_command, env=_child_env())
 
     stop_event.set()
     uploader.join(timeout=PROGRESS_UPLOAD_INTERVAL_SECONDS)

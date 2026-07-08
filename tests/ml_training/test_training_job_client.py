@@ -102,6 +102,7 @@ class TestSubmitCommandJob:
         assert container["command"] == ["python", "entrypoint.py"]
         assert container["args"] == ["--", "python", "train.py", "--dataset-path", "/mnt/dataset"]
         assert {"name": "FOO", "value": "bar"} in container["env"]
+        assert {"name": "CONTAINER_CPU_LIMIT", "value": "2.0"} in container["env"]
         assert container["resources"] == {"cpu": 2.0, "memory": "4Gi"}
 
     def test_raises_when_image_not_configured(self, monkeypatch):
@@ -121,7 +122,9 @@ class TestSubmitCommandJob:
             ),
         )
         submit_command_job(_spec())
-        assert captured["json"]["containers"][0]["resources"] == {"cpu": 1.5, "memory": "3Gi"}
+        container = captured["json"]["containers"][0]
+        assert container["resources"] == {"cpu": 1.5, "memory": "3Gi"}
+        assert {"name": "CONTAINER_CPU_LIMIT", "value": "1.5"} in container["env"]
 
     def test_raises_when_azure_returns_error(self, monkeypatch):
         monkeypatch.setattr(

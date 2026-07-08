@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import traceback
 from datetime import datetime, timezone
@@ -160,7 +161,14 @@ def main() -> int:
         if not image_file.exists():
             raise FileNotFoundError(f"Imagen de prueba no encontrada: {image_file}")
 
+        import torch
         from ultralytics import YOLO
+
+        # Mismo motivo que train.py: limitar los hilos de PyTorch al CPU
+        # real asignado (entrypoint.py ya fija OMP_NUM_THREADS/etc. antes de
+        # arrancar este proceso; esto es defensa en profundidad).
+        cpu_limit = max(1, int(float(os.environ.get("CONTAINER_CPU_LIMIT") or "2")))
+        torch.set_num_threads(cpu_limit)
 
         _log("loading_model", weights=str(weights_path))
         model = YOLO(str(weights_path))

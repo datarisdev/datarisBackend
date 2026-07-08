@@ -195,6 +195,16 @@ def submit_command_job(spec: TrainingJobSpec) -> str:
     if not image:
         raise TrainingJobClientError("TRAINING_JOB_IMAGE no está configurada.")
 
+    resources = _default_job_resources()
+    # entrypoint.py usa CONTAINER_CPU_LIMIT para limitar los hilos de
+    # OpenMP/MKL/OpenBLAS/PyTorch antes de correr train.py — sin esto,
+    # PyTorch/OpenCV detectan el CPU real del nodo (Azure corre estos jobs
+    # sobre nodos de muchos cores, ej. AMD EPYC de 64 cores) en vez del
+    # cupo real de 2 vCPU del container, y sobre-asignan hilos cuyo overhead
+    # de memoria causó un OOMKilled real incluso con dataloader workers=2.
+    env_list = [{"name": k, "value": v} for k, v in spec.environment_variables.items()]
+    env_list.append({"name": "CONTAINER_CPU_LIMIT", "value": str(resources["cpu"])})
+
     url = f"{_ARM_BASE_URL}{_job_resource_id()}/start?api-version={_ARM_API_VERSION}"
     body = {
         "containers": [
@@ -203,8 +213,8 @@ def submit_command_job(spec: TrainingJobSpec) -> str:
                 "image": image,
                 "command": ["python", "entrypoint.py"],
                 "args": ["--", *spec.command, *spec.args],
-                "env": [{"name": k, "value": v} for k, v in spec.environment_variables.items()],
-                "resources": _default_job_resources(),
+                "env": env_list,
+                "resources": resources,
             }
         ]
     }
