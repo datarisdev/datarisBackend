@@ -313,6 +313,10 @@ class _FakeContainerClient:
         return [_FakeBlobItem(name) for name in self.blobs if name.startswith(name_starts_with)]
 
     def download_blob(self, name: str):
+        if name not in self.blobs:
+            from azure.core.exceptions import ResourceNotFoundError
+
+            raise ResourceNotFoundError(f"blob not found: {name}")
         return _FakeBlobDownload(self.blobs[name])
 
     def upload_blob(self, name: str, data, overwrite: bool = True) -> None:  # noqa: ARG002
@@ -342,6 +346,30 @@ def check_entrypoint_blob_io() -> bool:
         try:
             entrypoint.download_prefix(fake, "ml/datasets/no-existe/", root / "vacio")
             print("  FAIL: download_prefix no lanzó FileNotFoundError con un prefijo vacío")
+            return False
+        except FileNotFoundError:
+            pass
+
+        # Dataset subido directo como ZIP (caso real: un dataset.storage_prefix
+        # apuntando a un solo archivo .zip, no a una carpeta ya extraída).
+        import io
+        import zipfile
+
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w") as zf:
+            zf.writestr("data.yaml", "names: [weed]\n")
+            zf.writestr("images/i1.jpg", "fake-image-bytes")
+        fake.blobs["ml/datasets/u2/d2/raw/dataset.zip"] = zip_buffer.getvalue()
+
+        zip_dataset_dir = root / "dataset_from_zip"
+        entrypoint.download_prefix(fake, "ml/datasets/u2/d2/raw/dataset.zip", zip_dataset_dir)
+        if not (zip_dataset_dir / "data.yaml").exists() or not (zip_dataset_dir / "images" / "i1.jpg").exists():
+            print("  FAIL: download_prefix no extrajo el ZIP correctamente")
+            return False
+
+        try:
+            entrypoint.download_prefix(fake, "ml/datasets/no-existe/dataset.zip", root / "zip_vacio")
+            print("  FAIL: download_prefix no lanzó FileNotFoundError con un .zip inexistente")
             return False
         except FileNotFoundError:
             pass
