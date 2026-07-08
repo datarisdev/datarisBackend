@@ -16,6 +16,11 @@ Variables de entorno requeridas:
     AZURE_CLIENT_ID       Client ID de la Managed Identity del Container App Job.
     BLOB_INPUTS_JSON      JSON: {"<nombre>": "<prefijo de blob>"} — cada uno se
                           descarga a /mnt/<nombre>/ antes de correr el comando real.
+                          Si el valor termina en ".zip" (dataset subido
+                          directo como ZIP, ver upload_service.py), se
+                          descarga y se extrae en /mnt/<nombre>/ en vez de
+                          copiarse tal cual — train.py/predict.py siempre
+                          esperaron una carpeta ya extraída, nunca un ZIP.
     BLOB_OUTPUT_PREFIX    Prefijo de blob donde se sube /mnt/output/ al terminar
                           (éxito o error) — incluye progress.json en vivo.
 """
@@ -25,10 +30,13 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import traceback
+import zipfile
 from pathlib import Path
 
+from azure.core.exceptions import ResourceNotFoundError
 from azure.identity import DefaultAzureCredential, ManagedIdentityCredential
 from azure.storage.blob import BlobServiceClient
 
@@ -56,8 +64,43 @@ def _container_client():
     return service_client.get_container_client(container_name)
 
 
+def _safe_extract_zip(zip_path: Path, dest_dir: Path) -> None:
+    """Extracción defensiva contra ZIP Slip (rutas ..\\/absolutas dentro del
+    ZIP escapando dest_dir). El dataset ya pasó por
+    dataset_validation.py::inspect_zip_safety en el backend antes de poder
+    lanzar un entrenamiento, pero esto es defensa en profundidad: nunca
+    confiar en un ZIP externo sin revalidar en el punto donde se extrae."""
+    dest_resolved = dest_dir.resolve()
+    with zipfile.ZipFile(zip_path) as zf:
+        for member in zf.infolist():
+            target = (dest_dir / member.filename).resolve()
+            if target != dest_resolved and dest_resolved not in target.parents:
+                raise ValueError(f"Entrada de ZIP fuera del directorio destino: {member.filename}")
+        zf.extractall(dest_dir)
+
+
 def download_prefix(container_client, blob_prefix: str, local_dir: Path) -> None:
     local_dir.mkdir(parents=True, exist_ok=True)
+    stripped = blob_prefix.rstrip("/")
+
+    # Un dataset subido directo como ZIP (o importado de Roboflow) se guarda
+    # como un único blob (ej. ".../raw/dataset.zip"), no como una carpeta ya
+    # extraída — train.py/predict.py siempre esperaron recibir una carpeta
+    # YOLO ya extraída, nunca un ZIP sin abrir. Se detecta por la extensión
+    # y se extrae acá antes de devolver el control.
+    if stripped.lower().endswith(".zip"):
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+            try:
+                container_client.download_blob(stripped).readinto(tmp)
+            except ResourceNotFoundError as exc:
+                raise FileNotFoundError(f"No se encontró el archivo de blob '{stripped}'") from exc
+        try:
+            _safe_extract_zip(tmp_path, local_dir)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+        return
+
     found = False
     for blob in container_client.list_blobs(name_starts_with=blob_prefix):
         rel = blob.name[len(blob_prefix):].lstrip("/")
