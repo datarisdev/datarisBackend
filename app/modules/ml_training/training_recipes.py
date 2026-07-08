@@ -82,10 +82,19 @@ RECIPES: dict[str, TrainingRecipe] = {
     ),
 }
 
+# batch_size reducido a la mitad en los 3 modos (2026-07-08) respecto a los
+# valores originales (pensados para GPU): con batch=16/imgsz=640 el Container
+# App Job de CPU (2 vCPU/4Gi, ver datarisInfra/ml_training_job.tf) murió con
+# OOMKilled de forma reproducible en un dataset real de 122 imágenes, incluso
+# después de corregir dataloader workers y límites de hilos de PyTorch/OpenMP
+# — no se pudo aislar la causa exacta más allá de "batch más chico consume
+# menos memoria pico", así que se bajó el batch como mitigación directa
+# mientras se investiga más a fondo. Revisar hacia arriba si se confirma que
+# ya no hace falta, o si de todas formas se resuelve la cuota GPU pendiente.
 MODE_PRESETS: dict[str, dict[str, object]] = {
-    "fast": {"epochs": 20, "batch_size": 16, "image_size": 480, "patience": 5},
-    "balanced": {"epochs": 50, "batch_size": 16, "image_size": 640, "patience": 20},
-    "accurate": {"epochs": 120, "batch_size": 8, "image_size": 832, "patience": 40},
+    "fast": {"epochs": 20, "batch_size": 8, "image_size": 416, "patience": 5},
+    "balanced": {"epochs": 50, "batch_size": 8, "image_size": 640, "patience": 20},
+    "accurate": {"epochs": 120, "batch_size": 4, "image_size": 832, "patience": 40},
 }
 
 
