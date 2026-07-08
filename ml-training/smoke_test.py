@@ -1,6 +1,7 @@
 #!/usr/bin/env python
-"""Smoke test local de la imagen de entrenamiento — SIN GPU y SIN entrenar
-un modelo real (eso requeriría GPU y minutos/horas). Verifica:
+"""Smoke test local de la imagen de entrenamiento — SIN GPU (usa CPU con
+modelos/datasets minúsculos, nunca un entrenamiento de producción real).
+Verifica:
 
 1. Que todas las dependencias pesadas importan correctamente.
 2. Que validate_dataset.py detecta un dataset sintético válido e inválido.
@@ -11,6 +12,14 @@ un modelo real (eso requeriría GPU y minutos/horas). Verifica:
 7. Que predict.py corre de punta a punta con un modelo real (yolov8n
    pretrained, en CPU) contra una imagen sintética más grande que un tile,
    y produce preview.png + detections.json + manifest.json coherentes.
+8. Que entrypoint.py descarga/sube contra Blob Storage y extrae datasets
+   subidos como ZIP correctamente (sin red real).
+9. Que train.py corre de punta a punta (1 época real, CPU) contra un
+   dataset sintético con un data.yaml SIN `path:` y rutas relativas típicas
+   de un export de Roboflow/YOLO — regresión real: Ultralytics resuelve
+   esas rutas contra su datasets_dir global, no contra la carpeta del
+   dataset, y sin _ensure_absolute_dataset_path() el entrenamiento fallaba
+   con "images not found" aunque los archivos sí existieran.
 
 Uso:
     python smoke_test.py
@@ -391,6 +400,76 @@ def check_entrypoint_blob_io() -> bool:
     return True
 
 
+def check_train_end_to_end_with_relative_data_yaml() -> bool:
+    print(
+        "[9/9] Verificando train.py de punta a punta (1 época real, CPU, "
+        "data.yaml sin 'path:' como en un export de Roboflow/YOLO)..."
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        # Estructura deliberadamente igual a la que reportó el bug real:
+        # sin "path:" en el yaml y carpetas train/valid en vez de
+        # train/images + val/images bajo una carpeta "images/" común.
+        dataset_root = root / "MiDataset"
+        (dataset_root / "train" / "images").mkdir(parents=True)
+        (dataset_root / "train" / "labels").mkdir(parents=True)
+        (dataset_root / "valid" / "images").mkdir(parents=True)
+        (dataset_root / "valid" / "labels").mkdir(parents=True)
+
+        # validate_dataset.py exige un mínimo de 10 imágenes en total.
+        for split, n in (("train", 8), ("valid", 4)):
+            for i in range(n):
+                _make_image(dataset_root / split / "images" / f"i{i}.jpg", size=(64, 64))
+                (dataset_root / split / "labels" / f"i{i}.txt").write_text("0 0.5 0.5 0.4 0.4\n")
+
+        (dataset_root / "data.yaml").write_text(
+            yaml.safe_dump({"train": "train/images", "val": "valid/images", "nc": 1, "names": ["weed"]})
+        )
+
+        output_dir = root / "output"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "train.py",
+                "--dataset-path", str(dataset_root),
+                "--task", "detection",
+                "--recipe", "ultralytics_yolo_detection",
+                "--model", "yolo11n.pt",
+                "--epochs", "1",
+                "--imgsz", "64",
+                "--batch", "2",
+                "--lr", "0.01",
+                "--patience", "5",
+                "--val-split", "0.2",
+                "--seed", "0",
+                "--augment", "0",
+                "--project-id", "p1",
+                "--job-id", "smoke-test-train",
+                "--output-path", str(output_dir),
+            ],
+            capture_output=True,
+            text=True,
+            cwd=Path(__file__).parent,
+        )
+        if result.returncode != 0:
+            error_json = output_dir / "error.json"
+            detail = error_json.read_text() if error_json.exists() else "(sin error.json)"
+            print(
+                f"  FAIL: train.py terminó con código {result.returncode}\n"
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}\nerror.json:\n{detail}"
+            )
+            return False
+
+        manifest_path = output_dir / "manifest.json"
+        if not manifest_path.exists():
+            print("  FAIL: no se generó manifest.json")
+            return False
+
+    print("  OK")
+    return True
+
+
 def main() -> int:
     checks = [
         check_imports,
@@ -401,6 +480,7 @@ def main() -> int:
         check_predict_cli_validation,
         check_predict_end_to_end,
         check_entrypoint_blob_io,
+        check_train_end_to_end_with_relative_data_yaml,
     ]
     results = [check() for check in checks]
     if all(results):

@@ -24,6 +24,8 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
+import yaml
+
 from validate_dataset import validate as validate_dataset
 from create_manifest import build_manifest
 
@@ -78,6 +80,21 @@ def _find_data_yaml(dataset_path: Path) -> Path:
     return candidates[0]
 
 
+def _ensure_absolute_dataset_path(data_yaml_path: Path) -> None:
+    """Ultralytics resuelve train/val/test como rutas relativas a la clave
+    `path:` del yaml — y si falta (típico en exports de Roboflow/YOLO), a su
+    `datasets_dir` global (por defecto /app/datasets dentro del contenedor),
+    NUNCA al directorio real donde vive el yaml. Sin esto, un dataset
+    extraído en cualquier ruta que no sea /app/datasets falla con "images
+    not found" aunque los archivos sí existan (validate_dataset.py no tiene
+    este problema porque resuelve las rutas él mismo, sin pasar por
+    Ultralytics). Se fija `path` al directorio real y se sobreescribe el
+    yaml in-place — es nuestra copia local extraída, no el original en Blob."""
+    content = yaml.safe_load(data_yaml_path.read_text(encoding="utf-8")) or {}
+    content["path"] = str(data_yaml_path.parent.resolve())
+    data_yaml_path.write_text(yaml.safe_dump(content, sort_keys=False), encoding="utf-8")
+
+
 def _make_progress_callback(output_dir: Path, total_epochs: int):
     """progress.json se escribe en la raíz de output_dir (no en el subdirectorio
     del run) en cada fin de época, para que el backend lo lea vía blob storage
@@ -119,6 +136,7 @@ def main() -> int:
         _log("dataset_valid", image_count=report["image_count"], class_count=report["class_count"])
 
         data_yaml_path = _find_data_yaml(args.dataset_path)
+        _ensure_absolute_dataset_path(data_yaml_path)
 
         from ultralytics import YOLO
 
