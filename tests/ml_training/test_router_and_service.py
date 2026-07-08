@@ -340,6 +340,42 @@ class TestRefreshJobStatusProgressAndModelRegistration:
         assert result.status == TrainingJobStatus.RUNNING
         assert result.current_epoch is None
 
+    def test_failed_status_from_polling_persists_error_message(self, db_session, user_a_id, monkeypatch):
+        job = self._make_job(user_a_id, TrainingJobStatus.RUNNING)
+        db_session.add(job)
+        db_session.commit()
+
+        monkeypatch.setattr(
+            "app.modules.ml_training.service.azure_get_job",
+            lambda _: {
+                "internal_status": TrainingJobStatus.FAILED,
+                "status": "Failed",
+                "studio_url": "https://ml.azure.com/runs/ml-fake-job",
+            },
+        )
+
+        result = service.refresh_job_status(db_session, job)
+        assert result.status == TrainingJobStatus.FAILED
+        assert result.error_code == "azure_ml_job_failed"
+        assert "Failed" in result.error_message
+        assert "https://ml.azure.com/runs/ml-fake-job" in result.error_message
+
+    def test_failed_status_from_polling_does_not_overwrite_existing_error(self, db_session, user_a_id, monkeypatch):
+        job = self._make_job(user_a_id, TrainingJobStatus.RUNNING)
+        job.error_code = "azure_ml_unavailable"
+        job.error_message = "mensaje original"
+        db_session.add(job)
+        db_session.commit()
+
+        monkeypatch.setattr(
+            "app.modules.ml_training.service.azure_get_job",
+            lambda _: {"internal_status": TrainingJobStatus.FAILED, "status": "Failed", "studio_url": None},
+        )
+
+        result = service.refresh_job_status(db_session, job)
+        assert result.error_code == "azure_ml_unavailable"
+        assert result.error_message == "mensaje original"
+
     def test_finalize_registers_model_and_artifacts_on_completion(self, db_session, user_a_id, monkeypatch):
         job = self._make_job(user_a_id, TrainingJobStatus.FINALIZING)
         db_session.add(job)

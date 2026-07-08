@@ -582,6 +582,18 @@ def refresh_job_status(db: Session, job: TrainingJob) -> TrainingJob:
         job.status = new_status
         if new_status in TERMINAL_JOB_STATUSES:
             job.finished_at = datetime.now(timezone.utc)
+        if new_status == TrainingJobStatus.FAILED and not job.error_message:
+            # A diferencia de la falla síncrona en _launch_job, Azure ML no
+            # expone el motivo real de una falla detectada por polling a
+            # través de MLClient.jobs.get() (solo el estado). Se deja al
+            # menos el estado crudo de Azure y el link a Studio para que el
+            # job no quede "Fallido" sin ninguna pista para el usuario.
+            job.error_code = job.error_code or "azure_ml_job_failed"
+            studio_url = info.get("studio_url")
+            job.error_message = (
+                f"Azure ML marcó el job como fallido (estado: {info.get('status')})."
+                + (f" Detalle: {studio_url}" if studio_url else "")
+            )
 
     if job.status == TrainingJobStatus.RUNNING:
         _sync_job_progress(db, job)
