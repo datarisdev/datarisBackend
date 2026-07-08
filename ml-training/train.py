@@ -155,6 +155,15 @@ def main() -> int:
             patience=args.patience,
             seed=args.seed,
             augment=args.augment == "1",
+            # El default de Ultralytics (workers=8) asume 8+ cores disponibles
+            # y genera un proceso de dataloader por worker. El Container App
+            # Job de entrenamiento corre con 2 vCPU/4Gi (plan Consumption,
+            # ver datarisInfra/ml_training_job.tf) — 8 workers ahí desperdicia
+            # CPU y, sobre todo, memoria (cada proceso duplica overhead de
+            # Python/PyTorch), y fue la causa real de un OOMKilled (exit 137)
+            # en un dataset de apenas 122 imágenes. 2 es suficiente para este
+            # tope de CPU y dataset típico del módulo.
+            workers=2,
             project=str(output_dir),
             name=run_name,
             exist_ok=True,
