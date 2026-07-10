@@ -37,6 +37,7 @@ from app.services.telemetry.helicopter_processor import process_helicopter_zip
 from app.services.telemetry.aerial_copilot import process_aerial_copilot
 from app.utils.geojson_normalizer import normalize_record_geometries
 from app.services.commercial_demo_seed import ensure_commercial_demo, is_commercial_demo_user
+from app.services.parcel_split_migration import split_multi_feature_parcels
 from app.utils.azure_blob import azure_blob_storage_disabled
 from app.utils.storage_compat import (
     delete_compat_objects,
@@ -564,6 +565,11 @@ def normalize_db(db: Dict[str, Any]) -> Dict[str, Any]:
         ]
 
     ensure_commercial_demo(db, password_hash=password_hash, reset=False)
+    # Lotes subidos antes del split por parcela (PR #89) guardan todas las
+    # parcelas en una sola fila; se dividen aquí para que la vista satelital
+    # seleccione/compare parcela por parcela. ensure_storage() persiste el
+    # resultado al detectar el cambio; después es un no-op.
+    split_multi_feature_parcels(db, timestamp=t)
     return db
 
 def table(db: Dict[str, Any], name: str) -> List[Dict[str, Any]]:
