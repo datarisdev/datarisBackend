@@ -36,18 +36,6 @@ modules = [
         "is_active": True,
     },
     {
-        "name": "tareas",
-        "description": "Gestión de tareas",
-        "icon": "CheckSquare",
-        "is_active": True,
-    },
-    {
-        "name": "analytics",
-        "description": "Dashboard analítico",
-        "icon": "BarChart3",
-        "is_active": True,
-    },
-    {
         "name": "satelite",
         "description": "Monitoreo satelital NDVI",
         "icon": "Satellite",
