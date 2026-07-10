@@ -991,6 +991,11 @@ def create_manual_admin_user(payload: Dict[str, Any] = Body(default_factory=dict
         company = next((c for c in table(db, "companies") if c.get("id") == company_id), None) if company_id else None
         if company_id and not company:
             raise HTTPException(status_code=400, detail="Empresa no encontrada")
+        if company and company.get("demo_seed"):
+            raise HTTPException(
+                status_code=400,
+                detail="No se pueden crear usuarios reales en la empresa de demostración comercial",
+            )
 
         if company:
             used = float(company.get("used_hectares") or 0)

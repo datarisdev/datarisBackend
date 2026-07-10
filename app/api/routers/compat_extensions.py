@@ -609,7 +609,10 @@ def current_link_scope(db: Dict[str, Any], user: Dict[str, Any]) -> Dict[str, An
 def link_visible_for_scope(row: Dict[str, Any], scope: Dict[str, Any]) -> bool:
     admin = scope.get("admin")
     if admin and admin.get("admin_role") == "superadmin":
-        return True
+        # El superadmin ve usuarios DigiformsApp de todas las empresas reales,
+        # pero nunca los usuarios sintéticos de la demo comercial (se
+        # identifican por demo_seed) para que no se mezclen con clientes reales.
+        return not row.get("demo_seed")
     if admin and admin.get("admin_role") == "company_admin":
         return row.get("company_id") == admin.get("company_id")
     company_id = scope.get("company_id")
