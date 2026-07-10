@@ -8,3 +8,9 @@ pyyaml==6.0.2
 numpy==1.26.4
 azure-storage-blob==12.22.0
 azure-identity==1.17.1
+# Lector uniforme de PNG/JPG/TIFF para predict.py (troceo en tiles vía
+# rasterio.windows.Window). El backend principal usa rasterio>=1.3.9 sobre
+# Python 3.12 (ver datarisBackend/requirements.txt); esta imagen corre sobre
+# la base conda de PyTorch, que trae Python 3.11 — rasterio==1.5.0 requiere
+# Python >=3.12 y no instala aquí, de ahí la versión distinta pero fijada.
+rasterio==1.4.3

@@ -8,6 +8,7 @@ from datetime import date
 
 from app.modules.ml_training import repository as ml_repository
 from app.modules.ml_training.service import refresh_job_status
+from app.modules.ml_training.inference_service import refresh_inference_job_status
 
 logger = get_task_logger(__name__)
 
@@ -122,10 +123,11 @@ def schedule_daily_satellite_jobs():
     acks_late=True,
 )
 def sync_training_job_status():
-    """Reconcilia el estado de los TrainingJob no terminales contra Azure ML.
+    """Reconcilia el estado de los TrainingJob no terminales contra Azure
+    Container Apps Jobs.
 
     Evita que un job quede indefinidamente en running/queued: traduce el
-    estado real de Azure ML, y refresh_job_status() marca como EXPIRED
+    estado real de la execution, y refresh_job_status() marca como EXPIRED
     cualquier job que exceda su timeout_minutes + margen de tolerancia.
     """
     db = SessionLocal()
@@ -137,5 +139,31 @@ def sync_training_job_status():
             except Exception as exc:  # noqa: BLE001 - un job problemático no debe frenar al resto
                 logger.error(f"No se pudo sincronizar TrainingJob {job.id}: {exc}")
         logger.info(f"Sincronizados {len(jobs)} training job(s) no terminales")
+    finally:
+        db.close()
+
+
+@celery_app.task(
+    name="app.api.task.sync_inference_job_status",
+    acks_late=True,
+)
+def sync_inference_job_status():
+    """Reconcilia el estado de los InferenceJob no terminales contra Azure
+    Container Apps Jobs.
+
+    Calco de sync_training_job_status: la inferencia es un espejo deliberado
+    del entrenamiento (mismo Container App Job de CPU, mismo mecanismo de
+    executions), así que se reconcilia con el mismo patrón de polling
+    periódico ligero.
+    """
+    db = SessionLocal()
+    try:
+        jobs = ml_repository.list_non_terminal_inference_jobs(db)
+        for job in jobs:
+            try:
+                refresh_inference_job_status(db, job)
+            except Exception as exc:  # noqa: BLE001 - un job problemático no debe frenar al resto
+                logger.error(f"No se pudo sincronizar InferenceJob {job.id}: {exc}")
+        logger.info(f"Sincronizados {len(jobs)} inference job(s) no terminales")
     finally:
         db.close()

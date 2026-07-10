@@ -1,14 +1,21 @@
 # Imagen de entrenamiento — Laboratorio de IA (Dataris)
 
-Imagen Docker independiente de `datarisBackend`, usada exclusivamente por
-Azure ML Compute Cluster (GPU bajo demanda, `min_instances=0`) para ejecutar
-entrenamientos de visión por computadora con PyTorch + Ultralytics. Nunca se
-ejecuta dentro del proceso FastAPI ni de Azure Container Apps.
+Imagen Docker independiente de `datarisBackend`, usada exclusivamente como
+execution bajo demanda de un Azure Container App Job de CPU (plan
+Consumption, tope real de 2 vCPU/4Gi por ejecución — ver
+`datarisInfra/ml_training_job.tf`) para ejecutar entrenamientos de visión
+por computadora con PyTorch + Ultralytics. Nunca se ejecuta dentro del
+proceso FastAPI principal.
+
+Reemplazó a un diseño original sobre Azure ML Compute Cluster GPU, que nunca
+llegó a funcionar por un bloqueo real de cuota en la suscripción de Azure
+(ver `app/modules/ml_training/training_job_client.py` para el detalle).
 
 ## Contenido
 
 - `Dockerfile` — imagen base `pytorch/pytorch:2.5.1-cuda12.1-cudnn9-runtime` (versión fijada).
 - `requirements.txt` — dependencias con versión fijada (Ultralytics, OpenCV, Pillow, PyYAML, NumPy, Azure SDKs).
+- `entrypoint.py` — wrapper que descarga los inputs de Blob Storage a `/mnt/<nombre>/` antes de correr `train.py`/`predict.py`, sube `progress.json` en vivo mientras corren, y sube `/mnt/output/` al terminar (éxito o error). Azure Container Apps Jobs, a diferencia de Azure ML, no monta carpetas de blob automáticamente.
 - `train.py` — entrenamiento real. Solo acepta parámetros validados por argparse (mismos rangos que `TrainingJobConfig` en el backend). No ejecuta comandos ni código arbitrario.
 - `validate_dataset.py` — validación de estructura YOLO (standalone, sin depender del paquete `app` del backend).
 - `export_model.py` — exporta un checkpoint `.pt` a ONNX (opcional).
@@ -43,7 +50,7 @@ El smoke test **no entrena un modelo real** (requeriría GPU y tiempo); valida q
 
 ## Comando real de entrenamiento
 
-El backend genera el comando exacto en `app/modules/ml_training/training_recipes.py::build_train_command()` y lo envía como Azure ML `command` job (`app/modules/ml_training/azure_ml_client.py`). Ejemplo:
+El backend genera el comando exacto en `app/modules/ml_training/training_recipes.py::build_train_command()` y lo envía envuelto en `entrypoint.py` como una execution del Container App Job (`app/modules/ml_training/training_job_client.py::submit_command_job`). Ejemplo del comando real que corre `entrypoint.py` (las rutas `/mnt/*` las llena/drena el wrapper, no Azure):
 
 ```bash
 python train.py \
@@ -78,4 +85,4 @@ Todos estos archivos son recogidos por el backend (`artifact_service.py`) y subi
 
 ## Variables/; secretos requeridos en producción
 
-Esta imagen no lee `ROBOFLOW_API_KEY` ni secretos de Key Vault directamente: el backend ya resuelve el dataset a una ruta de Blob Storage antes de crear el job. La imagen solo necesita acceso de lectura/escritura al datastore de Azure ML montado en `--dataset-path`/`--output-path`, gestionado por la Managed Identity del Compute Cluster (ver `datarisInfra/ml_training_identity.tf`).
+Esta imagen no lee `ROBOFLOW_API_KEY` ni secretos de Key Vault directamente: el backend ya resuelve el dataset a una ruta de Blob Storage antes de crear el job. `entrypoint.py` necesita acceso de lectura/escritura directo a Blob Storage (`BLOB_CONTAINER_NAME`, `AZURE_STORAGE_ACCOUNT_URL`, `AZURE_CLIENT_ID`, `BLOB_INPUTS_JSON`, `BLOB_OUTPUT_PREFIX` — ver `training_job_client.build_blob_io_env`), usando la Managed Identity del Container App Job (ver `datarisInfra/ml_training_identity.tf`).

@@ -26,6 +26,7 @@ from app.models.ml_training import (
     ModelArtifact,
     MLAuditLog,
     MLTrainingLimit,
+    InferenceJob,
 )
 
 # this is the Alembic Config object, which provides

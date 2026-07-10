@@ -9,6 +9,8 @@ from app.models.ml_training import (
     TrainingJobStatus,
     ModelVersionStatus,
     ModelArtifactType,
+    InferenceJobStatus,
+    InferenceInputFormat,
 )
 
 
@@ -244,3 +246,85 @@ class ModelDownloadUrlResponse(BaseModel):
     artifact_type: ModelArtifactType
     download_url: str
     expires_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# Inference ("probar modelo")
+# ---------------------------------------------------------------------------
+
+_ALLOWED_INFERENCE_EXTENSIONS = {".png": InferenceInputFormat.PNG, ".jpg": InferenceInputFormat.JPG, ".jpeg": InferenceInputFormat.JPG, ".tif": InferenceInputFormat.TIFF, ".tiff": InferenceInputFormat.TIFF}
+
+
+class InferenceUploadIntentRequest(BaseModel):
+    model_version_id: UUID
+    file_name: str = Field(min_length=1, max_length=255)
+    content_type: str = Field(default="application/octet-stream", max_length=100)
+    size_bytes: int = Field(gt=0)
+    confidence_threshold: float = Field(default=0.25, gt=0, le=1)
+    iou_threshold: float = Field(default=0.45, gt=0, le=1)
+
+    @field_validator("file_name")
+    @classmethod
+    def _valid_image_extension(cls, value: str) -> str:
+        if "/" in value or "\\" in value or ".." in value:
+            raise ValueError("Nombre de archivo inválido")
+        suffix = "." + value.rsplit(".", 1)[-1].lower() if "." in value else ""
+        if suffix not in _ALLOWED_INFERENCE_EXTENSIONS:
+            raise ValueError("Formato no soportado: usa PNG, JPG o TIFF")
+        return value
+
+
+class InferenceUploadIntentResponse(BaseModel):
+    inference_job_id: UUID
+    upload_url: str
+    blob_path: str
+    expires_at: datetime
+    max_size_bytes: int
+
+
+class InferenceJobRunRequest(BaseModel):
+    confirm: bool = Field(description="Debe ser true: confirmación explícita del usuario antes de lanzar el job")
+
+    @field_validator("confirm")
+    @classmethod
+    def _must_confirm(cls, value: bool) -> bool:
+        if not value:
+            raise ValueError("Se requiere confirmación explícita para iniciar una prueba de inferencia")
+        return value
+
+
+class InferenceDetectionOut(BaseModel):
+    class_id: int
+    class_name: str
+    confidence: float
+    bbox: list[float]
+
+
+class InferenceJobOut(BaseModel):
+    id: UUID
+    user_id: UUID
+    model_version_id: UUID
+    input_file_name: str
+    input_format: InferenceInputFormat
+    confidence_threshold: float
+    iou_threshold: float
+    status: InferenceJobStatus
+    azure_ml_job_id: str | None
+    compute_target: str | None
+    timeout_minutes: int
+    progress_percent: float | None
+    tile_count: int | None
+    tiles_processed: int | None
+    detections: list[InferenceDetectionOut] | None
+    detection_count: int | None
+    image_width_px: int | None
+    image_height_px: int | None
+    error_code: str | None
+    error_message: str | None
+    started_at: datetime | None
+    finished_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True

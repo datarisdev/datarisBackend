@@ -35,6 +35,13 @@ celery_app.conf.beat_schedule = {
         "task": "app.api.task.sync_training_job_status",
         "schedule": 120.0,
     },
+    # Mismo mecanismo para pruebas de inferencia (espejo del entrenamiento,
+    # ver inference_service.py). Más seguido que el entrenamiento porque una
+    # prueba de inferencia es mucho más corta.
+    "ml-inference-job-sync": {
+        "task": "app.api.task.sync_inference_job_status",
+        "schedule": 60.0,
+    },
 }
 
 # Import tasks here so Celery registers them

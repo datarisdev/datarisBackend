@@ -119,17 +119,20 @@ PARCEL_CHILD_TABLES = {
 
 DEFAULT_MODULES = [
     ("dashboard", "Dashboard", "Panel principal", "LayoutDashboard"),
-    ("analytics", "Analytics", "Indicadores gerenciales y modelos predictivos", "TrendingUp"),
     ("satelite", "Monitoreo Satelital", "Análisis satelital", "Satellite"),
     ("mapeo", "Mapeo", "Mapeo y análisis geoespacial", "Map"),
     ("telemetria", "Telemetría", "Indicadores y métricas", "Activity"),
     ("ortofoto-analysis", "Análisis de ortofotos", "Procesamiento visual de ortomosaicos", "Image"),
     ("sig-agricola", "SIG Agrícola", "Análisis agrícola", "Sprout"),
     ("aplicaciones-aereas", "Aplicaciones Aéreas", "Control de aplicaciones", "Plane"),
-    ("tareas", "Tareas", "Tablero Kanban", "Kanban"),
     ("personal", "Personal de Campo", "Control biométrico y georreferenciado", "Users"),
     ("alertas", "Alertas inteligentes", "Detección proactiva de riesgos operativos", "Bell"),
 ]
+
+# Módulos descontinuados (Analytics, Tareas). Se filtran de las tablas en
+# normalize_db() para que desaparezcan también de cualquier ambiente que ya
+# los tuviera sembrados, sin necesitar una migración de datos aparte.
+RETIRED_MODULE_IDS = {"analytics", "tareas"}
 
 EXTENSION_MODULES = [
     (
@@ -548,6 +551,17 @@ def normalize_db(db: Dict[str, Any]) -> Dict[str, Any]:
                 "created_at": t,
                 "updated_at": t,
             })
+
+    if RETIRED_MODULE_IDS:
+        tables["platform_modules"] = [
+            m for m in tables.get("platform_modules", []) if m.get("id") not in RETIRED_MODULE_IDS
+        ]
+        tables["company_modules"] = [
+            m for m in tables.get("company_modules", []) if m.get("module_id") not in RETIRED_MODULE_IDS
+        ]
+        tables["user_modules"] = [
+            m for m in tables.get("user_modules", []) if m.get("module_id") not in RETIRED_MODULE_IDS
+        ]
 
     ensure_commercial_demo(db, password_hash=password_hash, reset=False)
     return db
@@ -991,6 +1005,11 @@ def create_manual_admin_user(payload: Dict[str, Any] = Body(default_factory=dict
         company = next((c for c in table(db, "companies") if c.get("id") == company_id), None) if company_id else None
         if company_id and not company:
             raise HTTPException(status_code=400, detail="Empresa no encontrada")
+        if company and company.get("demo_seed"):
+            raise HTTPException(
+                status_code=400,
+                detail="No se pueden crear usuarios reales en la empresa de demostración comercial",
+            )
 
         if company:
             used = float(company.get("used_hectares") or 0)
@@ -1329,31 +1348,43 @@ async def upload_parcel_from_satellite(
             shutil.copyfileobj(file.file, out)
         from app.services.telemetry.parcel_upload import parse_parcel_file
 
-        parsed = parse_parcel_file(dest, clean_original)
+        lot_name = name.strip()
+        parsed = parse_parcel_file(dest, clean_original, base_name=lot_name)
+        parcels_data = parsed.get("parcels") or []
+        if not parcels_data:
+            raise ValueError("El archivo no contiene polígonos válidos")
+
         t = now()
         public_url = f"/api/compat/storage/public/parcels/{str(storage_path).replace(os.sep, '/') }"
-        row = normalize_record_geometries("parcels", {
-            "id": str(uuid.uuid4()),
-            "user_id": user["id"],
-            "name": name.strip(),
-            "area": parsed.get("area"),
-            "geometry": parsed.get("geometry"),
-            "geometry_geojson": parsed.get("geometry_geojson"),
-            "geometry_bounds": parsed.get("geometry_bounds"),
-            "geometry_center": parsed.get("geometry_center"),
-            "bbox": parsed.get("bbox"),
-            "geometry_type": parsed.get("geometry_type"),
-            "geometry_feature_count": parsed.get("geometry_feature_count"),
-            "geometry_source_crs": parsed.get("geometry_source_crs"),
-            "file_url": public_url,
-            "created_at": t,
-            "updated_at": t,
-        })
+        single = len(parcels_data) == 1
+        created_rows: List[Dict[str, Any]] = []
         with LOCK:
             db = read_db()
-            row = upsert_user_parcel(db, user["id"], row)
+            for item in parcels_data:
+                row = normalize_record_geometries("parcels", {
+                    "id": str(uuid.uuid4()),
+                    "user_id": user["id"],
+                    # Un solo polígono conserva el nombre que escribió el usuario;
+                    # varios polígonos usan el nombre de cada parcela detectada en
+                    # el shapefile/KML (o un correlativo si no trae atributos).
+                    "name": lot_name if single else item.get("name") or lot_name,
+                    "area": item.get("area"),
+                    "geometry": item.get("geometry"),
+                    "geometry_geojson": item.get("geometry_geojson"),
+                    "geometry_bounds": item.get("geometry_bounds"),
+                    "geometry_center": item.get("geometry_center"),
+                    "bbox": item.get("bbox"),
+                    "geometry_type": item.get("geometry_type"),
+                    "geometry_feature_count": item.get("geometry_feature_count"),
+                    "geometry_source_crs": item.get("geometry_source_crs"),
+                    "finca": lot_name,
+                    "file_url": public_url,
+                    "created_at": t,
+                    "updated_at": t,
+                })
+                created_rows.append(upsert_user_parcel(db, user["id"], row))
             write_db(db)
-        return {"data": {"parcel": row}, "error": None}
+        return {"data": {"parcel": created_rows[0], "parcels": created_rows}, "error": None}
     except ValueError as exc:
         try:
             dest.unlink(missing_ok=True)
