@@ -6,7 +6,8 @@ Este script SOLO acepta parámetros ya validados por el backend
 ejecuta código ni comandos arbitrarios: cada argumento tiene un tipo y un
 rango fijos vía argparse, igual que TrainingJobConfig en el backend.
 
-Uso real (generado por Azure ML, ver azure_ml_client.py):
+Uso real (generado por el backend vía entrypoint.py, ver
+app/modules/ml_training/training_job_client.py::submit_command_job):
     python train.py --dataset-path <input> --task detection \
         --recipe ultralytics_yolo_detection --model yolo11n.pt \
         --epochs 50 --imgsz 640 --batch 16 --lr 0.01 --patience 20 \
@@ -17,11 +18,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
+
+import yaml
 
 from validate_dataset import validate as validate_dataset
 from create_manifest import build_manifest
@@ -77,6 +81,21 @@ def _find_data_yaml(dataset_path: Path) -> Path:
     return candidates[0]
 
 
+def _ensure_absolute_dataset_path(data_yaml_path: Path) -> None:
+    """Ultralytics resuelve train/val/test como rutas relativas a la clave
+    `path:` del yaml — y si falta (típico en exports de Roboflow/YOLO), a su
+    `datasets_dir` global (por defecto /app/datasets dentro del contenedor),
+    NUNCA al directorio real donde vive el yaml. Sin esto, un dataset
+    extraído en cualquier ruta que no sea /app/datasets falla con "images
+    not found" aunque los archivos sí existan (validate_dataset.py no tiene
+    este problema porque resuelve las rutas él mismo, sin pasar por
+    Ultralytics). Se fija `path` al directorio real y se sobreescribe el
+    yaml in-place — es nuestra copia local extraída, no el original en Blob."""
+    content = yaml.safe_load(data_yaml_path.read_text(encoding="utf-8")) or {}
+    content["path"] = str(data_yaml_path.parent.resolve())
+    data_yaml_path.write_text(yaml.safe_dump(content, sort_keys=False), encoding="utf-8")
+
+
 def _make_progress_callback(output_dir: Path, total_epochs: int):
     """progress.json se escribe en la raíz de output_dir (no en el subdirectorio
     del run) en cada fin de época, para que el backend lo lea vía blob storage
@@ -118,8 +137,17 @@ def main() -> int:
         _log("dataset_valid", image_count=report["image_count"], class_count=report["class_count"])
 
         data_yaml_path = _find_data_yaml(args.dataset_path)
+        _ensure_absolute_dataset_path(data_yaml_path)
 
+        import torch
         from ultralytics import YOLO
+
+        # Defensa en profundidad además de las OMP_NUM_THREADS/etc. que fija
+        # entrypoint.py antes de arrancar este proceso: torch.set_num_threads
+        # es la API que PyTorch documenta para su propio pool de hilos
+        # internos, que no siempre respeta las env vars de OpenMP al 100%.
+        cpu_limit = max(1, int(float(os.environ.get("CONTAINER_CPU_LIMIT") or "2")))
+        torch.set_num_threads(cpu_limit)
 
         _log("loading_model", model=args.model)
         model = YOLO(args.model)
@@ -136,6 +164,15 @@ def main() -> int:
             patience=args.patience,
             seed=args.seed,
             augment=args.augment == "1",
+            # El default de Ultralytics (workers=8) asume 8+ cores disponibles
+            # y genera un proceso de dataloader por worker. El Container App
+            # Job de entrenamiento corre con 2 vCPU/4Gi (plan Consumption,
+            # ver datarisInfra/ml_training_job.tf) — 8 workers ahí desperdicia
+            # CPU y, sobre todo, memoria (cada proceso duplica overhead de
+            # Python/PyTorch), y fue la causa real de un OOMKilled (exit 137)
+            # en un dataset de apenas 122 imágenes. 2 es suficiente para este
+            # tope de CPU y dataset típico del módulo.
+            workers=2,
             project=str(output_dir),
             name=run_name,
             exist_ok=True,

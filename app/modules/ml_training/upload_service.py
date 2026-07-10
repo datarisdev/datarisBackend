@@ -32,9 +32,9 @@ _UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]")
 
 
 def _sanitize_file_name(file_name: str) -> str:
-    """Nombre de archivo seguro para blob path y para interpolar (con
-    shlex.quote, ver training_recipes.py::build_predict_command) en la línea
-    de comando de Azure ML — nunca texto libre sin filtrar."""
+    """Nombre de archivo seguro para blob path y para pasar como argumento de
+    proceso (ver training_recipes.py::build_predict_command) — nunca texto
+    libre sin filtrar."""
     name = file_name.replace("/", "_").replace("\\", "_")
     return _UNSAFE_FILENAME_CHARS.sub("_", name) or "archivo"
 

@@ -343,13 +343,13 @@ class InferenceInputFormat(str, Enum):
 class InferenceJob(Base):
     """Probar un modelo ya entrenado (ModelVersion) contra una imagen nueva.
 
-    Espejo deliberado de TrainingJob: mismo Compute Cluster GPU, misma imagen
-    Docker (datarisBackend/ml-training/), mismo mecanismo de envío de command
-    jobs (azure_ml_client.submit_command_job) y el mismo patrón de
+    Espejo deliberado de TrainingJob: mismo Container App Job de CPU, misma
+    imagen Docker (datarisBackend/ml-training/), mismo mecanismo de envío de
+    executions (training_job_client.submit_command_job) y el mismo patrón de
     reconciliación por polling periódico (ver refresh_inference_job_status).
     No hay un runtime de inferencia nuevo ni cómputo separado: se reutiliza
-    exactamente la misma infraestructura y las mismas limitaciones (incluida
-    la cuota GPU) que el entrenamiento.
+    exactamente la misma infraestructura y las mismas limitaciones (incluido
+    el tope de 2 vCPU/4Gi del plan Consumption) que el entrenamiento.
     """
 
     __tablename__ = "ml_inference_jobs"

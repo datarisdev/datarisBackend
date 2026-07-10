@@ -220,7 +220,9 @@ def _normalize_point(point: Any, order: str = "lnglat") -> Optional[List[float]]
 
 
 def _normalize_ring(ring: Any, fallback_order: str = "lnglat") -> List[List[float]]:
-    if not isinstance(ring, list):
+    # Las geometrías de shapely (p.ej. shapely.geometry.mapping()) devuelven
+    # anillos como tuplas anidadas, no listas; deben aceptarse igual.
+    if not isinstance(ring, (list, tuple)):
         return []
     raw_points = [p for p in ring if isinstance(p, (list, tuple)) and len(p) >= 2 and _is_num(p[0]) and _is_num(p[1])]
     if len(raw_points) < MIN_RING_POINTS:
@@ -321,7 +323,7 @@ def _iter_coords(value: Any):
         if lng is not None and lat is not None and _valid_lng(lng) and _valid_lat(lat):
             yield lng, lat
         return
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         for item in value:
             yield from _iter_coords(item)
 

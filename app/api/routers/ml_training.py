@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user, get_db
 from app.core.config import settings
 from app.modules.ml_training import artifact_service, inference_service, repository, service
-from app.modules.ml_training.azure_ml_client import azure_ml_disabled
+from app.modules.ml_training.training_job_client import azure_ml_disabled
 from app.modules.ml_training.inference_service import MLInferenceError
 from app.modules.ml_training.policies import (
     MLTrainingCapabilities,
@@ -269,8 +269,9 @@ def get_job_logs(
     job = repository.get_job(db, current_user["id"], job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job no encontrado")
-    # Los logs detallados de Azure ML requieren streaming desde el SDK; en
-    # esta fase se expone el estado consolidado. Ver azure_ml_client.get_job.
+    # Los logs detallados de la execution requieren streaming desde la API de
+    # Azure; en esta fase se expone el estado consolidado. Ver
+    # training_job_client.get_job.
     lines = [f"status={job.status.value}"]
     if job.error_message:
         lines.append(f"error={job.error_message}")

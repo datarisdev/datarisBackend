@@ -4,8 +4,8 @@ prueba (PNG/JPG/TIFF).
 
 Espejo deliberado de train.py: mismos principios (argparse estricto, log JSON
 estructurado por evento, nada de comandos arbitrarios). Corre en la misma
-imagen Docker y el mismo Compute Cluster GPU que el entrenamiento — ver
-app/modules/ml_training/inference_service.py y azure_ml_client.py.
+imagen Docker y el mismo Container App Job de CPU que el entrenamiento — ver
+app/modules/ml_training/inference_service.py y training_job_client.py.
 
 Para imágenes más grandes que --tile-size (típico en TIFF de dron/aéreas), la
 imagen se lee por ventanas con rasterio (mismo lector para PNG/JPG/TIFF, sin
@@ -16,7 +16,8 @@ detecciones se traducen a coordenadas de la imagen completa y se fusionan
 detecciones sobre la imagen entera, sin duplicados en los bordes de los
 tiles.
 
-Uso real (generado por Azure ML, ver azure_ml_client.py):
+Uso real (generado por el backend vía entrypoint.py, ver
+app/modules/ml_training/training_job_client.py::submit_command_job):
     python predict.py --model-path <input> --image-path <input> \
         --image-file foto.tif --tile-size 640 --overlap 0.25 \
         --conf 0.25 --iou 0.45 --job-id <uuid> --output-path <output>
@@ -25,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import traceback
 from datetime import datetime, timezone
@@ -159,7 +161,14 @@ def main() -> int:
         if not image_file.exists():
             raise FileNotFoundError(f"Imagen de prueba no encontrada: {image_file}")
 
+        import torch
         from ultralytics import YOLO
+
+        # Mismo motivo que train.py: limitar los hilos de PyTorch al CPU
+        # real asignado (entrypoint.py ya fija OMP_NUM_THREADS/etc. antes de
+        # arrancar este proceso; esto es defensa en profundidad).
+        cpu_limit = max(1, int(float(os.environ.get("CONTAINER_CPU_LIMIT") or "2")))
+        torch.set_num_threads(cpu_limit)
 
         _log("loading_model", weights=str(weights_path))
         model = YOLO(str(weights_path))
