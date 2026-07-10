@@ -119,17 +119,20 @@ PARCEL_CHILD_TABLES = {
 
 DEFAULT_MODULES = [
     ("dashboard", "Dashboard", "Panel principal", "LayoutDashboard"),
-    ("analytics", "Analytics", "Indicadores gerenciales y modelos predictivos", "TrendingUp"),
     ("satelite", "Monitoreo Satelital", "Análisis satelital", "Satellite"),
     ("mapeo", "Mapeo", "Mapeo y análisis geoespacial", "Map"),
     ("telemetria", "Telemetría", "Indicadores y métricas", "Activity"),
     ("ortofoto-analysis", "Análisis de ortofotos", "Procesamiento visual de ortomosaicos", "Image"),
     ("sig-agricola", "SIG Agrícola", "Análisis agrícola", "Sprout"),
     ("aplicaciones-aereas", "Aplicaciones Aéreas", "Control de aplicaciones", "Plane"),
-    ("tareas", "Tareas", "Tablero Kanban", "Kanban"),
     ("personal", "Personal de Campo", "Control biométrico y georreferenciado", "Users"),
     ("alertas", "Alertas inteligentes", "Detección proactiva de riesgos operativos", "Bell"),
 ]
+
+# Módulos descontinuados (Analytics, Tareas). Se filtran de las tablas en
+# normalize_db() para que desaparezcan también de cualquier ambiente que ya
+# los tuviera sembrados, sin necesitar una migración de datos aparte.
+RETIRED_MODULE_IDS = {"analytics", "tareas"}
 
 EXTENSION_MODULES = [
     (
@@ -548,6 +551,17 @@ def normalize_db(db: Dict[str, Any]) -> Dict[str, Any]:
                 "created_at": t,
                 "updated_at": t,
             })
+
+    if RETIRED_MODULE_IDS:
+        tables["platform_modules"] = [
+            m for m in tables.get("platform_modules", []) if m.get("id") not in RETIRED_MODULE_IDS
+        ]
+        tables["company_modules"] = [
+            m for m in tables.get("company_modules", []) if m.get("module_id") not in RETIRED_MODULE_IDS
+        ]
+        tables["user_modules"] = [
+            m for m in tables.get("user_modules", []) if m.get("module_id") not in RETIRED_MODULE_IDS
+        ]
 
     ensure_commercial_demo(db, password_hash=password_hash, reset=False)
     return db

@@ -29,14 +29,12 @@ DEMO_COMPANY_ID = str(uuid.uuid5(DEMO_NAMESPACE, "company:agrovision-demo"))
 
 DEMO_MODULES = [
     ("dashboard", "Dashboard", "Centro de control operativo", "LayoutDashboard"),
-    ("analytics", "Analytics", "Indicadores gerenciales y modelos predictivos", "TrendingUp"),
     ("satelite", "Monitoreo Satelital", "Análisis multitemporal e índices vegetativos", "Satellite"),
     ("mapeo", "Mapeo", "Mapeo y análisis geoespacial de labores", "Map"),
     ("telemetria", "Telemetría", "Indicadores y métricas de maquinaria", "Activity"),
     ("sig-agricola", "SIG Agrícola", "Seguimiento territorial de cosecha, malezas y plagas", "Sprout"),
     ("aplicaciones-aereas", "Aplicaciones Aéreas", "Control de aplicaciones y cobertura", "Plane"),
     ("ortofoto-analysis", "Análisis de ortofotos", "Procesamiento visual de ortomosaicos", "Image"),
-    ("tareas", "Tareas", "Tablero operativo y seguimiento de campo", "Kanban"),
     ("personal", "Personal de Campo", "Control biométrico y georreferenciado", "Users"),
     ("alertas", "Alertas inteligentes", "Detección proactiva de riesgos operativos", "Bell"),
     ("digiforms", "DigiformsApp", "Formularios digitales de campo, GPS y evidencia", "FileText"),
