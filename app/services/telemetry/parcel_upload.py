@@ -203,7 +203,50 @@ def _record_props(reader: shapefile.Reader, record: Any) -> Dict[str, Any]:
     return props
 
 
-def _read_shapefile(shp_path: Path) -> Dict[str, Any]:
+# Nombres de columna de atributo (case-insensitive) que un shapefile de lote
+# suele usar para identificar cada parcela individual. Se prueban en orden de
+# prioridad; la primera columna con un valor no vacío gana.
+_PARCEL_LABEL_PROPERTY_KEYS = [
+    "parcela", "nombre_parcela", "nom_parcela", "parcel_name", "parcelname",
+    "nombre", "name", "label", "etiqueta",
+    "lote", "nom_lote", "lote_nom",
+    "codigo", "cod_parcela", "cod_lote", "code",
+    "id_parcela", "parcel_id", "plot", "plot_id", "clave", "id",
+]
+
+
+def _feature_label(properties: Optional[Dict[str, Any]], index: int, fallback_base: str) -> str:
+    lower_map = {str(key).strip().lower(): value for key, value in (properties or {}).items()}
+    for key in _PARCEL_LABEL_PROPERTY_KEYS:
+        value = lower_map.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text and text.lower() not in {"none", "null", "nan"}:
+            return text
+    return f"{fallback_base} {index + 1}"
+
+
+def _feature_result(feature: Dict[str, Any], label: str, source_crs_label: str) -> Dict[str, Any]:
+    fc = _feature_collection([feature])
+    summary = summarize_geojson(fc)
+    area = summary.get("area") or round(_area_ha_wgs([feature]), 4)
+    return {
+        "name": label,
+        "geometry": summary.get("geometry_geojson") or fc,
+        "geometry_geojson": summary.get("geometry_geojson") or fc,
+        "geometry_bounds": summary.get("geometry_bounds"),
+        "geometry_center": summary.get("geometry_center"),
+        "bbox": summary.get("bbox"),
+        "geometry_type": summary.get("geometry_type"),
+        "geometry_feature_count": summary.get("geometry_feature_count"),
+        "geometry_source_crs": source_crs_label,
+        "area": area,
+        "properties": feature.get("properties") or {},
+    }
+
+
+def _read_shapefile(shp_path: Path, base_name: str) -> Dict[str, Any]:
     src_crs = _read_prj(shp_path) or CRS.from_epsg(4326)
     reader = shapefile.Reader(str(shp_path))
     features: List[Dict[str, Any]] = []
@@ -228,28 +271,28 @@ def _read_shapefile(shp_path: Path) -> Dict[str, Any]:
         })
     if not features:
         raise ValueError("El shapefile no contiene polígonos válidos")
-    fc = _feature_collection(features)
-    summary = summarize_geojson(fc)
-    area = summary.get("area") or round(_area_ha_wgs(features), 4)
-    return {
-        "geometry": summary.get("geometry_geojson") or fc,
-        "geometry_geojson": summary.get("geometry_geojson") or fc,
-        "geometry_bounds": summary.get("geometry_bounds"),
-        "geometry_center": summary.get("geometry_center"),
-        "bbox": summary.get("bbox"),
-        "geometry_type": summary.get("geometry_type"),
-        "geometry_feature_count": summary.get("geometry_feature_count"),
-        "geometry_source_crs": str(src_crs.to_authority()[0] + ":" + src_crs.to_authority()[1]) if src_crs and src_crs.to_authority() else str(src_crs or "EPSG:4326"),
-        "area": area,
-    }
+    source_crs_label = (
+        str(src_crs.to_authority()[0] + ":" + src_crs.to_authority()[1])
+        if src_crs and src_crs.to_authority()
+        else str(src_crs or "EPSG:4326")
+    )
+    # Cada polígono del shapefile es su propia parcela: se conserva por
+    # separado (con su propia área y atributos) en vez de fusionar todo el
+    # lote en una sola geometría, para que el clic en el mapa seleccione
+    # parcela por parcela.
+    parcels = [
+        _feature_result(feature, _feature_label(feature.get("properties"), index, base_name), source_crs_label)
+        for index, feature in enumerate(features)
+    ]
+    return {"parcels": parcels}
 
 
-def _parse_kml_text(text: str) -> Dict[str, Any]:
+def _parse_kml_text(text: str, base_name: str) -> Dict[str, Any]:
     root = ET.fromstring(text)
     features: List[Dict[str, Any]] = []
     for placemark in root.findall(".//{*}Placemark"):
         name_el = placemark.find("{*}name")
-        name = name_el.text.strip() if name_el is not None and name_el.text else "Parcela"
+        name = name_el.text.strip() if name_el is not None and name_el.text else None
         for polygon in placemark.findall(".//{*}Polygon"):
             coords_el = polygon.find(".//{*}outerBoundaryIs/{*}LinearRing/{*}coordinates")
             if coords_el is None:
@@ -273,28 +316,23 @@ def _parse_kml_text(text: str) -> Dict[str, Any]:
             if geom is not None and geom.is_valid and not geom.is_empty:
                 features.append({
                     "type": "Feature",
-                    "properties": {"name": name, "Name": name},
+                    "properties": {"name": name or "Parcela"},
                     "geometry": mapping(geom),
+                    "_name": name,
                 })
     if not features:
         raise ValueError("El KML/KMZ no contiene polígonos válidos")
-    fc = _feature_collection(features)
-    summary = summarize_geojson(fc)
-    return {
-        "geometry": summary.get("geometry_geojson") or fc,
-        "geometry_geojson": summary.get("geometry_geojson") or fc,
-        "geometry_bounds": summary.get("geometry_bounds"),
-        "geometry_center": summary.get("geometry_center"),
-        "bbox": summary.get("bbox"),
-        "geometry_type": summary.get("geometry_type"),
-        "geometry_feature_count": summary.get("geometry_feature_count"),
-        "geometry_source_crs": "EPSG:4326",
-        "area": summary.get("area") or round(_area_ha_wgs(features), 4),
-    }
+    # Cada Placemark/Polygon del KML es su propia parcela, igual que con shapefiles.
+    parcels = []
+    for index, feature in enumerate(features):
+        label = feature.pop("_name", None) or f"{base_name} {index + 1}"
+        parcels.append(_feature_result(feature, label, "EPSG:4326"))
+    return {"parcels": parcels}
 
 
-def parse_parcel_file(path: Path, original_name: str) -> Dict[str, Any]:
+def parse_parcel_file(path: Path, original_name: str, base_name: Optional[str] = None) -> Dict[str, Any]:
     suffix = original_name.lower().split(".")[-1]
+    fallback_base = base_name or original_name.rsplit(".", 1)[0] or "Parcela"
 
     if suffix == "zip":
         with tempfile.TemporaryDirectory() as td:
@@ -306,13 +344,13 @@ def parse_parcel_file(path: Path, original_name: str) -> Dict[str, Any]:
                 raise ValueError("El ZIP no contiene archivos .shp")
             # Prioriza shapefiles que parezcan polígonos/lotes.
             shp_files.sort(key=lambda p: (0 if any(k in p.stem.lower() for k in ["polygon", "poligono", "parcel", "parcela", "lote", "area"]) else 1, str(p)))
-            return _read_shapefile(shp_files[0])
+            return _read_shapefile(shp_files[0], fallback_base)
 
     if suffix == "shp":
-        return _read_shapefile(path)
+        return _read_shapefile(path, fallback_base)
 
     if suffix == "kml":
-        return _parse_kml_text(path.read_text(encoding="utf-8", errors="ignore"))
+        return _parse_kml_text(path.read_text(encoding="utf-8", errors="ignore"), fallback_base)
 
     if suffix == "kmz":
         with zipfile.ZipFile(path) as zf:
@@ -320,6 +358,6 @@ def parse_parcel_file(path: Path, original_name: str) -> Dict[str, Any]:
             if not kml_names:
                 raise ValueError("El KMZ no contiene KML")
             with zf.open(kml_names[0]) as fh:
-                return _parse_kml_text(fh.read().decode("utf-8", errors="ignore"))
+                return _parse_kml_text(fh.read().decode("utf-8", errors="ignore"), fallback_base)
 
     raise ValueError("Formato no soportado. Usa .zip, .shp, .kml o .kmz")

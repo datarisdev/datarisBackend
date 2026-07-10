@@ -1329,31 +1329,43 @@ async def upload_parcel_from_satellite(
             shutil.copyfileobj(file.file, out)
         from app.services.telemetry.parcel_upload import parse_parcel_file
 
-        parsed = parse_parcel_file(dest, clean_original)
+        lot_name = name.strip()
+        parsed = parse_parcel_file(dest, clean_original, base_name=lot_name)
+        parcels_data = parsed.get("parcels") or []
+        if not parcels_data:
+            raise ValueError("El archivo no contiene polígonos válidos")
+
         t = now()
         public_url = f"/api/compat/storage/public/parcels/{str(storage_path).replace(os.sep, '/') }"
-        row = normalize_record_geometries("parcels", {
-            "id": str(uuid.uuid4()),
-            "user_id": user["id"],
-            "name": name.strip(),
-            "area": parsed.get("area"),
-            "geometry": parsed.get("geometry"),
-            "geometry_geojson": parsed.get("geometry_geojson"),
-            "geometry_bounds": parsed.get("geometry_bounds"),
-            "geometry_center": parsed.get("geometry_center"),
-            "bbox": parsed.get("bbox"),
-            "geometry_type": parsed.get("geometry_type"),
-            "geometry_feature_count": parsed.get("geometry_feature_count"),
-            "geometry_source_crs": parsed.get("geometry_source_crs"),
-            "file_url": public_url,
-            "created_at": t,
-            "updated_at": t,
-        })
+        single = len(parcels_data) == 1
+        created_rows: List[Dict[str, Any]] = []
         with LOCK:
             db = read_db()
-            row = upsert_user_parcel(db, user["id"], row)
+            for item in parcels_data:
+                row = normalize_record_geometries("parcels", {
+                    "id": str(uuid.uuid4()),
+                    "user_id": user["id"],
+                    # Un solo polígono conserva el nombre que escribió el usuario;
+                    # varios polígonos usan el nombre de cada parcela detectada en
+                    # el shapefile/KML (o un correlativo si no trae atributos).
+                    "name": lot_name if single else item.get("name") or lot_name,
+                    "area": item.get("area"),
+                    "geometry": item.get("geometry"),
+                    "geometry_geojson": item.get("geometry_geojson"),
+                    "geometry_bounds": item.get("geometry_bounds"),
+                    "geometry_center": item.get("geometry_center"),
+                    "bbox": item.get("bbox"),
+                    "geometry_type": item.get("geometry_type"),
+                    "geometry_feature_count": item.get("geometry_feature_count"),
+                    "geometry_source_crs": item.get("geometry_source_crs"),
+                    "finca": lot_name,
+                    "file_url": public_url,
+                    "created_at": t,
+                    "updated_at": t,
+                })
+                created_rows.append(upsert_user_parcel(db, user["id"], row))
             write_db(db)
-        return {"data": {"parcel": row}, "error": None}
+        return {"data": {"parcel": created_rows[0], "parcels": created_rows}, "error": None}
     except ValueError as exc:
         try:
             dest.unlink(missing_ok=True)
