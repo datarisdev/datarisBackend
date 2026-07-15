@@ -124,6 +124,24 @@ class Settings(BaseSettings):
     ML_TRAINING_DEFAULT_MAX_CONCURRENT_JOBS: int = 1
     ML_TRAINING_DEFAULT_MAX_DATASET_SIZE_GB: float = 5.0
 
+    # EOS Data Analytics (EOSDA) API Connect. Keep the API key only in backend
+    # env vars / Azure Container App secrets — never in the frontend bundle.
+    EOS_BASE_URL: str = "https://api-connect.eos.com/api"
+    EOS_API_KEY: str | None = None
+    # Default satellite dataset used for search/render/statistics.
+    EOS_DATASET: str = "sentinel2"
+    EOS_TIMEOUT_SECONDS: int = 60
+    # Avoid downloading useless scenes.
+    EOS_MAX_CLOUD: float = 80.0
+    # How far back to look for scenes when no date range is provided (days).
+    EOS_SEARCH_DAYS_BACK: int = 365
+    # mt_stats is asynchronous (create -> poll). Bound the synchronous polling.
+    EOS_STATS_POLL_SECONDS: float = 3.0
+    EOS_STATS_MAX_POLLS: int = 8
+    # Map-layer rendering: stitch XYZ render tiles over the parcel bbox.
+    EOS_RENDER_MAX_TILES: int = 80
+    EOS_RENDER_TARGET_PX: int = 1024
+
     model_config = {
         "env_file": ".env",
         "extra": "ignore",
