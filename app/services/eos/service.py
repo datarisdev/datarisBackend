@@ -220,6 +220,14 @@ def _parse_stats_result(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 "max": stats.get("max"),
                 "median": stats.get("median"),
                 "std": stats.get("std"),
+                # Cuartiles reales: permiten construir p25/p75 (gráficos) y una
+                # distribución de zonas exacta (25% bajo / 50% medio / 25% alto)
+                # sin necesitar acceso al ráster crudo.
+                "q1": stats.get("q1"),
+                "q3": stats.get("q3"),
+                "p10": stats.get("p10"),
+                "p90": stats.get("p90"),
+                "variance": stats.get("variance"),
             }
             for name, stats in indexes.items()
             if isinstance(stats, dict)
