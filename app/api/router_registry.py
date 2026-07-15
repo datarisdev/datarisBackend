@@ -14,6 +14,7 @@ from app.api.routers import (
     compat_sig,
     contextual_copilot,
     dashboard,
+    eos,
     field_notes,
     graniot,
     harvest,
@@ -59,6 +60,7 @@ API_ROUTERS: tuple[RouterRegistration, ...] = (
     RouterRegistration(me_access.router, settings.API_V1_STR),
     RouterRegistration(dashboard.router, settings.API_V1_STR),
     RouterRegistration(sentinel2.router, settings.API_V1_STR),
+    RouterRegistration(eos.router, settings.API_V1_STR),
     RouterRegistration(harvest.router, settings.API_V1_STR),
     RouterRegistration(ml_training.router, settings.API_V1_STR),
 )
