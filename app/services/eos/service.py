@@ -134,6 +134,28 @@ def list_scenes(
     return [_normalize_scene(r) for r in results if r.get("view_id")]
 
 
+def _render_notice(meta: dict[str, Any]) -> Optional[str]:
+    """Mensaje amigable cuando la imagen es un resumen a menor detalle y/o parcial.
+
+    Devuelve ``None`` cuando el render fue completo y a resolución normal, para
+    que el frontend no muestre ningún aviso innecesario.
+    """
+    parts: list[str] = []
+    if meta.get("degraded"):
+        res = meta.get("approx_m_per_px")
+        detalle = f" (~{res:.0f} m/píxel)" if isinstance(res, (int, float)) else ""
+        parts.append(
+            "Lote grande: se muestra el campo completo a menor resolución"
+            f"{detalle} para cargar rápido dentro del límite del proveedor satelital."
+        )
+    if meta.get("partial"):
+        parts.append(
+            "Parte de la imagen no se cargó por el límite de solicitudes del "
+            "proveedor; vuelve a intentarlo en un minuto para completarla."
+        )
+    return " ".join(parts) if parts else None
+
+
 def build_map_layer(
     raw_geometry: Any,
     *,
@@ -226,6 +248,7 @@ def build_map_layer(
             continue
 
         image_url = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
+        notice = _render_notice(meta)
         return {
             "available": True,
             "index": index_key,
@@ -238,6 +261,12 @@ def build_map_layer(
             "bounds": bounds,
             "render": meta,
             "scenes": normalized_scenes,
+            # Vista reducida (lote grande) y/o parcial (faltaron tiles por el
+            # límite de EOS). El frontend muestra este aviso sin bloquear la imagen.
+            "coarse": bool(meta.get("degraded")),
+            "partial": bool(meta.get("partial")),
+            "resolution_m": meta.get("approx_m_per_px"),
+            "notice": notice,
         }
 
     return {
