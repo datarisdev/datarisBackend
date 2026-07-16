@@ -1,7 +1,10 @@
+import logging
 from datetime import datetime, timedelta
 from jose import jwt
 from passlib.context import CryptContext
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -10,8 +13,19 @@ def hash_password(password: str) -> str:
     return pwd_context.hash(truncated)
 
 def verify_password(password: str, hashed: str) -> bool:
+    # Un hash almacenado ausente o en un formato no reconocido (p. ej. cuentas
+    # sembradas sin bcrypt) hacía que passlib lanzara UnknownHashError y el login
+    # devolviera 500 en vez de un 401 limpio. Se trata como credencial inválida.
+    if not hashed:
+        return False
     truncated = password.encode("utf-8")[:72]
-    return pwd_context.verify(truncated, hashed)
+    try:
+        return pwd_context.verify(truncated, hashed)
+    except (ValueError, TypeError) as exc:
+        # passlib lanza UnknownHashError/MalformedHashError (subclases de
+        # ValueError) cuando el hash almacenado no es bcrypt reconocible.
+        logger.warning("verify_password: hash no verificable (%s)", exc)
+        return False
 
 
 def create_access_token(subject: str, role: str, token_type: str = "admin") -> str:
