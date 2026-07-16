@@ -207,31 +207,48 @@ def build_map_layer(
     bbox = _polygon_bbox(polygon)
     normalized_scenes = [_normalize_scene(s) for s in scenes[:scenes_limit] if s.get("view_id")]
 
-    # EOS a veces cataloga una escena como disponible en la búsqueda antes de
-    # que sus tiles de render terminen de procesarse (más común en escenas muy
-    # recientes). Si la mejor escena falla al renderizar, se intenta con la
-    # siguiente en vez de devolver un error al usuario. El número de intentos se
-    # acota (EOS_RENDER_SCENE_FALLBACK_LIMIT) porque cada escena consume tiles
-    # del mismo cupo de render de EOS.
+    # Un lote grande puede cruzar el borde de dos escenas Sentinel-2 (granules)
+    # de la MISMA fecha (p. ej. .../P/XS y .../P/XR): cada granule solo cubre una
+    # parte del lote, y renderizar una sola dejaba media parcela sin NDVI (la
+    # "línea diagonal"). Se agrupan las escenas por fecha para renderizar juntas
+    # todas las de una fecha y cubrir el lote completo.
+    scenes_by_date: dict[str, list[dict[str, Any]]] = {}
+    date_priority: list[str] = []
+    for scene in ordered:
+        if not scene.get("view_id"):
+            continue
+        day = str(scene.get("date") or "")[:10]
+        if not day:
+            continue
+        if day not in scenes_by_date:
+            scenes_by_date[day] = []
+            date_priority.append(day)
+        scenes_by_date[day].append(scene)
+
+    # EOS a veces cataloga una escena como disponible en la búsqueda antes de que
+    # sus tiles de render terminen de procesarse (más común en escenas muy
+    # recientes). Si la mejor FECHA falla al renderizar, se intenta con la
+    # siguiente. El número de intentos se acota (EOS_RENDER_SCENE_FALLBACK_LIMIT)
+    # porque cada intento consume tiles del mismo cupo de render de EOS.
     last_error: str | None = None
     attempts = 0
-    for chosen in ordered:
-        view_id = chosen.get("view_id")
-        if not view_id:
-            continue
+    for day in date_priority:
         if attempts >= settings.EOS_RENDER_SCENE_FALLBACK_LIMIT:
             break
         attempts += 1
+        day_scenes = scenes_by_date[day]
+        view_ids = [s["view_id"] for s in day_scenes if s.get("view_id")]
+        chosen = day_scenes[0]  # representativa de la fecha (para metadatos)
         try:
             png_bytes, bounds, meta = eos_render.render_clipped_index_png(
-                view_id=view_id,
+                view_ids=view_ids,
                 band=band,
                 geometry=polygon,
                 bbox=bbox,
             )
         except EOSApiError as exc:
             last_error = str(exc)
-            # Un 429 es un límite global de la API key: probar otra escena solo
+            # Un 429 es un límite global de la API key: probar otra fecha solo
             # consumiría más cupo sin resolver nada. Se corta y se pide reintentar.
             if getattr(exc, "status_code", None) == 429:
                 return {
@@ -244,7 +261,7 @@ def build_map_layer(
                     "scenes": normalized_scenes,
                     "debug_last_error": last_error,
                 }
-            logger.warning("EOS: escena %s no se pudo renderizar, probando la siguiente: %s", view_id, exc)
+            logger.warning("EOS: fecha %s (%s escenas) no se pudo renderizar, probando la siguiente: %s", day, len(view_ids), exc)
             continue
 
         image_url = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
@@ -256,7 +273,8 @@ def build_map_layer(
             "date": chosen.get("date"),
             "cloud": chosen.get("cloudCoverage"),
             "scene_id": chosen.get("sceneID"),
-            "view_id": view_id,
+            "view_id": view_ids[0],
+            "view_ids": view_ids,
             "image_url": image_url,
             "bounds": bounds,
             "render": meta,
