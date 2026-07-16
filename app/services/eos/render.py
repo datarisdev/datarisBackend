@@ -119,23 +119,32 @@ def _choose_zoom(
 _RENDER_CACHE: dict[tuple, tuple[float, bytes, dict[str, float], dict[str, Any]]] = {}
 
 
-def _render_cache_key(view_id: str, band: str, bbox: tuple[float, float, float, float]) -> tuple:
-    return (view_id, band, tuple(round(v, 6) for v in bbox))
+def _render_cache_key(view_ids: tuple[str, ...], band: str, bbox: tuple[float, float, float, float]) -> tuple:
+    return (view_ids, band, tuple(round(v, 6) for v in bbox))
 
 
 def render_clipped_index_png(
     *,
-    view_id: str,
+    view_ids: list[str],
     band: str,
     geometry: dict[str, Any],
     bbox: tuple[float, float, float, float],
 ) -> tuple[bytes, dict[str, float], dict[str, Any]]:
     """Stitch + crop + mask EOS render tiles into a single clipped PNG.
 
+    ``view_ids`` son las escenas (granules Sentinel-2) de una MISMA fecha que
+    intersecan el lote. Un lote grande puede cruzar el borde de dos granules
+    (p. ej. ``S2/15/P/XS`` y ``S2/15/P/XR``); cada tile se pide a la primera
+    escena que devuelva datos, de modo que la NDVI cubra TODO el lote y no solo
+    la mitad que cae en una escena (la "línea diagonal" que dejaba medio lote sin
+    capa). La primera escena de la lista es la principal; las demás solo se
+    consultan para los tiles que la principal deja vacíos.
+
     Returns (png_bytes, bounds, meta) where bounds is {south,north,west,east}.
     Cachea el resultado en memoria de proceso por ``EOS_RENDER_CACHE_TTL_SECONDS``.
     """
-    cache_key = _render_cache_key(view_id, band, bbox)
+    view_ids = [v for v in view_ids if v]
+    cache_key = _render_cache_key(tuple(view_ids), band, bbox)
     cached_entry = _RENDER_CACHE.get(cache_key)
     if cached_entry is not None:
         cached_at, png_bytes, bounds, meta = cached_entry
@@ -143,7 +152,7 @@ def render_clipped_index_png(
             return png_bytes, bounds, {**meta, "cache_hit": True}
         _RENDER_CACHE.pop(cache_key, None)
 
-    png_bytes, bounds, meta = _render_clipped_index_png_uncached(view_id=view_id, band=band, geometry=geometry, bbox=bbox)
+    png_bytes, bounds, meta = _render_clipped_index_png_uncached(view_ids=view_ids, band=band, geometry=geometry, bbox=bbox)
     # No se cachea un render que salió parcial por saturación (429): guardarlo
     # 6 h dejaría una imagen con huecos hasta que expire. Un render limpio
     # (aunque tenga tiles sin datos legítimos en los bordes) sí se cachea.
@@ -154,7 +163,7 @@ def render_clipped_index_png(
 
 def _render_clipped_index_png_uncached(
     *,
-    view_id: str,
+    view_ids: list[str],
     band: str,
     geometry: dict[str, Any],
     bbox: tuple[float, float, float, float],
@@ -190,15 +199,29 @@ def _render_clipped_index_png_uncached(
 
     def _fetch(coord: tuple[int, int]):
         tx, ty = coord
-        try:
-            raw = client.fetch_render_tile(view_id, band, zoom, tx, ty)
-        except EOSApiError as exc:
-            # Se registra el motivo real de EOS (cuota/auth/404/etc.) para que
-            # quede en los logs; el fallo de un tile no debe abortar el
-            # stitching completo si otros tiles sí responden.
-            logger.warning("EOS render tile %s/%s/%s/%s falló: %s", view_id, band, tx, ty, exc)
-            return coord, None, getattr(exc, "status_code", None)
-        return coord, raw, None
+        last_status = None
+        # Se prueba cada escena en orden: la primera que devuelva datos para este
+        # tile gana. Un lote a caballo entre dos granules necesita tiles de ambas
+        # escenas; las escenas secundarias solo se consultan para los tiles que
+        # la principal deja vacíos (fuera de su granule), así que un lote normal
+        # (una sola escena) no genera peticiones extra.
+        for vid in view_ids:
+            try:
+                raw = client.fetch_render_tile(vid, band, zoom, tx, ty)
+            except EOSApiError as exc:
+                # Se registra el motivo real de EOS (cuota/auth/404/etc.); el
+                # fallo de un tile no debe abortar el stitching completo.
+                logger.warning("EOS render tile %s/%s/%s/%s falló: %s", vid, band, tx, ty, exc)
+                last_status = getattr(exc, "status_code", None)
+                # Un 429 es límite global de la API: no tiene sentido probar más
+                # escenas para este tile, comparten el mismo cupo.
+                if last_status == 429:
+                    return coord, None, 429
+                continue
+            if raw:
+                return coord, raw, None
+            # raw None = sin datos en este granule: probar la siguiente escena.
+        return coord, None, last_status
 
     fetched = 0
     rate_limited = False  # algún tile agotó los reintentos por 429 (límite de EOS)
@@ -218,15 +241,16 @@ def _render_clipped_index_png_uncached(
             canvas.paste(tile_img, ((tx - tx0) * TILE_SIZE, (ty - ty0) * TILE_SIZE), tile_img)
             fetched += 1
 
+    scenes_label = ", ".join(view_ids) if view_ids else "(sin escenas)"
     if fetched == 0:
         # Se propaga el 429 para que build_map_layer NO pruebe otras escenas
         # (comparten el mismo cupo): probar más solo agravaría la saturación.
         if rate_limited:
             raise EOSApiError(
-                f"Límite de peticiones de EOS alcanzado al renderizar la escena {view_id}.",
+                f"Límite de peticiones de EOS alcanzado al renderizar {scenes_label}.",
                 status_code=429,
             )
-        raise EOSApiError(f"No se pudieron obtener tiles de render de EOS para la escena {view_id}.")
+        raise EOSApiError(f"No se pudieron obtener tiles de render de EOS para {scenes_label}.")
 
     # Crop to the bbox pixel window (canvas coordinates = world_pixel - origin).
     crop_box = (
@@ -266,6 +290,7 @@ def _render_clipped_index_png_uncached(
         "zoom": zoom,
         "tiles": len(tiles),
         "tiles_rendered": fetched,
+        "scenes_used": len(view_ids),
         "size": list(out.size),
         "rate_limited": rate_limited,
         # Vista reducida a propósito (lote grande): se muestra el campo completo
