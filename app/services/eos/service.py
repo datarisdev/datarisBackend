@@ -15,6 +15,7 @@ from shapely.ops import unary_union
 from app.core.config import settings
 from app.services.eos import client
 from app.services.eos import render as eos_render
+from app.services.eos.client import EOSApiError
 
 logger = logging.getLogger(__name__)
 
@@ -177,35 +178,78 @@ def build_map_layer(
                 return abs((sd - target_date).days)
             except Exception:
                 return 10_000
-        chosen = min(scenes, key=_distance)
+        ordered = sorted(scenes, key=_distance)
     else:
-        chosen = scenes[0]  # más reciente (sort desc)
-
-    view_id = chosen.get("view_id")
-    if not view_id:
-        return {"available": False, "reason": "La escena seleccionada no tiene identificador de vista.", "index": index_key}
+        ordered = scenes  # ya vienen ordenadas por fecha desc (más reciente primero)
 
     bbox = _polygon_bbox(polygon)
-    png_bytes, bounds, meta = eos_render.render_clipped_index_png(
-        view_id=view_id,
-        band=band,
-        geometry=polygon,
-        bbox=bbox,
-    )
-    image_url = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
+    normalized_scenes = [_normalize_scene(s) for s in scenes[:scenes_limit] if s.get("view_id")]
+
+    # EOS a veces cataloga una escena como disponible en la búsqueda antes de
+    # que sus tiles de render terminen de procesarse (más común en escenas muy
+    # recientes). Si la mejor escena falla al renderizar, se intenta con la
+    # siguiente en vez de devolver un error al usuario. El número de intentos se
+    # acota (EOS_RENDER_SCENE_FALLBACK_LIMIT) porque cada escena consume tiles
+    # del mismo cupo de render de EOS.
+    last_error: str | None = None
+    attempts = 0
+    for chosen in ordered:
+        view_id = chosen.get("view_id")
+        if not view_id:
+            continue
+        if attempts >= settings.EOS_RENDER_SCENE_FALLBACK_LIMIT:
+            break
+        attempts += 1
+        try:
+            png_bytes, bounds, meta = eos_render.render_clipped_index_png(
+                view_id=view_id,
+                band=band,
+                geometry=polygon,
+                bbox=bbox,
+            )
+        except EOSApiError as exc:
+            last_error = str(exc)
+            # Un 429 es un límite global de la API key: probar otra escena solo
+            # consumiría más cupo sin resolver nada. Se corta y se pide reintentar.
+            if getattr(exc, "status_code", None) == 429:
+                return {
+                    "available": False,
+                    "reason": (
+                        "El proveedor satelital está momentáneamente saturado "
+                        "(límite de solicitudes). Vuelve a intentarlo en un minuto."
+                    ),
+                    "index": index_key,
+                    "scenes": normalized_scenes,
+                    "debug_last_error": last_error,
+                }
+            logger.warning("EOS: escena %s no se pudo renderizar, probando la siguiente: %s", view_id, exc)
+            continue
+
+        image_url = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
+        return {
+            "available": True,
+            "index": index_key,
+            "band": band,
+            "date": chosen.get("date"),
+            "cloud": chosen.get("cloudCoverage"),
+            "scene_id": chosen.get("sceneID"),
+            "view_id": view_id,
+            "image_url": image_url,
+            "bounds": bounds,
+            "render": meta,
+            "scenes": normalized_scenes,
+        }
 
     return {
-        "available": True,
+        "available": False,
+        "reason": (
+            "Las escenas satelitales más recientes de este lote todavía no tienen imagen "
+            "procesada disponible. Suele resolverse en poco tiempo; intenta de nuevo o elige "
+            "una fecha anterior."
+        ),
         "index": index_key,
-        "band": band,
-        "date": chosen.get("date"),
-        "cloud": chosen.get("cloudCoverage"),
-        "scene_id": chosen.get("sceneID"),
-        "view_id": view_id,
-        "image_url": image_url,
-        "bounds": bounds,
-        "render": meta,
-        "scenes": [_normalize_scene(s) for s in scenes[:scenes_limit] if s.get("view_id")],
+        "scenes": normalized_scenes,
+        "debug_last_error": last_error,
     }
 
 

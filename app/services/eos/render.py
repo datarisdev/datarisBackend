@@ -8,7 +8,9 @@ crop to the bbox and mask everything outside the parcel polygon to transparent.
 
 from __future__ import annotations
 
+import logging
 import math
+import time
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from typing import Any
@@ -18,6 +20,8 @@ from PIL import Image, ImageChops, ImageDraw
 from app.core.config import settings
 from app.services.eos import client
 from app.services.eos.client import EOSApiError
+
+logger = logging.getLogger(__name__)
 
 TILE_SIZE = 256
 
@@ -64,6 +68,19 @@ def _choose_zoom(bbox: tuple[float, float, float, float], target_px: int, max_ti
     return 12
 
 
+
+# Caché de proceso para el PNG ya generado (stitched + recortado + con
+# máscara). EOS limita el endpoint de render a ~10 solicitudes/minuto, y varias
+# pantallas (Satélite, Comparación, Gráficos, Zonificación) suelen pedir
+# exactamente la misma escena/índice/lote casi al mismo tiempo. Esta caché
+# evita volver a pedir los tiles a EOS para esas repeticiones.
+_RENDER_CACHE: dict[tuple, tuple[float, bytes, dict[str, float], dict[str, Any]]] = {}
+
+
+def _render_cache_key(view_id: str, band: str, bbox: tuple[float, float, float, float]) -> tuple:
+    return (view_id, band, tuple(round(v, 6) for v in bbox))
+
+
 def render_clipped_index_png(
     *,
     view_id: str,
@@ -74,7 +91,32 @@ def render_clipped_index_png(
     """Stitch + crop + mask EOS render tiles into a single clipped PNG.
 
     Returns (png_bytes, bounds, meta) where bounds is {south,north,west,east}.
+    Cachea el resultado en memoria de proceso por ``EOS_RENDER_CACHE_TTL_SECONDS``.
     """
+    cache_key = _render_cache_key(view_id, band, bbox)
+    cached_entry = _RENDER_CACHE.get(cache_key)
+    if cached_entry is not None:
+        cached_at, png_bytes, bounds, meta = cached_entry
+        if time.time() - cached_at < settings.EOS_RENDER_CACHE_TTL_SECONDS:
+            return png_bytes, bounds, {**meta, "cache_hit": True}
+        _RENDER_CACHE.pop(cache_key, None)
+
+    png_bytes, bounds, meta = _render_clipped_index_png_uncached(view_id=view_id, band=band, geometry=geometry, bbox=bbox)
+    # No se cachea un render que salió parcial por saturación (429): guardarlo
+    # 6 h dejaría una imagen con huecos hasta que expire. Un render limpio
+    # (aunque tenga tiles sin datos legítimos en los bordes) sí se cachea.
+    if not meta.get("rate_limited"):
+        _RENDER_CACHE[cache_key] = (time.time(), png_bytes, bounds, meta)
+    return png_bytes, bounds, meta
+
+
+def _render_clipped_index_png_uncached(
+    *,
+    view_id: str,
+    band: str,
+    geometry: dict[str, Any],
+    bbox: tuple[float, float, float, float],
+) -> tuple[bytes, dict[str, float], dict[str, Any]]:
     minx, miny, maxx, maxy = bbox
     zoom = _choose_zoom(bbox, settings.EOS_RENDER_TARGET_PX, settings.EOS_RENDER_MAX_TILES)
 
@@ -95,13 +137,23 @@ def render_clipped_index_png(
         tx, ty = coord
         try:
             raw = client.fetch_render_tile(view_id, band, zoom, tx, ty)
-        except EOSApiError:
-            return coord, None
-        return coord, raw
+        except EOSApiError as exc:
+            # Se registra el motivo real de EOS (cuota/auth/404/etc.) para que
+            # quede en los logs; el fallo de un tile no debe abortar el
+            # stitching completo si otros tiles sí responden.
+            logger.warning("EOS render tile %s/%s/%s/%s falló: %s", view_id, band, tx, ty, exc)
+            return coord, None, getattr(exc, "status_code", None)
+        return coord, raw, None
 
     fetched = 0
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        for (tx, ty), raw in pool.map(_fetch, tiles):
+    rate_limited = False  # algún tile agotó los reintentos por 429 (límite de EOS)
+    # Concurrencia moderada: EOS limita el render a ~10 req/min, así que
+    # disparar 8 tiles a la vez agotaba el cupo de inmediato ante cualquier
+    # otra actividad simultánea (otra pestaña, otro submódulo, otro usuario).
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        for (tx, ty), raw, err_status in pool.map(_fetch, tiles):
+            if err_status == 429:
+                rate_limited = True
             if not raw:
                 continue
             try:
@@ -112,7 +164,14 @@ def render_clipped_index_png(
             fetched += 1
 
     if fetched == 0:
-        raise EOSApiError("No se pudieron obtener tiles de render de EOS para la escena seleccionada.")
+        # Se propaga el 429 para que build_map_layer NO pruebe otras escenas
+        # (comparten el mismo cupo): probar más solo agravaría la saturación.
+        if rate_limited:
+            raise EOSApiError(
+                f"Límite de peticiones de EOS alcanzado al renderizar la escena {view_id}.",
+                status_code=429,
+            )
+        raise EOSApiError(f"No se pudieron obtener tiles de render de EOS para la escena {view_id}.")
 
     # Crop to the bbox pixel window (canvas coordinates = world_pixel - origin).
     crop_box = (
@@ -148,5 +207,11 @@ def render_clipped_index_png(
     out.save(buffer, format="PNG", optimize=True)
 
     bounds = {"south": miny, "north": maxy, "west": minx, "east": maxx}
-    meta = {"zoom": zoom, "tiles": len(tiles), "tiles_rendered": fetched, "size": list(out.size)}
+    meta = {
+        "zoom": zoom,
+        "tiles": len(tiles),
+        "tiles_rendered": fetched,
+        "size": list(out.size),
+        "rate_limited": rate_limited,
+    }
     return buffer.getvalue(), bounds, meta
