@@ -172,6 +172,34 @@ def list_scenes(
     return [_normalize_scene(r) for r in results if r.get("view_id")]
 
 
+def prefetch_map_layers(
+    parcels: list[tuple[str, Any]],
+    *,
+    index: Optional[str] = None,
+    target_date: Optional[date] = None,
+    limit: int = 3,
+    delay_seconds: float = 1.0,
+) -> int:
+    """Calienta la caché (memoria + blob) de la capa para unos pocos lotes.
+
+    Pensado para ejecutarse en segundo plano tras responder al usuario. EOS
+    limita el render a ~10 solicitudes/minuto, así que se acota el número de
+    lotes y se espacian las peticiones para NO robarle cupo a los clicks reales
+    del usuario. Un lote ya cacheado se resuelve casi sin consumir cupo (la
+    imagen sale del blob), y una vez calentado queda instantáneo para todos.
+    """
+    warmed = 0
+    for pid, geom in list(parcels)[: max(1, limit)]:
+        try:
+            res = build_map_layer(geom, index=index, target_date=target_date)
+            if res.get("available"):
+                warmed += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("EOS prefetch: lote %s falló: %s", pid, exc)
+        sleep(delay_seconds)
+    return warmed
+
+
 def _render_notice(meta: dict[str, Any]) -> Optional[str]:
     """Mensaje amigable cuando la imagen es un resumen a menor detalle y/o parcial.
 

@@ -165,6 +165,13 @@ class Settings(BaseSettings):
     # pantallas (Satélite, Comparación, Gráficos, Zonificación) piden la misma
     # escena/índice/lote casi al mismo tiempo.
     EOS_RENDER_CACHE_TTL_SECONDS: int = 6 * 60 * 60
+    # Caché persistente en Azure Blob (L2) del PNG ya renderizado: la caché en
+    # memoria (L1) se pierde al reiniciar/escalar y no se comparte entre réplicas
+    # ni usuarios. Con el blob, el segundo click de CUALQUIER usuario sobre el
+    # mismo lote/índice/fecha es casi instantáneo (una descarga en vez de buscar
+    # escenas + bajar tiles a EOS). Best-effort: si el blob no está disponible
+    # cae a solo memoria.
+    EOS_RENDER_BLOB_CACHE_ENABLED: bool = True
     # Si la mejor escena no se puede renderizar (p. ej. sus tiles aún no están
     # procesados), se prueba con la siguiente. Se acota cuántas escenas se
     # intentan: cada intento consume tiles del cupo de render, así que probar
