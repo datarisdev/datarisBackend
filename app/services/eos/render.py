@@ -8,6 +8,7 @@ crop to the bbox and mask everything outside the parcel polygon to transparent.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import time
@@ -20,6 +21,7 @@ from PIL import Image, ImageChops, ImageDraw
 from app.core.config import settings
 from app.services.eos import client
 from app.services.eos.client import EOSApiError
+from app.utils import azure_blob
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +125,47 @@ def _render_cache_key(view_ids: tuple[str, ...], band: str, bbox: tuple[float, f
     return (view_ids, band, tuple(round(v, 6) for v in bbox))
 
 
+def _blob_object_path(view_ids: list[str], band: str, bbox: tuple[float, float, float, float]) -> str:
+    """Ruta estable del PNG cacheado en Blob (hash de escenas+banda+bbox)."""
+    raw = "|".join(view_ids) + "|" + band + "|" + ",".join(f"{v:.6f}" for v in bbox)
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()
+    safe_band = band.replace(",", "-").replace("/", "-")
+    return f"eos-render/{safe_band}/{digest}.png"
+
+
+def _bounds_from_bbox(bbox: tuple[float, float, float, float]) -> dict[str, float]:
+    minx, miny, maxx, maxy = bbox
+    return {"south": miny, "north": maxy, "west": minx, "east": maxx}
+
+
+def _zoom_resolution(bbox: tuple[float, float, float, float]) -> tuple[int, float, bool]:
+    """(zoom, m/píxel, degraded) determinista a partir del bbox — para reconstruir
+    metadatos en un acierto de caché sin volver a renderizar."""
+    zoom = _choose_zoom(
+        bbox,
+        settings.EOS_RENDER_TARGET_PX,
+        settings.EOS_RENDER_TILE_BUDGET,
+        settings.EOS_RENDER_MAX_TILES,
+        settings.EOS_RENDER_MAX_ZOOM,
+    )
+    minx, miny, maxx, maxy = bbox
+    mid_lat = (miny + maxy) / 2.0
+    mpp = 156543.03392 * math.cos(math.radians(mid_lat)) / (2 ** zoom)
+    return zoom, round(mpp, 1), mpp > settings.EOS_RENDER_NATIVE_M_PER_PX
+
+
+def _blob_cache_enabled() -> bool:
+    if not settings.EOS_RENDER_BLOB_CACHE_ENABLED:
+        return False
+    try:
+        if azure_blob.azure_blob_storage_disabled():
+            return False
+        azure_blob.satellite_container_name()  # lanza si no está configurado (dev)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def render_clipped_index_png(
     *,
     view_ids: list[str],
@@ -141,7 +184,8 @@ def render_clipped_index_png(
     consultan para los tiles que la principal deja vacíos.
 
     Returns (png_bytes, bounds, meta) where bounds is {south,north,west,east}.
-    Cachea el resultado en memoria de proceso por ``EOS_RENDER_CACHE_TTL_SECONDS``.
+    Caché en dos niveles: L1 memoria de proceso (``EOS_RENDER_CACHE_TTL_SECONDS``)
+    y L2 Azure Blob persistente/compartida (best-effort).
     """
     view_ids = [v for v in view_ids if v]
     cache_key = _render_cache_key(tuple(view_ids), band, bbox)
@@ -152,12 +196,44 @@ def render_clipped_index_png(
             return png_bytes, bounds, {**meta, "cache_hit": True}
         _RENDER_CACHE.pop(cache_key, None)
 
+    # L2: caché persistente en Azure Blob (compartida entre réplicas/reinicios/usuarios).
+    blob_path = _blob_object_path(view_ids, band, bbox)
+    if _blob_cache_enabled():
+        try:
+            png_bytes = azure_blob.download_blob_bytes(
+                container_name=azure_blob.satellite_container_name(),
+                object_path=blob_path,
+            )
+            bounds = _bounds_from_bbox(bbox)
+            zoom, mpp, degraded = _zoom_resolution(bbox)
+            meta = {
+                "zoom": zoom, "approx_m_per_px": mpp, "degraded": degraded,
+                "partial": False, "rate_limited": False,
+                "cache_hit": True, "cache_source": "blob",
+            }
+            _RENDER_CACHE[cache_key] = (time.time(), png_bytes, bounds, meta)
+            return png_bytes, bounds, meta
+        except FileNotFoundError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("EOS render: fallo leyendo caché blob %s: %s", blob_path, exc)
+
     png_bytes, bounds, meta = _render_clipped_index_png_uncached(view_ids=view_ids, band=band, geometry=geometry, bbox=bbox)
-    # No se cachea un render que salió parcial por saturación (429): guardarlo
-    # 6 h dejaría una imagen con huecos hasta que expire. Un render limpio
-    # (aunque tenga tiles sin datos legítimos en los bordes) sí se cachea.
-    if not meta.get("rate_limited"):
+    # Solo se cachea un render COMPLETO (sin 429) y con píxeles válidos: un render
+    # parcial o vacío no debe quedar guardado hasta que expire.
+    if not meta.get("rate_limited") and meta.get("valid_pixels", 1) > 0:
         _RENDER_CACHE[cache_key] = (time.time(), png_bytes, bounds, meta)
+        if _blob_cache_enabled():
+            try:
+                azure_blob.upload_blob_bytes(
+                    container_name=azure_blob.satellite_container_name(),
+                    object_path=blob_path,
+                    content=png_bytes,
+                    content_type="image/png",
+                    cache_control="public, max-age=604800",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("EOS render: fallo guardando caché blob %s: %s", blob_path, exc)
     return png_bytes, bounds, meta
 
 
@@ -273,6 +349,11 @@ def _render_clipped_index_png_uncached(
         ext_pts = [_to_local(lon, lat) for lon, lat in exterior]
         if len(ext_pts) >= 3:
             draw.polygon(ext_pts, fill=255)
+            # También el contorno: a zoom bajo (lote grande) una parte pequeña o
+            # fina puede quedar por debajo de 1 px con polygon() y desaparecer;
+            # el trazo del borde garantiza que TODA parte del lote se dibuje, para
+            # que la capa siempre respete la forma exacta del lote seleccionado.
+            draw.line(ext_pts + [ext_pts[0]], fill=255, width=1)
         for hole in holes:
             hole_pts = [_to_local(lon, lat) for lon, lat in hole]
             if len(hole_pts) >= 3:
@@ -281,6 +362,18 @@ def _render_clipped_index_png_uncached(
     r, g, b, a = cropped.split()
     masked_alpha = ImageChops.multiply(a, mask)
     out = Image.merge("RGBA", (r, g, b, masked_alpha))
+
+    # Píxeles dentro de la forma del lote (mask) vs con dato satelital real
+    # (masked_alpha>0). Si el lote tiene área pero NINGÚN píxel con dato, la
+    # escena no sirve (nubes/sin datos): se descarta para que build_map_layer
+    # pruebe la siguiente fecha en vez de mostrar una capa vacía.
+    mask_pixels = sum(mask.histogram()[1:])
+    valid_pixels = sum(masked_alpha.histogram()[1:])
+    if mask_pixels > 0 and valid_pixels == 0 and not rate_limited:
+        raise EOSApiError(
+            f"La escena {scenes_label} no tiene píxeles válidos dentro del lote "
+            "(nubes o sin datos)."
+        )
 
     buffer = BytesIO()
     out.save(buffer, format="PNG", optimize=True)
@@ -301,5 +394,7 @@ def _render_clipped_index_png_uncached(
         # Parcial = faltan tiles por el límite de solicitudes (no por bordes sin
         # datos, que son transparentes de forma legítima).
         "partial": bool(rate_limited),
+        "mask_pixels": mask_pixels,
+        "valid_pixels": valid_pixels,
     }
     return buffer.getvalue(), bounds, meta

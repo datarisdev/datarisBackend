@@ -11,7 +11,8 @@ import logging
 from typing import Any, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
@@ -83,6 +84,40 @@ def map_layer(
     except Exception as exc:  # noqa: BLE001
         raise _handle_eos_errors(exc) from exc
     return {"data": result}
+
+
+class PrefetchRequest(BaseModel):
+    parcel_ids: list[str]
+    index: Optional[str] = "NDVI"
+    date: Optional[str] = None
+
+
+@router.post("/parcels/prefetch")
+def prefetch(
+    body: PrefetchRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Calienta en segundo plano la caché de la capa para unos pocos lotes del
+    usuario, para que el siguiente click sea casi instantáneo. Acotado para no
+    saturar el límite de EOS."""
+    target_date = _parse_target_date(body.date)
+    parcels: list[tuple[str, Any]] = []
+    for pid in (body.parcel_ids or [])[:12]:
+        try:
+            parcel = _get_owned_parcel(db, pid, current_user)
+        except HTTPException:
+            continue  # lote inexistente o de otro usuario: se ignora
+        parcels.append((str(parcel.get("id") or pid), parcel.get("geometry")))
+    if parcels:
+        background_tasks.add_task(
+            eos_service.prefetch_map_layers,
+            parcels,
+            index=body.index,
+            target_date=target_date,
+        )
+    return {"data": {"queued": len(parcels)}}
 
 
 @router.get("/parcels/{parcel_id}/statistics")
