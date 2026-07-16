@@ -177,6 +177,14 @@ class Settings(BaseSettings):
     # intentan: cada intento consume tiles del cupo de render, así que probar
     # las 30 escenas ante un fallo por rate-limit solo empeoraría la saturación.
     EOS_RENDER_SCENE_FALLBACK_LIMIT: int = 3
+    # Mosaico multi-escena/multi-fecha: cuántas escenas candidatas (ordenadas de
+    # mejor a peor: fecha más cercana/reciente y menos nubes) se pasan al render.
+    # Cada tile toma la PRIMERA escena con datos, de modo que un lote que cruza el
+    # borde de dos granules o cuya mejor fecha solo cubre una parte se rellene
+    # COMPLETO con las demás. La escena principal domina; las otras solo rellenan
+    # huecos (no cuestan peticiones extra en los tiles ya cubiertos). Se acota
+    # para no disparar el límite ~10 req/min de EOS en el primer render.
+    EOS_MOSAIC_MAX_SCENES: int = 10
 
     model_config = {
         "env_file": ".env",

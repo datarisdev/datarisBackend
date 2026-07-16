@@ -277,96 +277,90 @@ def build_map_layer(
     bbox = _polygon_bbox(render_shape)
     normalized_scenes = [_normalize_scene(s) for s in scenes[:scenes_limit] if s.get("view_id")]
 
-    # Un lote grande puede cruzar el borde de dos escenas Sentinel-2 (granules)
-    # de la MISMA fecha (p. ej. .../P/XS y .../P/XR): cada granule solo cubre una
-    # parte del lote, y renderizar una sola dejaba media parcela sin NDVI (la
-    # "línea diagonal"). Se agrupan las escenas por fecha para renderizar juntas
-    # todas las de una fecha y cubrir el lote completo.
-    scenes_by_date: dict[str, list[dict[str, Any]]] = {}
-    date_priority: list[str] = []
+    # Mosaico multi-escena / multi-fecha para cubrir el lote COMPLETO:
+    # un lote puede cruzar el borde de dos granules Sentinel-2 y/o su fecha más
+    # reciente tener datos válidos solo en una parte (la otra parte quedaba vacía
+    # = "un pedazo"). Se pasa al render una lista de escenas ordenada de mejor a
+    # peor (fecha más cercana/reciente); cada tile toma la PRIMERA escena que
+    # tenga datos, así se rellena todo el lote. La mejor escena domina; las demás
+    # solo rellenan huecos (no cuestan peticiones en tiles ya cubiertos). Se
+    # acota el número de escenas para no disparar el cupo de EOS en el 1er render.
+    view_ids: list[str] = []
+    seen_ids: set[str] = set()
     for scene in ordered:
-        if not scene.get("view_id"):
+        vid = scene.get("view_id")
+        if not vid or vid in seen_ids:
             continue
-        day = str(scene.get("date") or "")[:10]
-        if not day:
-            continue
-        if day not in scenes_by_date:
-            scenes_by_date[day] = []
-            date_priority.append(day)
-        scenes_by_date[day].append(scene)
-
-    # EOS a veces cataloga una escena como disponible en la búsqueda antes de que
-    # sus tiles de render terminen de procesarse (más común en escenas muy
-    # recientes). Si la mejor FECHA falla al renderizar, se intenta con la
-    # siguiente. El número de intentos se acota (EOS_RENDER_SCENE_FALLBACK_LIMIT)
-    # porque cada intento consume tiles del mismo cupo de render de EOS.
-    last_error: str | None = None
-    attempts = 0
-    for day in date_priority:
-        if attempts >= settings.EOS_RENDER_SCENE_FALLBACK_LIMIT:
+        seen_ids.add(vid)
+        view_ids.append(vid)
+        if len(view_ids) >= settings.EOS_MOSAIC_MAX_SCENES:
             break
-        attempts += 1
-        day_scenes = scenes_by_date[day]
-        view_ids = [s["view_id"] for s in day_scenes if s.get("view_id")]
-        chosen = day_scenes[0]  # representativa de la fecha (para metadatos)
-        try:
-            png_bytes, bounds, meta = eos_render.render_clipped_index_png(
-                view_ids=view_ids,
-                band=band,
-                geometry=render_shape,
-                bbox=bbox,
-            )
-        except EOSApiError as exc:
-            last_error = str(exc)
-            # Un 429 es un límite global de la API key: probar otra fecha solo
-            # consumiría más cupo sin resolver nada. Se corta y se pide reintentar.
-            if getattr(exc, "status_code", None) == 429:
-                return {
-                    "available": False,
-                    "reason": (
-                        "El proveedor satelital está momentáneamente saturado "
-                        "(límite de solicitudes). Vuelve a intentarlo en un minuto."
-                    ),
-                    "index": index_key,
-                    "scenes": normalized_scenes,
-                    "debug_last_error": last_error,
-                }
-            logger.warning("EOS: fecha %s (%s escenas) no se pudo renderizar, probando la siguiente: %s", day, len(view_ids), exc)
-            continue
 
-        image_url = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
-        notice = _render_notice(meta)
+    if not view_ids:
         return {
-            "available": True,
+            "available": False,
+            "reason": "No hay imágenes satelitales disponibles para el rango solicitado.",
             "index": index_key,
-            "band": band,
-            "date": chosen.get("date"),
-            "cloud": chosen.get("cloudCoverage"),
-            "scene_id": chosen.get("sceneID"),
-            "view_id": view_ids[0],
-            "view_ids": view_ids,
-            "image_url": image_url,
-            "bounds": bounds,
-            "render": meta,
             "scenes": normalized_scenes,
-            # Vista reducida (lote grande) y/o parcial (faltaron tiles por el
-            # límite de EOS). El frontend muestra este aviso sin bloquear la imagen.
-            "coarse": bool(meta.get("degraded")),
-            "partial": bool(meta.get("partial")),
-            "resolution_m": meta.get("approx_m_per_px"),
-            "notice": notice,
         }
 
+    primary = ordered[0]  # escena principal (mejor fecha) para los metadatos
+    try:
+        png_bytes, bounds, meta = eos_render.render_clipped_index_png(
+            view_ids=view_ids,
+            band=band,
+            geometry=render_shape,
+            bbox=bbox,
+        )
+    except EOSApiError as exc:
+        # Un 429 es un límite global de la API key: reintentar más solo consumiría
+        # más cupo. Se corta y se pide reintentar en un minuto.
+        if getattr(exc, "status_code", None) == 429:
+            return {
+                "available": False,
+                "reason": (
+                    "El proveedor satelital está momentáneamente saturado "
+                    "(límite de solicitudes). Vuelve a intentarlo en un minuto."
+                ),
+                "index": index_key,
+                "scenes": normalized_scenes,
+                "debug_last_error": str(exc),
+            }
+        # Ninguna escena tenía tiles/datos disponibles (p. ej. aún sin procesar).
+        logger.warning("EOS: no se pudo renderizar el mosaico (%s escenas): %s", len(view_ids), exc)
+        return {
+            "available": False,
+            "reason": (
+                "Las escenas satelitales más recientes de este lote todavía no tienen imagen "
+                "procesada disponible. Suele resolverse en poco tiempo; intenta de nuevo o elige "
+                "una fecha anterior."
+            ),
+            "index": index_key,
+            "scenes": normalized_scenes,
+            "debug_last_error": str(exc),
+        }
+
+    image_url = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
+    notice = _render_notice(meta)
     return {
-        "available": False,
-        "reason": (
-            "Las escenas satelitales más recientes de este lote todavía no tienen imagen "
-            "procesada disponible. Suele resolverse en poco tiempo; intenta de nuevo o elige "
-            "una fecha anterior."
-        ),
+        "available": True,
         "index": index_key,
+        "band": band,
+        "date": primary.get("date"),
+        "cloud": primary.get("cloudCoverage"),
+        "scene_id": primary.get("sceneID"),
+        "view_id": view_ids[0],
+        "view_ids": view_ids,
+        "image_url": image_url,
+        "bounds": bounds,
+        "render": meta,
         "scenes": normalized_scenes,
-        "debug_last_error": last_error,
+        # Vista reducida (lote grande) y/o parcial (faltaron tiles por el
+        # límite de EOS). El frontend muestra este aviso sin bloquear la imagen.
+        "coarse": bool(meta.get("degraded")),
+        "partial": bool(meta.get("partial")),
+        "resolution_m": meta.get("approx_m_per_px"),
+        "notice": notice,
     }
 
 
