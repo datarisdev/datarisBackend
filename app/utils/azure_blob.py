@@ -13,12 +13,27 @@ connection string is required.
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from typing import BinaryIO, Iterable
 from urllib.parse import urlparse
+
+
+# El SDK de Azure vuelca cada request/response HTTP (URL, headers, y el
+# 'x-ms-error-code: BlobNotFound' de cada cache-miss) al log. Con la caché de
+# render EOS eso genera ruido constante y dispara alertas por "errores" que en
+# realidad son cache-miss esperados. Se sube el nivel de esos loggers para que
+# solo emitan problemas reales; nuestro código ya loguea sus propios warnings.
+for _noisy in (
+    "azure.core.pipeline.policies.http_logging_policy",
+    "azure.storage",
+    "azure.storage.blob",
+    "azure.identity",
+):
+    logging.getLogger(_noisy).setLevel(logging.ERROR)
 
 
 _TRUE_VALUES = {"1", "true", "yes", "y", "on"}

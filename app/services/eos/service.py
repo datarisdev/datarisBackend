@@ -162,13 +162,18 @@ def list_scenes(
         default_from, default_to = _default_date_range(None)
         date_from = date_from or default_from
         date_to = date_to or default_to
-    results = client.search_scenes(
-        geometry=polygon,
-        date_from=date_from,
-        date_to=date_to,
-        cloud_max=float(cloud_max if cloud_max is not None else settings.EOS_MAX_CLOUD),
-        limit=limit,
-    )
+    # Un fallo de EOS en la búsqueda no debe dar 502: se devuelve lista vacía.
+    try:
+        results = client.search_scenes(
+            geometry=polygon,
+            date_from=date_from,
+            date_to=date_to,
+            cloud_max=float(cloud_max if cloud_max is not None else settings.EOS_MAX_CLOUD),
+            limit=limit,
+        )
+    except EOSApiError as exc:
+        logger.warning("EOS: fallo listando escenas: %s", exc)
+        return []
     return [_normalize_scene(r) for r in results if r.get("view_id")]
 
 
@@ -249,13 +254,22 @@ def build_map_layer(
     else:
         window_from, window_to = _default_date_range(None)
 
-    scenes = client.search_scenes(
-        geometry=search_shape,
-        date_from=window_from,
-        date_to=window_to,
-        cloud_max=cloud,
-        limit=max(scenes_limit, 30),
-    )
+    # Un fallo de EOS en la búsqueda no debe dar 502: se degrada a "no disponible".
+    try:
+        scenes = client.search_scenes(
+            geometry=search_shape,
+            date_from=window_from,
+            date_to=window_to,
+            cloud_max=cloud,
+            limit=max(scenes_limit, 30),
+        )
+    except EOSApiError as exc:
+        logger.warning("EOS: fallo buscando escenas para el mapa: %s", exc)
+        return {
+            "available": False,
+            "reason": "El proveedor satelital no respondió a la búsqueda de imágenes. Intenta de nuevo en un minuto.",
+            "index": index_key,
+        }
     if not scenes:
         return {
             "available": False,
@@ -417,19 +431,33 @@ def statistics_series(
         date_start = date_start or default_start
         date_end = date_end or default_end
 
-    created = client.create_stats_task(
-        geometry=polygon,
-        date_start=date_start,
-        date_end=date_end,
-        indices=wanted,
-    )
+    # Un error de EOS (p. ej. un 4xx/5xx transitorio) NO debe convertirse en un
+    # 502 de nuestra API (dispara alertas por correo): las estadísticas se
+    # degradan a un estado limpio y el frontend puede reintentar.
+    try:
+        created = client.create_stats_task(
+            geometry=polygon,
+            date_start=date_start,
+            date_end=date_end,
+            indices=wanted,
+        )
+    except EOSApiError as exc:
+        logger.warning("EOS stats: no se pudo crear la tarea: %s", exc)
+        return {"status": "error", "reason": "No se pudieron calcular las estadísticas satelitales en este momento. Intenta de nuevo en un minuto.", "series": [], "indices": wanted}
+
     task_id = created.get("task_id")
     if not task_id:
         return {"status": "error", "reason": "EOS no devolvió un identificador de tarea.", "series": []}
 
     for _ in range(settings.EOS_STATS_MAX_POLLS):
         sleep(settings.EOS_STATS_POLL_SECONDS)
-        payload = client.get_stats_task(task_id)
+        try:
+            payload = client.get_stats_task(task_id)
+        except EOSApiError as exc:
+            # Hipo transitorio de EOS durante el procesamiento: se reintenta el
+            # siguiente ciclo en vez de fallar la petición completa.
+            logger.warning("EOS stats: fallo consultando la tarea %s (se reintenta): %s", task_id, exc)
+            continue
         has_result = isinstance(payload.get("result"), list)
         status_value = str(payload.get("status") or "").lower()
         if has_result or status_value in {"finished", "completed", "done"}:
@@ -446,7 +474,11 @@ def statistics_series(
 
 
 def statistics_by_task(task_id: str) -> dict[str, Any]:
-    payload = client.get_stats_task(task_id)
+    try:
+        payload = client.get_stats_task(task_id)
+    except EOSApiError as exc:
+        logger.warning("EOS stats: fallo consultando la tarea %s: %s", task_id, exc)
+        return {"status": "processing", "task_id": task_id, "series": []}
     has_result = isinstance(payload.get("result"), list)
     if not has_result:
         return {"status": "processing", "task_id": task_id, "series": []}
