@@ -141,6 +141,19 @@ class Settings(BaseSettings):
     # Map-layer rendering: stitch XYZ render tiles over the parcel bbox.
     EOS_RENDER_MAX_TILES: int = 80
     EOS_RENDER_TARGET_PX: int = 1024
+    # EOS limita el endpoint de render a ~10 solicitudes/minuto compartidas por
+    # toda la app. Una capa se arma pegando varios tiles, así que el número de
+    # tiles por render debe caber holgadamente en ese cupo o el render tarda
+    # minutos y termina en 429 ("proveedor saturado"). Este presupuesto es el
+    # tope efectivo de tiles por capa: para un lote grande se elige un zoom más
+    # bajo (menos detalle) de modo que TODO el lote quepa en estos tiles y
+    # cargue en segundos, en vez de intentar decenas de tiles y saturar la API.
+    # EOS_RENDER_MAX_TILES sigue siendo el techo absoluto de seguridad.
+    EOS_RENDER_TILE_BUDGET: int = 9
+    # Resolución nativa aproximada de Sentinel-2 (~10 m/píxel). Solo por encima
+    # de este umbral la vista se considera "reducida" (lote grande) y se avisa al
+    # usuario; por debajo el detalle es full aunque se limiten los tiles.
+    EOS_RENDER_NATIVE_M_PER_PX: float = 12.0
     # EOS limita el render a ~10 req/min compartidas por toda la app. Cachear
     # el PNG final en memoria de proceso evita repetir tiles cuando varias
     # pantallas (Satélite, Comparación, Gráficos, Zonificación) piden la misma
