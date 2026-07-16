@@ -141,6 +141,16 @@ class Settings(BaseSettings):
     # Map-layer rendering: stitch XYZ render tiles over the parcel bbox.
     EOS_RENDER_MAX_TILES: int = 80
     EOS_RENDER_TARGET_PX: int = 1024
+    # EOS limita el render a ~10 req/min compartidas por toda la app. Cachear
+    # el PNG final en memoria de proceso evita repetir tiles cuando varias
+    # pantallas (Satélite, Comparación, Gráficos, Zonificación) piden la misma
+    # escena/índice/lote casi al mismo tiempo.
+    EOS_RENDER_CACHE_TTL_SECONDS: int = 6 * 60 * 60
+    # Si la mejor escena no se puede renderizar (p. ej. sus tiles aún no están
+    # procesados), se prueba con la siguiente. Se acota cuántas escenas se
+    # intentan: cada intento consume tiles del cupo de render, así que probar
+    # las 30 escenas ante un fallo por rate-limit solo empeoraría la saturación.
+    EOS_RENDER_SCENE_FALLBACK_LIMIT: int = 3
 
     model_config = {
         "env_file": ".env",
