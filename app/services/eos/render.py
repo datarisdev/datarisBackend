@@ -51,21 +51,52 @@ def _polygon_rings(geometry: dict[str, Any]) -> list[tuple[list, list]]:
     return []
 
 
-def _choose_zoom(bbox: tuple[float, float, float, float], target_px: int, max_tiles: int) -> int:
+MIN_ZOOM = 7
+MAX_ZOOM = 18
+
+
+def _tiles_at_zoom(bbox: tuple[float, float, float, float], zoom: int) -> tuple[int, float]:
+    """Return (tile_count, longest_side_px) for ``bbox`` at ``zoom``."""
     minx, miny, maxx, maxy = bbox
-    for zoom in range(18, 6, -1):
-        left, top = lonlat_to_world_pixel(minx, maxy, zoom)
-        right, bottom = lonlat_to_world_pixel(maxx, miny, zoom)
-        width = abs(right - left)
-        height = abs(bottom - top)
-        if max(width, height) > target_px * 1.6:
-            continue
-        tx0, tx1 = int(left // TILE_SIZE), int((right - 1e-9) // TILE_SIZE)
-        ty0, ty1 = int(top // TILE_SIZE), int((bottom - 1e-9) // TILE_SIZE)
-        n_tiles = (abs(tx1 - tx0) + 1) * (abs(ty1 - ty0) + 1)
-        if n_tiles <= max_tiles:
-            return zoom
-    return 12
+    left, top = lonlat_to_world_pixel(minx, maxy, zoom)
+    right, bottom = lonlat_to_world_pixel(maxx, miny, zoom)
+    width = abs(right - left)
+    height = abs(bottom - top)
+    tx0, tx1 = int(left // TILE_SIZE), int((right - 1e-9) // TILE_SIZE)
+    ty0, ty1 = int(top // TILE_SIZE), int((bottom - 1e-9) // TILE_SIZE)
+    n_tiles = (abs(tx1 - tx0) + 1) * (abs(ty1 - ty0) + 1)
+    return n_tiles, max(width, height)
+
+
+def _choose_zoom(
+    bbox: tuple[float, float, float, float],
+    target_px: int,
+    tile_budget: int,
+    max_tiles: int,
+) -> int:
+    """Pick the finest zoom that renders the WHOLE parcel within the tile budget.
+
+    EOS throttles the render endpoint to ~10 req/min shared across the app, so a
+    large parcel rendered at full zoom needs dozens of tiles: it either takes
+    minutes or trips the rate limit and fails with "proveedor saturado". Both
+    tile count and canvas pixels grow monotonically with zoom, so the valid zooms
+    form a contiguous low range; we return the highest zoom whose tile grid still
+    fits ``tile_budget`` and whose canvas stays within the detail cap
+    (``target_px``). For a big parcel that means a deliberately coarser zoom: the
+    whole field is shown at lower resolution and loads in seconds.
+    """
+    budget = max(1, min(int(tile_budget), int(max_tiles)))
+
+    chosen = MIN_ZOOM
+    for zoom in range(MIN_ZOOM, MAX_ZOOM + 1):
+        n_tiles, longest_px = _tiles_at_zoom(bbox, zoom)
+        if n_tiles <= budget and longest_px <= target_px * 1.6:
+            chosen = zoom
+        else:
+            # Higher zooms only need more tiles / more pixels (monotonic): stop.
+            break
+
+    return chosen
 
 
 
@@ -118,7 +149,19 @@ def _render_clipped_index_png_uncached(
     bbox: tuple[float, float, float, float],
 ) -> tuple[bytes, dict[str, float], dict[str, Any]]:
     minx, miny, maxx, maxy = bbox
-    zoom = _choose_zoom(bbox, settings.EOS_RENDER_TARGET_PX, settings.EOS_RENDER_MAX_TILES)
+    zoom = _choose_zoom(
+        bbox,
+        settings.EOS_RENDER_TARGET_PX,
+        settings.EOS_RENDER_TILE_BUDGET,
+        settings.EOS_RENDER_MAX_TILES,
+    )
+    # Resolución aproximada en el suelo (m/píxel) en Web-Mercator a la latitud
+    # media del lote. Solo cuando supera la resolución nativa de Sentinel-2
+    # (~10 m) la vista es realmente un resumen a menor detalle (lote grande);
+    # por debajo el detalle es full aunque se limiten los tiles.
+    mid_lat = (miny + maxy) / 2.0
+    approx_m_per_px = 156543.03392 * math.cos(math.radians(mid_lat)) / (2 ** zoom)
+    degraded = approx_m_per_px > settings.EOS_RENDER_NATIVE_M_PER_PX
 
     left, top = lonlat_to_world_pixel(minx, maxy, zoom)      # west/north corner
     right, bottom = lonlat_to_world_pixel(maxx, miny, zoom)  # east/south corner
@@ -213,5 +256,13 @@ def _render_clipped_index_png_uncached(
         "tiles_rendered": fetched,
         "size": list(out.size),
         "rate_limited": rate_limited,
+        # Vista reducida a propósito (lote grande): se muestra el campo completo
+        # a menor resolución para caber en el cupo de tiles de EOS.
+        "degraded": degraded,
+        "approx_m_per_px": round(approx_m_per_px, 1),
+        "tile_budget": settings.EOS_RENDER_TILE_BUDGET,
+        # Parcial = faltan tiles por el límite de solicitudes (no por bordes sin
+        # datos, que son transparentes de forma legítima).
+        "partial": bool(rate_limited),
     }
     return buffer.getvalue(), bounds, meta
