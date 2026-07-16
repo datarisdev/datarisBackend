@@ -81,6 +81,42 @@ def geometry_to_polygon(raw_geometry: Any) -> Optional[dict[str, Any]]:
     return mapping(geom)
 
 
+def geometry_to_render_shape(raw_geometry: Any) -> Optional[dict[str, Any]]:
+    """Full parcel geometry as a single GeoJSON Polygon/MultiPolygon (ALL parts).
+
+    La geometría de un lote es un FeatureCollection que puede tener varias partes
+    (p. ej. un lote con 99 polígonos). geometry_to_polygon se quedaba solo con el
+    polígono MÁS GRANDE, así que el render dejaba el resto del lote sin NDVI
+    (cargaba "solo un pedazo"). Esta versión conserva todas las partes; el mask
+    del render (_polygon_rings) ya sabe dibujar Polygon y MultiPolygon, y el bbox
+    se calcula sobre la extensión completa.
+    """
+    geom = _extract_shapely(raw_geometry)
+    if geom is None or geom.is_empty:
+        return None
+    if geom.geom_type not in ("Polygon", "MultiPolygon"):
+        geom = geom.convex_hull
+    if geom.is_empty or geom.geom_type not in ("Polygon", "MultiPolygon"):
+        return None
+    return mapping(geom)
+
+
+def geometry_search_hull(raw_geometry: Any) -> Optional[dict[str, Any]]:
+    """Single Polygon (convex hull) que cubre TODAS las partes del lote.
+
+    Para la búsqueda de escenas: garantiza encontrar las escenas que intersecan
+    cualquier parte de un lote disperso, sin depender de que EOS acepte un
+    MultiPolygon en el shape de búsqueda.
+    """
+    geom = _extract_shapely(raw_geometry)
+    if geom is None or geom.is_empty:
+        return None
+    hull = geom.convex_hull
+    if hull.geom_type != "Polygon" or hull.is_empty:
+        return None
+    return mapping(hull)
+
+
 def _polygon_bbox(polygon: dict[str, Any]) -> tuple[float, float, float, float]:
     return shape(polygon).bounds  # (minx, miny, maxx, maxy)
 
@@ -117,7 +153,9 @@ def list_scenes(
     cloud_max: Optional[float] = None,
     limit: int = 60,
 ) -> list[dict[str, Any]]:
-    polygon = geometry_to_polygon(raw_geometry)
+    # Hull que cubre TODAS las partes del lote: así las fechas listadas incluyen
+    # escenas de cualquier zona de un lote multi-parte, no solo la más grande.
+    polygon = geometry_search_hull(raw_geometry)
     if polygon is None:
         return []
     if not date_from or not date_to:
@@ -167,9 +205,13 @@ def build_map_layer(
     index_key = _normalize_index(index)
     band = RENDER_BANDS[index_key]
 
-    polygon = geometry_to_polygon(raw_geometry)
-    if polygon is None:
+    # render_shape conserva TODAS las partes del lote (para bbox + máscara);
+    # search_shape es un solo polígono (hull) que cubre todas las partes para
+    # que la búsqueda encuentre las escenas de cualquier zona del lote.
+    render_shape = geometry_to_render_shape(raw_geometry)
+    if render_shape is None:
         return {"available": False, "reason": "El lote no tiene una geometría válida.", "index": index_key}
+    search_shape = geometry_search_hull(raw_geometry) or render_shape
 
     cloud = float(cloud_max if cloud_max is not None else settings.EOS_MAX_CLOUD)
     if target_date is not None:
@@ -180,7 +222,7 @@ def build_map_layer(
         window_from, window_to = _default_date_range(None)
 
     scenes = client.search_scenes(
-        geometry=polygon,
+        geometry=search_shape,
         date_from=window_from,
         date_to=window_to,
         cloud_max=cloud,
@@ -204,7 +246,7 @@ def build_map_layer(
     else:
         ordered = scenes  # ya vienen ordenadas por fecha desc (más reciente primero)
 
-    bbox = _polygon_bbox(polygon)
+    bbox = _polygon_bbox(render_shape)
     normalized_scenes = [_normalize_scene(s) for s in scenes[:scenes_limit] if s.get("view_id")]
 
     # Un lote grande puede cruzar el borde de dos escenas Sentinel-2 (granules)
@@ -243,7 +285,7 @@ def build_map_layer(
             png_bytes, bounds, meta = eos_render.render_clipped_index_png(
                 view_ids=view_ids,
                 band=band,
-                geometry=polygon,
+                geometry=render_shape,
                 bbox=bbox,
             )
         except EOSApiError as exc:
@@ -340,7 +382,8 @@ def statistics_series(
     date_start: Optional[str] = None,
     date_end: Optional[str] = None,
 ) -> dict[str, Any]:
-    polygon = geometry_to_polygon(raw_geometry)
+    # Estadísticas sobre TODAS las partes del lote (no solo el polígono mayor).
+    polygon = geometry_to_render_shape(raw_geometry)
     if polygon is None:
         return {"status": "error", "reason": "El lote no tiene una geometría válida.", "series": []}
 
