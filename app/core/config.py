@@ -154,6 +154,12 @@ class Settings(BaseSettings):
     # de este umbral la vista se considera "reducida" (lote grande) y se avisa al
     # usuario; por debajo el detalle es full aunque se limiten los tiles.
     EOS_RENDER_NATIVE_M_PER_PX: float = 12.0
+    # Zoom máximo que soporta el endpoint de render de EOS (Sentinel-2). Pedir un
+    # zoom mayor devuelve HTTP 422 "Max zoom exceed"; como el fallo de todos los
+    # tiles se acaba enmascarando como "proveedor saturado", este tope evita que
+    # los lotes PEQUEÑOS (que de otro modo pedirían z17/z18) fallen siempre.
+    # Verificado empíricamente contra la API: z16 responde 200, z17 da 422.
+    EOS_RENDER_MAX_ZOOM: int = 16
     # EOS limita el render a ~10 req/min compartidas por toda la app. Cachear
     # el PNG final en memoria de proceso evita repetir tiles cuando varias
     # pantallas (Satélite, Comparación, Gráficos, Zonificación) piden la misma

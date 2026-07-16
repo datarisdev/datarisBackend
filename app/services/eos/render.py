@@ -52,7 +52,10 @@ def _polygon_rings(geometry: dict[str, Any]) -> list[tuple[list, list]]:
 
 
 MIN_ZOOM = 7
-MAX_ZOOM = 18
+# Techo absoluto de seguridad. El máximo REAL soportado por el render de EOS
+# (Sentinel-2) es 16: pedir z>16 devuelve HTTP 422 "Max zoom exceed". El tope
+# efectivo se controla con settings.EOS_RENDER_MAX_ZOOM.
+MAX_ZOOM = 16
 
 
 def _tiles_at_zoom(bbox: tuple[float, float, float, float], zoom: int) -> tuple[int, float]:
@@ -73,6 +76,7 @@ def _choose_zoom(
     target_px: int,
     tile_budget: int,
     max_tiles: int,
+    max_zoom: int = MAX_ZOOM,
 ) -> int:
     """Pick the finest zoom that renders the WHOLE parcel within the tile budget.
 
@@ -84,11 +88,18 @@ def _choose_zoom(
     fits ``tile_budget`` and whose canvas stays within the detail cap
     (``target_px``). For a big parcel that means a deliberately coarser zoom: the
     whole field is shown at lower resolution and loads in seconds.
+
+    ``max_zoom`` es el zoom máximo que soporta el render de EOS (16 para
+    Sentinel-2): pedir uno mayor devuelve 422 "Max zoom exceed", y como el fallo
+    de todos los tiles se acaba enmascarando como "proveedor saturado", NUNCA se
+    debe superar. Para lotes pequeños este tope es el que manda (antes se pedía
+    z17/z18 y fallaba siempre).
     """
     budget = max(1, min(int(tile_budget), int(max_tiles)))
+    ceiling = max(MIN_ZOOM, min(int(max_zoom), MAX_ZOOM))
 
     chosen = MIN_ZOOM
-    for zoom in range(MIN_ZOOM, MAX_ZOOM + 1):
+    for zoom in range(MIN_ZOOM, ceiling + 1):
         n_tiles, longest_px = _tiles_at_zoom(bbox, zoom)
         if n_tiles <= budget and longest_px <= target_px * 1.6:
             chosen = zoom
@@ -154,6 +165,7 @@ def _render_clipped_index_png_uncached(
         settings.EOS_RENDER_TARGET_PX,
         settings.EOS_RENDER_TILE_BUDGET,
         settings.EOS_RENDER_MAX_TILES,
+        settings.EOS_RENDER_MAX_ZOOM,
     )
     # Resolución aproximada en el suelo (m/píxel) en Web-Mercator a la latitud
     # media del lote. Solo cuando supera la resolución nativa de Sentinel-2
