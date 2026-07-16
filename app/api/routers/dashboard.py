@@ -387,7 +387,14 @@ def _sort_recent(rows: Iterable[Dict[str, Any]], limit: int = 8) -> List[Dict[st
     return sorted(list(rows), key=key, reverse=True)[:limit]
 
 
-def _activity(kind: str, title: str, when: Any, description: Optional[str] = None, module: Optional[str] = None) -> Dict[str, Any]:
+def _activity(
+    kind: str,
+    title: str,
+    when: Any,
+    description: Optional[str] = None,
+    module: Optional[str] = None,
+    actor: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     return {
         "kind": kind,
         "title": title,
@@ -395,7 +402,53 @@ def _activity(kind: str, title: str, when: Any, description: Optional[str] = Non
         "module": module,
         "created_at": _iso(when),
         "date_label": _date_label(when),
+        # Autor de la acción: permite al Super Admin identificar visualmente
+        # quién hizo qué (foto + nombre) en la línea de tiempo.
+        "actor": actor,
     }
+
+
+def _profile_display_name(row: Dict[str, Any]) -> Optional[str]:
+    first = str(row.get("first_name") or "").strip()
+    last = str(row.get("last_name") or "").strip()
+    name = f"{first} {last}".strip()
+    if name:
+        return name
+    for key in ("full_name", "name", "display_name"):
+        value = str(row.get(key) or "").strip()
+        if value:
+            return value
+    email = str(row.get("email") or "").strip()
+    return email.split("@")[0] if email else None
+
+
+def _profiles_by_user(db: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    result: Dict[str, Dict[str, Any]] = {}
+    for row in table(db, "profiles"):
+        uid = str(row.get("user_id") or row.get("id") or "").strip()
+        if not uid:
+            continue
+        result[uid] = {"id": uid, "name": _profile_display_name(row), "avatar_url": row.get("avatar_url") or None}
+    return result
+
+
+_ACTOR_KEYS = ("user_id", "created_by", "owner_id", "requested_by_user_id")
+
+
+def _resolve_actor(
+    row: Dict[str, Any],
+    profiles_by_user: Dict[str, Dict[str, Any]],
+    default_actor: Dict[str, Any],
+) -> Dict[str, Any]:
+    for key in _ACTOR_KEYS:
+        uid = row.get(key)
+        if uid and str(uid) in profiles_by_user:
+            return profiles_by_user[str(uid)]
+    for key in _ACTOR_KEYS:
+        uid = row.get(key)
+        if uid:
+            return {"id": str(uid), "name": None, "avatar_url": None}
+    return default_actor
 
 
 def _extension_summary(extension_requests: List[Dict[str, Any]], platform_modules: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -665,17 +718,20 @@ def dashboard_summary(force_refresh: bool = False, current_user: Any = Depends(g
             "mapeo_count": len(sessions_by_parcel.get(pid, [])),
         })
 
+    profiles_by_user = _profiles_by_user(db)
+    default_actor = profiles_by_user.get(user_id) or {"id": user_id, "name": None, "avatar_url": None}
+
     activities: List[Dict[str, Any]] = []
     for row in _sort_recent(parcels, 5):
-        activities.append(_activity("parcel", f"Lote cargado: {row.get('name') or row.get('lote') or 'Sin nombre'}", row.get("created_at"), module="lotes"))
+        activities.append(_activity("parcel", f"Lote cargado: {row.get('name') or row.get('lote') or 'Sin nombre'}", row.get("created_at"), module="lotes", actor=_resolve_actor(row, profiles_by_user, default_actor)))
     for row in sorted(satellite_comparisons, key=_row_timestamp, reverse=True)[:5]:
-        activities.append(_activity("satellite", _comparison_title(row), row.get("compared_at") or row.get("created_at"), "Comparación guardada", "satelite"))
+        activities.append(_activity("satellite", _comparison_title(row), row.get("compared_at") or row.get("created_at"), "Comparación guardada", "satelite", actor=_resolve_actor(row, profiles_by_user, default_actor)))
     for row in _sort_recent(aerial_analyses, 5):
-        activities.append(_activity("aerial", f"Análisis aéreo: {_aircraft_type(row)}", row.get("created_at") or row.get("date"), _status(row), "aplicaciones-aereas"))
+        activities.append(_activity("aerial", f"Análisis aéreo: {_aircraft_type(row)}", row.get("created_at") or row.get("date"), _status(row), "aplicaciones-aereas", actor=_resolve_actor(row, profiles_by_user, default_actor)))
     for row in _sort_recent(analysis_sessions, 5):
-        activities.append(_activity("mapping", row.get("name") or row.get("analysis_type") or "Análisis de mapeo", row.get("created_at") or row.get("updated_at"), "Mapeo guardado", "mapeo"))
+        activities.append(_activity("mapping", row.get("name") or row.get("analysis_type") or "Análisis de mapeo", row.get("created_at") or row.get("updated_at"), "Mapeo guardado", "mapeo", actor=_resolve_actor(row, profiles_by_user, default_actor)))
     for row in _sort_recent(field_notes, 5):
-        activities.append(_activity("note", row.get("title") or "Nota de campo registrada", row.get("created_at"), row.get("description"), "campo"))
+        activities.append(_activity("note", row.get("title") or "Nota de campo registrada", row.get("created_at"), row.get("description"), "campo", actor=_resolve_actor(row, profiles_by_user, default_actor)))
     activities = sorted(activities, key=lambda item: _as_datetime(item.get("created_at")) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)[:12]
 
     satellite_last = max(satellite_comparisons, key=_row_timestamp) if satellite_comparisons else None
