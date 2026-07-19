@@ -21,11 +21,13 @@ from PIL import Image, ImageChops, ImageDraw
 from app.core.config import settings
 from app.services.eos import client
 from app.services.eos.client import EOSApiError
+from app.services.eos.visualization import render_params_for_index
 from app.utils import azure_blob
 
 logger = logging.getLogger(__name__)
 
 TILE_SIZE = 256
+RENDER_STYLE_VERSION = "absolute-eos-v2"
 
 
 def lonlat_to_world_pixel(lon: float, lat: float, zoom: int) -> tuple[float, float]:
@@ -122,12 +124,12 @@ _RENDER_CACHE: dict[tuple, tuple[float, bytes, dict[str, float], dict[str, Any]]
 
 
 def _render_cache_key(view_ids: tuple[str, ...], band: str, bbox: tuple[float, float, float, float]) -> tuple:
-    return (view_ids, band, tuple(round(v, 6) for v in bbox))
+    return (RENDER_STYLE_VERSION, view_ids, band, tuple(round(v, 6) for v in bbox))
 
 
 def _blob_object_path(view_ids: list[str], band: str, bbox: tuple[float, float, float, float]) -> str:
     """Ruta estable del PNG cacheado en Blob (hash de escenas+banda+bbox)."""
-    raw = "|".join(view_ids) + "|" + band + "|" + ",".join(f"{v:.6f}" for v in bbox)
+    raw = RENDER_STYLE_VERSION + "|" + "|".join(view_ids) + "|" + band + "|" + ",".join(f"{v:.6f}" for v in bbox)
     digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()
     safe_band = band.replace(",", "-").replace("/", "-")
     return f"eos-render/{safe_band}/{digest}.png"
@@ -210,6 +212,7 @@ def render_clipped_index_png(
                 "zoom": zoom, "approx_m_per_px": mpp, "degraded": degraded,
                 "partial": False, "rate_limited": False,
                 "cache_hit": True, "cache_source": "blob",
+                "render_style_version": RENDER_STYLE_VERSION,
             }
             _RENDER_CACHE[cache_key] = (time.time(), png_bytes, bounds, meta)
             return png_bytes, bounds, meta
@@ -272,6 +275,7 @@ def _render_clipped_index_png_uncached(
     canvas = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
 
     tiles = [(tx, ty) for tx in range(tx0, tx1 + 1) for ty in range(ty0, ty1 + 1)]
+    render_params = render_params_for_index(band)
 
     def _fetch(coord: tuple[int, int]):
         tx, ty = coord
@@ -283,7 +287,7 @@ def _render_clipped_index_png_uncached(
         # (una sola escena) no genera peticiones extra.
         for vid in view_ids:
             try:
-                raw = client.fetch_render_tile(vid, band, zoom, tx, ty)
+                raw = client.fetch_render_tile(vid, band, zoom, tx, ty, render_params=render_params)
             except EOSApiError as exc:
                 # Se registra el motivo real de EOS (cuota/auth/404/etc.); el
                 # fallo de un tile no debe abortar el stitching completo.
@@ -396,5 +400,6 @@ def _render_clipped_index_png_uncached(
         "partial": bool(rate_limited),
         "mask_pixels": mask_pixels,
         "valid_pixels": valid_pixels,
+        "render_style_version": RENDER_STYLE_VERSION,
     }
     return buffer.getvalue(), bounds, meta

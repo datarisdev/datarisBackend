@@ -92,6 +92,37 @@ class PrefetchRequest(BaseModel):
     date: Optional[str] = None
 
 
+class PointValueRequest(BaseModel):
+    index: str
+    lat: float
+    lon: float
+    view_ids: list[str]
+
+
+@router.post("/parcels/{parcel_id}/point-value")
+def point_value(
+    parcel_id: UUID | str,
+    body: PointValueRequest,
+    db: Session = Depends(get_db),
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Return EOSDA's numeric index value at a point inside an owned parcel."""
+    if not -90 <= body.lat <= 90 or not -180 <= body.lon <= 180:
+        raise HTTPException(status_code=422, detail="Coordenadas fuera de rango.")
+    parcel = _get_owned_parcel(db, parcel_id, current_user)
+    try:
+        result = eos_service.point_value(
+            parcel["geometry"],
+            index=body.index,
+            lat=body.lat,
+            lon=body.lon,
+            view_ids=body.view_ids,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise _handle_eos_errors(exc) from exc
+    return {"data": result}
+
+
 @router.post("/parcels/prefetch")
 def prefetch(
     body: PrefetchRequest,
