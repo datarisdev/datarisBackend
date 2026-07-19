@@ -99,19 +99,28 @@ class Settings(BaseSettings):
     # when a deployment has multiple users but a single DigiForms client.
     DIGIFORMS_SYNC_TARGET_USER_ID: str | None = None
 
-    # OpenAI Copiloto de Aplicación Aérea.
-    # OPENAI_API_KEY debe configurarse en producción; si no existe, el backend devuelve
-    # un diagnóstico determinístico local para que la UI siga funcionando.
+    # Azure OpenAI para todos los copilotos. En Azure se usa Managed Identity por
+    # defecto; AZURE_OPENAI_API_KEY solo existe como alternativa de compatibilidad.
+    AZURE_OPENAI_ENDPOINT: str | None = None
+    AZURE_OPENAI_DEPLOYMENT: str | None = None
+    AZURE_OPENAI_CONTEXTUAL_DEPLOYMENT: str | None = None
+    AZURE_OPENAI_AERIAL_DEPLOYMENT: str | None = None
+    AZURE_OPENAI_API_KEY: str | None = None
+    AZURE_OPENAI_TOKEN_SCOPE: str = "https://ai.azure.com/.default"
+    AZURE_OPENAI_IMAGE_DETAIL: str = "original"
+
+    # OpenAI público queda únicamente como fallback de desarrollo. Si ningún
+    # proveedor está configurado, el backend mantiene el diagnóstico local.
     OPENAI_API_KEY: str | None = None
     OPENAI_AERIAL_COPILOT_MODEL: str = "gpt-4.1-mini"
-    OPENAI_AERIAL_COPILOT_MAX_OUTPUT_TOKENS: int = 1400
-    OPENAI_AERIAL_COPILOT_TIMEOUT_SECONDS: int = 25
+    OPENAI_AERIAL_COPILOT_MAX_OUTPUT_TOKENS: int = 2400
+    OPENAI_AERIAL_COPILOT_TIMEOUT_SECONDS: int = 60
 
     # Copiloto contextual global. Analiza la ventana que el usuario está viendo
     # con texto visible, filtros, tablas y un resumen estructurado sin geometrías crudas.
-    OPENAI_CONTEXTUAL_COPILOT_MODEL: str = "gpt-4o-mini"
-    OPENAI_CONTEXTUAL_COPILOT_MAX_OUTPUT_TOKENS: int = 1400
-    OPENAI_CONTEXTUAL_COPILOT_TIMEOUT_SECONDS: int = 35
+    OPENAI_CONTEXTUAL_COPILOT_MODEL: str = "gpt-4.1"
+    OPENAI_CONTEXTUAL_COPILOT_MAX_OUTPUT_TOKENS: int = 3200
+    OPENAI_CONTEXTUAL_COPILOT_TIMEOUT_SECONDS: int = 75
 
     # Módulo de entrenamiento de modelos de visión por computadora (Laboratorio
     # de IA). ML_TRAINING_ENABLED controla si el módulo se expone en la API;
