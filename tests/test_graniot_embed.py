@@ -85,18 +85,45 @@ def test_embed_endpoint_resolves_current_url_without_client_id(monkeypatch):
     )]
 
 
-def test_embed_endpoint_prefers_configured_url_without_calling_graniot(monkeypatch):
+def test_embed_endpoint_prefers_live_url_over_configured(monkeypatch):
+    """A fresh live token must win over a possibly-stale configured URL."""
+    fake_client = _FakeGraniotClient(
+        [{
+            "account_email": "gmateo@ingeoproyectos.com",
+            "embedded_url": "https://embed.graniot.com/?auth_id=fresh-token",
+        }],
+    )
+    monkeypatch.setattr(graniot, "GraniotClient", lambda: fake_client)
+    monkeypatch.setattr(graniot, "bearer_user", lambda authorization: {"id": "user-1"})
+    monkeypatch.setattr(graniot.settings, "GRANIOT_EMBED_ACCOUNT_EMAIL", "gmateo@ingeoproyectos.com")
+    monkeypatch.setattr(
+        graniot.settings,
+        "GRANIOT_EMBED_URL",
+        "https://embed.graniot.com/?auth_id=stale-configured-token",
+    )
+    response = Response()
+
+    result = asyncio.run(graniot.get_embed_url(response=response, authorization="Bearer test"))
+
+    assert result["data"]["embedded_url"].endswith("auth_id=fresh-token")
+    assert response.headers["cache-control"] == "no-store"
+    assert fake_client.calls  # the live lookup was attempted
+
+
+def test_embed_endpoint_falls_back_to_configured_url_when_live_fails(monkeypatch):
+    """When Graniot is unreachable, serve the configured URL instead of erroring."""
+
+    class _BoomClient:
+        async def get(self, path, **kwargs):
+            raise RuntimeError("graniot down")
+
+    monkeypatch.setattr(graniot, "GraniotClient", _BoomClient)
     monkeypatch.setattr(graniot, "bearer_user", lambda authorization: {"id": "user-1"})
     monkeypatch.setattr(graniot.settings, "GRANIOT_EMBED_ACCOUNT_EMAIL", "gmateo@ingeoproyectos.com")
     monkeypatch.setattr(
         graniot.settings,
         "GRANIOT_EMBED_URL",
         "https://embed.graniot.com/?auth_id=configured-token",
-    )
-    monkeypatch.setattr(
-        graniot,
-        "GraniotClient",
-        lambda: pytest.fail("GraniotClient should not be created when an embed URL is configured"),
     )
     response = Response()
 
@@ -107,3 +134,20 @@ def test_embed_endpoint_prefers_configured_url_without_calling_graniot(monkeypat
         "embedded_url": "https://embed.graniot.com/?auth_id=configured-token",
     }
     assert response.headers["cache-control"] == "no-store"
+
+
+def test_embed_endpoint_reraises_when_live_fails_and_no_fallback(monkeypatch):
+    """Without a configured fallback, a live failure must surface as an error."""
+
+    class _BoomClient:
+        async def get(self, path, **kwargs):
+            raise RuntimeError("graniot down")
+
+    monkeypatch.setattr(graniot, "GraniotClient", _BoomClient)
+    monkeypatch.setattr(graniot, "bearer_user", lambda authorization: {"id": "user-1"})
+    monkeypatch.setattr(graniot.settings, "GRANIOT_EMBED_ACCOUNT_EMAIL", "gmateo@ingeoproyectos.com")
+    monkeypatch.setattr(graniot.settings, "GRANIOT_EMBED_URL", None)
+    response = Response()
+
+    with pytest.raises(HTTPException):
+        asyncio.run(graniot.get_embed_url(response=response, authorization="Bearer test"))

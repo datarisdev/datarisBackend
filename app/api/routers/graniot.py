@@ -2514,38 +2514,55 @@ def status():
     }
 
 
+def _configured_embed_account() -> Optional[Dict[str, str]]:
+    """Return the statically configured embed account, if any."""
+    if not settings.GRANIOT_EMBED_URL:
+        return None
+    return _select_embed_account(
+        [{
+            "account_email": settings.GRANIOT_EMBED_ACCOUNT_EMAIL,
+            "embedded_url": settings.GRANIOT_EMBED_URL,
+        }],
+        settings.GRANIOT_EMBED_ACCOUNT_EMAIL,
+    )
+
+
 @router.get("/embed")
 async def get_embed_url(
     response: Response,
     authorization: Optional[str] = Header(default=None),
 ):
-    """Resolve the current dedicated embed URL without exposing API credentials."""
-    _require_user(authorization)
-    if settings.GRANIOT_EMBED_URL:
-        account = _select_embed_account(
-            [{
-                "account_email": settings.GRANIOT_EMBED_ACCOUNT_EMAIL,
-                "embedded_url": settings.GRANIOT_EMBED_URL,
-            }],
-            settings.GRANIOT_EMBED_ACCOUNT_EMAIL,
-        )
-        response.headers["Cache-Control"] = "no-store"
-        return {"data": account, "error": None}
+    """Resolve the current dedicated embed URL without exposing API credentials.
 
-    client = GraniotClient()
+    The Graniot embed link carries a time-limited ``auth_id``; serving a stale
+    one leaves the embedded portal stuck on "loading". To avoid that, always try
+    to resolve a *fresh* URL from Graniot on every request (``Cache-Control:
+    no-store``). A statically configured ``GRANIOT_EMBED_URL`` is used only as a
+    fallback when the live lookup fails, never as a frozen shortcut.
+    """
+    _require_user(authorization)
+    response.headers["Cache-Control"] = "no-store"
+
+    live_error: Optional[Exception] = None
     try:
+        client = GraniotClient()
         raw = await client.get(
             "/api/accounts/",
             include_client_id=False,
             debug_context={"operation": "resolve-embed-url"},
         )
         account = _select_embed_account(raw, settings.GRANIOT_EMBED_ACCOUNT_EMAIL)
-        response.headers["Cache-Control"] = "no-store"
         return {"data": account, "error": None}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        _raise_graniot_error(exc)
+    except Exception as exc:  # noqa: BLE001 — fall back to the configured URL below
+        live_error = exc
+
+    fallback = _configured_embed_account()
+    if fallback is not None:
+        return {"data": fallback, "error": None}
+
+    if isinstance(live_error, HTTPException):
+        raise live_error
+    _raise_graniot_error(live_error)
 
 
 @router.get("/debug/logs")
