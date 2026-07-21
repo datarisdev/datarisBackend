@@ -43,6 +43,17 @@ class Settings(BaseSettings):
     # auth_id in source control or frontend build variables.
     GRANIOT_EMBED_ACCOUNT_EMAIL: str = "gmateo@ingeoproyectos.com"
     GRANIOT_EMBED_URL: str | None = None
+    # The embedded portal (embed.graniot.com) authenticates with a SimpleJWT
+    # *access* token passed as ?auth_id=. That token lives ~3h and Graniot does
+    # NOT refresh the one exposed by /api/accounts/ (it goes stale, leaving the
+    # iframe stuck on "loading"). To always serve a fresh token, the backend
+    # mints one on demand against the embed host's token endpoints. Provide
+    # EITHER a long-lived refresh token OR the embed account's credentials
+    # (ideally a dedicated Graniot service user). Keep these in backend secrets.
+    GRANIOT_EMBED_HOST: str = "embed.graniot.com"
+    GRANIOT_EMBED_USERNAME: str | None = None
+    GRANIOT_EMBED_PASSWORD: str | None = None
+    GRANIOT_EMBED_REFRESH_TOKEN: str | None = None
     # The public ReDoc spec does not declare a security scheme; make it configurable.
     # Common valid values are: X-API-Key, Api-Key, Authorization.
     GRANIOT_AUTH_HEADER: str = "X-API-Key"

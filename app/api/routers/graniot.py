@@ -10,6 +10,7 @@ import uuid
 import asyncio
 import hashlib
 import tempfile
+import httpx
 from pathlib import Path
 from io import BytesIO
 from datetime import datetime, timezone
@@ -398,7 +399,8 @@ def _select_embed_account(payload: Any, target_email: str) -> Dict[str, str]:
     embedded_url = str(account.get("embedded_url") or "").strip()
     parsed = urlparse(embedded_url)
     auth_id = parse_qs(parsed.query).get("auth_id", [])
-    if parsed.scheme != "https" or parsed.hostname != "embed.graniot.com" or not auth_id or not auth_id[0]:
+    expected_host = (settings.GRANIOT_EMBED_HOST or "embed.graniot.com").strip().lower()
+    if parsed.scheme != "https" or (parsed.hostname or "").lower() != expected_host or not auth_id or not auth_id[0]:
         raise HTTPException(status_code=502, detail="Graniot devolvió un enlace embebido inválido")
 
     return {
@@ -2527,6 +2529,86 @@ def _configured_embed_account() -> Optional[Dict[str, str]]:
     )
 
 
+def _embed_minting_configured() -> bool:
+    """True when the backend can mint a fresh embed access token itself."""
+    return bool(
+        (settings.GRANIOT_EMBED_USERNAME and settings.GRANIOT_EMBED_PASSWORD)
+        or settings.GRANIOT_EMBED_REFRESH_TOKEN
+    )
+
+
+def _build_embed_url(access_token: str) -> str:
+    host = (settings.GRANIOT_EMBED_HOST or "embed.graniot.com").strip()
+    return f"https://{host}/?{urlencode({'auth_id': access_token})}"
+
+
+def _embed_token_looks_expired(access_token: str, *, skew_seconds: int = 30) -> bool:
+    """Best-effort: decode a SimpleJWT access token and check it isn't expired."""
+    try:
+        payload_b64 = access_token.split(".")[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        exp = payload.get("exp")
+        if not isinstance(exp, (int, float)):
+            return False
+        return exp <= time_module.time() + skew_seconds
+    except Exception:
+        return False
+
+
+async def _mint_embed_access_token() -> str:
+    """Mint a fresh embed access token from the SimpleJWT auth host.
+
+    ``embed.graniot.com`` authenticates the portal with a ~3h SimpleJWT *access*
+    token passed as ``?auth_id=``. Graniot does not refresh the token exposed by
+    ``/api/accounts/`` (it goes stale → iframe stuck on "loading"). So we mint a
+    fresh one on demand: prefer the embed-account credentials (never expire),
+    otherwise use a configured refresh token. Raises ``HTTPException(502)`` on
+    failure so the caller surfaces a clean error instead of a stale token.
+
+    Credentials/tokens are never included in error messages or logs.
+    """
+    host = (settings.GRANIOT_EMBED_HOST or "embed.graniot.com").strip()
+    base = f"https://{host}"
+    timeout = float(settings.GRANIOT_TIMEOUT_SECONDS or 30)
+
+    if settings.GRANIOT_EMBED_USERNAME and settings.GRANIOT_EMBED_PASSWORD:
+        endpoint = f"{base}/api/token/"
+        payload = {
+            "username": settings.GRANIOT_EMBED_USERNAME,
+            "password": settings.GRANIOT_EMBED_PASSWORD,
+        }
+        mode = "login"
+    else:
+        endpoint = f"{base}/api/token/refresh/"
+        payload = {"refresh": settings.GRANIOT_EMBED_REFRESH_TOKEN}
+        mode = "refresh"
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(endpoint, json=payload, headers={"Accept": "application/json"})
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=502,
+            detail=f"No se pudo contactar al portal Graniot para renovar el acceso ({mode})",
+        ) from exc
+
+    if resp.status_code != 200:
+        # Never echo the response body: it may reflect the submitted credentials.
+        raise HTTPException(
+            status_code=502,
+            detail=f"Graniot rechazó la renovación del acceso al portal (HTTP {resp.status_code}, {mode})",
+        )
+
+    try:
+        access = str((resp.json() or {}).get("access") or "").strip()
+    except Exception:
+        access = ""
+    if not access or _embed_token_looks_expired(access):
+        raise HTTPException(status_code=502, detail="Graniot no devolvió un token de portal válido")
+    return access
+
+
 @router.get("/embed")
 async def get_embed_url(
     response: Response,
@@ -2535,13 +2617,27 @@ async def get_embed_url(
     """Resolve the current dedicated embed URL without exposing API credentials.
 
     The Graniot embed link carries a time-limited ``auth_id``; serving a stale
-    one leaves the embedded portal stuck on "loading". To avoid that, always try
-    to resolve a *fresh* URL from Graniot on every request (``Cache-Control:
-    no-store``). A statically configured ``GRANIOT_EMBED_URL`` is used only as a
-    fallback when the live lookup fails, never as a frozen shortcut.
+    one leaves the embedded portal stuck on "loading" (``/api/accounts/`` does
+    not refresh it). Order of preference (``Cache-Control: no-store``):
+
+    1. If embed credentials/refresh token are configured, **mint a fresh access
+       token** on demand — this always yields a valid ``auth_id``.
+    2. Otherwise, fall back to the URL Graniot exposes via ``/api/accounts/``
+       (may already be expired), then to a statically configured URL.
     """
     _require_user(authorization)
     response.headers["Cache-Control"] = "no-store"
+
+    if _embed_minting_configured():
+        access = await _mint_embed_access_token()
+        account = _select_embed_account(
+            [{
+                "account_email": settings.GRANIOT_EMBED_ACCOUNT_EMAIL,
+                "embedded_url": _build_embed_url(access),
+            }],
+            settings.GRANIOT_EMBED_ACCOUNT_EMAIL,
+        )
+        return {"data": account, "error": None}
 
     live_error: Optional[Exception] = None
     try:
