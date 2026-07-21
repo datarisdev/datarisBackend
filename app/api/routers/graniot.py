@@ -374,6 +374,39 @@ def _items(payload: Any) -> List[Dict[str, Any]]:
     return []
 
 
+def _select_embed_account(payload: Any, target_email: str) -> Dict[str, str]:
+    """Select and validate the dedicated Graniot embed account.
+
+    Only the minimum fields needed by the browser are returned. In particular,
+    ``account_access`` and the backend API key never leave the backend.
+    """
+    normalized_target = str(target_email or "").strip().lower()
+    account = next(
+        (
+            item
+            for item in _items(payload)
+            if str(item.get("account_email") or "").strip().lower() == normalized_target
+        ),
+        None,
+    )
+    if not account:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No se encontró la cuenta Graniot configurada ({target_email})",
+        )
+
+    embedded_url = str(account.get("embedded_url") or "").strip()
+    parsed = urlparse(embedded_url)
+    auth_id = parse_qs(parsed.query).get("auth_id", [])
+    if parsed.scheme != "https" or parsed.hostname != "embed.graniot.com" or not auth_id or not auth_id[0]:
+        raise HTTPException(status_code=502, detail="Graniot devolvió un enlace embebido inválido")
+
+    return {
+        "account_email": str(account.get("account_email") or target_email),
+        "embedded_url": embedded_url,
+    }
+
+
 def _looks_like_layer(item: Dict[str, Any]) -> bool:
     return bool(
         isinstance(item, dict)
@@ -2479,6 +2512,40 @@ def status():
         },
         "error": None,
     }
+
+
+@router.get("/embed")
+async def get_embed_url(
+    response: Response,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Resolve the current dedicated embed URL without exposing API credentials."""
+    _require_user(authorization)
+    if settings.GRANIOT_EMBED_URL:
+        account = _select_embed_account(
+            [{
+                "account_email": settings.GRANIOT_EMBED_ACCOUNT_EMAIL,
+                "embedded_url": settings.GRANIOT_EMBED_URL,
+            }],
+            settings.GRANIOT_EMBED_ACCOUNT_EMAIL,
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return {"data": account, "error": None}
+
+    client = GraniotClient()
+    try:
+        raw = await client.get(
+            "/api/accounts/",
+            include_client_id=False,
+            debug_context={"operation": "resolve-embed-url"},
+        )
+        account = _select_embed_account(raw, settings.GRANIOT_EMBED_ACCOUNT_EMAIL)
+        response.headers["Cache-Control"] = "no-store"
+        return {"data": account, "error": None}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_graniot_error(exc)
 
 
 @router.get("/debug/logs")

@@ -38,6 +38,11 @@ class Settings(BaseSettings):
     # Graniot API integration. Keep the API key only in backend env vars.
     GRANIOT_BASE_URL: str = "https://app.graniot.com"
     GRANIOT_API_KEY: str | None = None
+    # Account whose dedicated Graniot portal is embedded in the staging
+    # satellite module. The URL itself is resolved at runtime; never store its
+    # auth_id in source control or frontend build variables.
+    GRANIOT_EMBED_ACCOUNT_EMAIL: str = "gmateo@ingeoproyectos.com"
+    GRANIOT_EMBED_URL: str | None = None
     # The public ReDoc spec does not declare a security scheme; make it configurable.
     # Common valid values are: X-API-Key, Api-Key, Authorization.
     GRANIOT_AUTH_HEADER: str = "X-API-Key"
