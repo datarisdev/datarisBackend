@@ -5,17 +5,21 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import math
+import re
 from datetime import date, datetime, timedelta
+from functools import lru_cache
 from time import sleep
 from typing import Any, Optional
 
-from shapely.geometry import mapping, shape
+from shapely.geometry import Point, mapping, shape
 from shapely.ops import unary_union
 
 from app.core.config import settings
 from app.services.eos import client
 from app.services.eos import render as eos_render
 from app.services.eos.client import EOSApiError
+from app.services.eos.visualization import classify_index_value, legend_for_index
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +128,77 @@ def _polygon_bbox(polygon: dict[str, Any]) -> tuple[float, float, float, float]:
 def _normalize_index(index: Optional[str]) -> str:
     key = (index or DEFAULT_INDEX).strip().upper()
     return key if key in RENDER_BANDS else DEFAULT_INDEX
+
+
+def _scene_date_from_view_id(view_id: str) -> Optional[str]:
+    parts = str(view_id or "").split("/")
+    if len(parts) < 7:
+        return None
+    try:
+        return f"{int(parts[4]):04d}-{int(parts[5]):02d}-{int(parts[6]):02d}"
+    except (TypeError, ValueError):
+        return None
+
+
+@lru_cache(maxsize=4096)
+def _cached_point_value(view_id: str, band: str, lat: float, lon: float) -> Optional[float]:
+    # Sentinel-2 has a 10–20 m native pixel. Five decimals keep the lookup
+    # spatially precise while deduplicating repeated hover events at one point.
+    return client.fetch_point_value(view_id, band, lat, lon)
+
+
+def point_value(
+    raw_geometry: Any,
+    *,
+    index: str,
+    lat: float,
+    lon: float,
+    view_ids: list[str],
+) -> dict[str, Any]:
+    """Resolve an exact EOSDA point value for the same scenes used by the map."""
+    index_key = str(index or "").strip().upper()
+    if index_key not in RENDER_BANDS:
+        return {"available": False, "reason": "Índice EOSDA no soportado.", "index": index_key}
+    if index_key == "RGB":
+        return {"available": False, "reason": "Color natural no es un índice numérico.", "index": index_key}
+
+    geom = _extract_shapely(raw_geometry)
+    if geom is None or geom.is_empty or not geom.buffer(1e-9).covers(Point(float(lon), float(lat))):
+        return {"available": False, "reason": "El punto está fuera del lote seleccionado.", "index": index_key}
+
+    safe_view_ids: list[str] = []
+    for raw_view_id in view_ids[:6]:
+        candidate = str(raw_view_id or "").strip("/")
+        if candidate.startswith("S2/") and re.fullmatch(r"[A-Za-z0-9_./-]+", candidate):
+            safe_view_ids.append(candidate)
+    if not safe_view_ids:
+        return {"available": False, "reason": "La capa no incluye escenas EOSDA consultables.", "index": index_key}
+
+    band = RENDER_BANDS[index_key]
+    lookup_lat = round(float(lat), 5)
+    lookup_lon = round(float(lon), 5)
+    for view_id in safe_view_ids:
+        value = _cached_point_value(view_id, band, lookup_lat, lookup_lon)
+        if value is None or not math.isfinite(value):
+            continue
+        classification = classify_index_value(index_key, value) or {}
+        return {
+            "available": True,
+            "index": index_key,
+            "value": value,
+            "lat": lookup_lat,
+            "lon": lookup_lon,
+            "view_id": view_id,
+            "date": _scene_date_from_view_id(view_id),
+            "provider": "EOSDA Point Value API",
+            **classification,
+        }
+
+    return {
+        "available": False,
+        "reason": "EOSDA no devolvió un píxel utilizable en esta coordenada.",
+        "index": index_key,
+    }
 
 
 def _default_date_range(target: Optional[date]) -> tuple[str, str]:
@@ -365,6 +440,7 @@ def build_map_layer(
         "scene_id": primary.get("sceneID"),
         "view_id": view_ids[0],
         "view_ids": view_ids,
+        "legend": legend_for_index(index_key),
         "image_url": image_url,
         "bounds": bounds,
         "render": meta,

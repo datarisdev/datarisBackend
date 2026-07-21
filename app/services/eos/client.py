@@ -4,6 +4,7 @@ Endpoints used (base ``https://api-connect.eos.com/api``):
 - Search:      POST /lms/search/v2/{dataset}
 - Statistics:  POST /gdw/api        (type=mt_stats, async)  +  GET /gdw/api/{task_id}
 - Render tile: GET  /render/{view_id}/{band}/{z}/{x}/{y}
+- Point value: GET  /render/{sensor}/point/{scene}/{band}/{lat}/{lon}
 
 Authentication is sent both as the ``x-api-key`` header and the ``api_key``
 query parameter, since the EOS documentation is inconsistent about which one a
@@ -13,6 +14,7 @@ given endpoint expects (render tiles use the query parameter).
 from __future__ import annotations
 
 import logging
+import math
 import random
 import time
 from typing import Any, Optional
@@ -114,16 +116,25 @@ def search_scenes(
     return results if isinstance(results, list) else []
 
 
-def fetch_render_tile(view_id: str, band: str, z: int, x: int, y: int) -> Optional[bytes]:
+def fetch_render_tile(
+    view_id: str,
+    band: str,
+    z: int,
+    x: int,
+    y: int,
+    *,
+    render_params: Optional[dict[str, str]] = None,
+) -> Optional[bytes]:
     """Fetch a single 256x256 render tile. Returns None for empty/no-data tiles.
 
     Retries with backoff on HTTP 429 (rate limit), since EOS limits the render
     endpoint to ~10 req/min and a single map layer needs several tiles.
     """
     url = f"{_base_url()}/render/{view_id}/{band}/{z}/{x}/{y}"
+    params = {**_params(), **(render_params or {})}
     attempt = 0
     while True:
-        resp = requests.get(url, params=_params(), timeout=settings.EOS_TIMEOUT_SECONDS)
+        resp = requests.get(url, params=params, timeout=settings.EOS_TIMEOUT_SECONDS)
         if resp.status_code == 429 and attempt < RENDER_MAX_RETRIES_429:
             retry_after = resp.headers.get("Retry-After")
             try:
@@ -144,6 +155,33 @@ def fetch_render_tile(view_id: str, band: str, z: int, x: int, y: int) -> Option
     if "image" not in content_type or not resp.content:
         return None
     return resp.content
+
+
+def fetch_point_value(view_id: str, band: str, lat: float, lon: float) -> Optional[float]:
+    """Return EOSDA's real spectral-index value for one scene coordinate.
+
+    The Point Value API expects the sensor as its first path segment and the
+    scene identifier as the remaining ``view_id`` path. A 404/no-value response
+    means this scene has no usable pixel at the requested coordinate, allowing
+    the mosaic caller to try its next scene.
+    """
+    parts = [part for part in str(view_id or "").strip("/").split("/") if part]
+    if len(parts) < 2:
+        raise EOSApiError("EOS point-value recibió un view_id inválido.")
+    sensor, scene = parts[0], "/".join(parts[1:])
+    url = f"{_base_url()}/render/{sensor}/point/{scene}/{band}/{float(lat):.8f}/{float(lon):.8f}"
+    params = {**_params(), "CALIBRATE": "1"}
+    resp = requests.get(url, headers={"x-api-key": _api_key()}, params=params, timeout=settings.EOS_TIMEOUT_SECONDS)
+    if resp.status_code == 404:
+        return None
+    _raise_for_status(resp, "point-value")
+    payload = resp.json() if resp.content else {}
+    raw_value = payload.get("index_value") if isinstance(payload, dict) else None
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
 
 
 def create_stats_task(
