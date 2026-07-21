@@ -2683,6 +2683,84 @@ async def list_graniot_parcels(authorization: Optional[str] = Header(default=Non
         _raise_graniot_error(exc)
 
 
+@router.get("/all-parcels-overlays")
+async def list_all_graniot_parcel_overlays(
+    layer: str = Query(default="NDVI"),
+    time: Optional[str] = Query(default=None),
+    width: int = Query(default=1024, ge=64, le=4096),
+    height: int = Query(default=1024, ge=64, le=4096),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Devuelve TODAS las parcelas de la cuenta Graniot ya listas para pintar.
+
+    Alimenta la vista de staging "mostrar la capa satelital de todas las parcelas
+    a la vez" directamente desde Graniot (sin sync de parcelas locales). Cada
+    overlay trae la geometría de la parcela, los bounds de despliegue y una URL de
+    /wms-proxy que sirve la imagen recortada a la forma EXACTA de la parcela
+    (el recorte lo hace Graniot vía el access_key firmado, con nubes o sin ellas).
+    """
+    _require_user(authorization)
+    client = GraniotClient()
+    try:
+        raw = await client.get("/api/parcels/")
+    except Exception as exc:
+        _raise_graniot_error(exc)
+
+    overlays: List[Dict[str, Any]] = []
+    for feat in _items(raw):
+        if not isinstance(feat, dict):
+            continue
+        props = feat.get("properties") if isinstance(feat.get("properties"), dict) else {}
+        wms_url = props.get("wms_url")
+        image_url_tpl = props.get("image_url")
+        access_key = _access_key_from_wms_template(wms_url) or _access_key_from_wms_template(image_url_tpl)
+        bounds = (
+            _bbox_from_graniot_bbox(feat.get("bbox"))
+            or _bounds_from_wms_template(image_url_tpl)
+            or _bounds_from_wms_template(wms_url)
+        )
+        geometry = feat.get("geometry")
+        if not access_key or not bounds or not geometry:
+            continue
+
+        date = time or _latest_image_date_from_resolutions(props.get("parcelresolution_set"))
+        graniot_id = feat.get("id") or props.get("key")
+        cache_scope = str(props.get("key") or graniot_id or "parcel")
+        query: Dict[str, Any] = {
+            "access_key": access_key,
+            "layer": layer,
+            "width": width,
+            "height": height,
+            "south": bounds["south"],
+            "west": bounds["west"],
+            "north": bounds["north"],
+            "east": bounds["east"],
+        }
+        if date:
+            query["time"] = date
+        # Clave de caché estable (sin el token firmado, que rota) compartida con el
+        # proxy y la caché en disco de imágenes WMS.
+        query["cache_key"] = f"visual-v6:graniot:{cache_scope}:layer:{layer}:time:{date or 'latest'}"
+        query["cache_v"] = "visual-v6"
+
+        overlays.append({
+            "id": str(graniot_id or cache_scope),
+            "graniot_parcel_id": feat.get("id"),
+            "graniot_parcel_key": props.get("key"),
+            "name": props.get("name"),
+            "hectares": props.get("hectares"),
+            "geometry": geometry,
+            "bounds": bounds,
+            "image_url": f"/api/graniot/wms-proxy?{urlencode(query)}",
+            "date": date,
+            "layer": layer,
+            "source": "graniot-wms-proxy",
+            "parcelresolution_set": props.get("parcelresolution_set"),
+        })
+
+    return {"data": {"overlays": overlays, "layer": layer, "count": len(overlays)}, "error": None}
+
+
 @router.post("/parcels/sync-local/{parcel_id}")
 async def sync_local_parcel(
     parcel_id: str,
