@@ -37,28 +37,75 @@ jobs:
             -t "$IMAGE_NAME:${GITHUB_SHA}" \
             .
 
-      - name: Run container smoke test
+      - name: Run container smoke test with PostgreSQL
+        shell: bash
         run: |
           set -euo pipefail
 
-          docker run -d \
-            --name dataris-backend-ci \
-            -p 8080:8080 \
-            -e PORT=8080 \
-            "$IMAGE_NAME:${GITHUB_SHA}"
+          NETWORK="dataris-backend-ci-net"
+          DATABASE_CONTAINER="dataris-backend-ci-db"
+          APP_CONTAINER="dataris-backend-ci"
+          SMOKE_DATABASE_URL="postgresql+psycopg2://dataris:dataris@postgres:5432/dataris_smoke"
+          SMOKE_SUCCESS="false"
 
           cleanup() {
-            docker logs dataris-backend-ci || true
-            docker rm -f dataris-backend-ci || true
+            if [[ "$SMOKE_SUCCESS" != "true" ]]; then
+              echo "=== Backend smoke logs ==="
+              docker logs "$APP_CONTAINER" || true
+
+              echo "=== PostgreSQL smoke logs ==="
+              docker logs "$DATABASE_CONTAINER" || true
+            fi
+
+            docker rm -f "$APP_CONTAINER" "$DATABASE_CONTAINER" >/dev/null 2>&1 || true
+            docker network rm "$NETWORK" >/dev/null 2>&1 || true
           }
           trap cleanup EXIT
 
+          docker network create "$NETWORK"
+
+          docker run -d \
+            --name "$DATABASE_CONTAINER" \
+            --network "$NETWORK" \
+            --network-alias postgres \
+            --env POSTGRES_USER=dataris \
+            --env POSTGRES_PASSWORD=dataris \
+            --env POSTGRES_DB=dataris_smoke \
+            postgres:16-alpine
+
           for attempt in $(seq 1 30); do
+            if docker exec "$DATABASE_CONTAINER" \
+              pg_isready --username dataris --dbname dataris_smoke >/dev/null 2>&1
+            then
+              echo "PostgreSQL smoke database is ready"
+              break
+            fi
+            echo "Waiting for PostgreSQL... attempt ${attempt}/30"
+            sleep 2
+          done
+
+          if ! docker exec "$DATABASE_CONTAINER" \
+            pg_isready --username dataris --dbname dataris_smoke >/dev/null 2>&1
+          then
+            echo "::error::PostgreSQL smoke database did not become ready"
+            exit 1
+          fi
+
+          docker run -d \
+            --name "$APP_CONTAINER" \
+            --network "$NETWORK" \
+            --publish 8080:8080 \
+            --env PORT=8080 \
+            --env DATABASE_URL="$SMOKE_DATABASE_URL" \
+            "$IMAGE_NAME:${GITHUB_SHA}"
+
+          for attempt in $(seq 1 45); do
             if curl -fsS "http://127.0.0.1:8080/health"; then
-              echo "API health check OK"
+              SMOKE_SUCCESS="true"
+              echo "API health check with PostgreSQL OK"
               exit 0
             fi
-            echo "Waiting for API health check... attempt ${attempt}/30"
+            echo "Waiting for API health check... attempt ${attempt}/45"
             sleep 2
           done
 
