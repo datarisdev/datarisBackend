@@ -52,6 +52,10 @@ GRANIOT_MAP_LAYER_CACHE_TTL_SECONDS = int(os.getenv("GRANIOT_MAP_LAYER_CACHE_TTL
 GRANIOT_WMS_CACHE_TTL_SECONDS = int(os.getenv("GRANIOT_WMS_CACHE_TTL_SECONDS", str(60 * 60 * 24 * 7)))
 GRANIOT_WMS_CACHE_MAX_MB = int(os.getenv("GRANIOT_WMS_CACHE_MAX_MB", "256"))
 GRANIOT_WMS_PREFETCH_CONCURRENCY = int(os.getenv("GRANIOT_WMS_PREFETCH_CONCURRENCY", "3"))
+# /api/accounts/ cambia poco (altas/bajas de cuentas Graniot). Una caché corta
+# evita golpear a Graniot en cada carga del módulo Satélite; la expiración del
+# auth_id de cada cuenta se valida por petición, así que cachear es seguro.
+GRANIOT_EMBED_ACCOUNTS_CACHE_TTL_SECONDS = int(os.getenv("GRANIOT_EMBED_ACCOUNTS_CACHE_TTL_SECONDS", str(60 * 5)))
 GRANIOT_WMS_BACKEND_MASK_ENABLED = str(os.getenv("GRANIOT_WMS_BACKEND_MASK_ENABLED", "false")).strip().lower() in {"1", "true", "yes", "on"}
 
 _RUNTIME_CACHE: Dict[str, Tuple[float, Any]] = {}
@@ -2609,6 +2613,97 @@ async def _mint_embed_access_token() -> str:
     return access
 
 
+_EMBED_ACCOUNTS_CACHE_KEY = "graniot:embed:accounts"
+
+
+def _embed_url_auth_token(embedded_url: str) -> str:
+    """Extract the ``auth_id`` token from a Graniot embedded URL."""
+    try:
+        values = parse_qs(urlparse(str(embedded_url or "")).query).get("auth_id") or []
+        return str(values[0] or "").strip() if values else ""
+    except Exception:
+        return ""
+
+
+def _embed_service_account_emails() -> set[str]:
+    """Emails that identify the dedicated embed service account."""
+    return {
+        str(email).strip().lower()
+        for email in (settings.GRANIOT_EMBED_ACCOUNT_EMAIL, settings.GRANIOT_EMBED_USERNAME)
+        if email and str(email).strip()
+    }
+
+
+async def _fetch_embed_accounts() -> Any:
+    """Fetch (with a short cache) the Graniot accounts listing for embed matching."""
+    cached = _cache_get(_EMBED_ACCOUNTS_CACHE_KEY)
+    if cached is not None:
+        return cached
+    client = GraniotClient()
+    payload = await client.get(
+        "/api/accounts/",
+        include_client_id=False,
+        debug_context={"operation": "resolve-embed-url-per-user"},
+    )
+    return _cache_set(_EMBED_ACCOUNTS_CACHE_KEY, payload, GRANIOT_EMBED_ACCOUNTS_CACHE_TTL_SECONDS)
+
+
+async def _embed_account_for_user(user: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """Return the personal Graniot portal for the authenticated Dataris user.
+
+    Graniot's ``/api/accounts/`` exposes one ``embedded_url`` per account. When
+    the Dataris user's email matches a Graniot account, their own portal is
+    served. In every other case (no match, the account's ``auth_id`` already
+    expired — Graniot never regenerates it in ``/api/accounts/`` —, or Graniot
+    being unreachable) the caller falls back to the dedicated service account,
+    whose token IS minted fresh on demand. This function never raises: the
+    per-user match must never break the fallback.
+    """
+    if not settings.GRANIOT_EMBED_PER_USER_ENABLED:
+        return None
+    email = str((user or {}).get("email") or "").strip().lower()
+    if not email or "@" not in email:
+        return None
+    if email in _embed_service_account_emails():
+        # The service account is better served by the minted token (always fresh).
+        return None
+
+    try:
+        payload = await _fetch_embed_accounts()
+        account = _select_embed_account(payload, email)
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            # 404 = the user simply has no Graniot account (expected, no noise).
+            log_event({
+                "event": "dataris.graniot.embed_per_user.invalid_account",
+                "operation": "resolve-embed-url-per-user",
+                "email": email,
+                "status_code": exc.status_code,
+            })
+        return None
+    except Exception as exc:  # noqa: BLE001 — the fallback must always survive
+        log_event({
+            "event": "dataris.graniot.embed_per_user.lookup_failed",
+            "operation": "resolve-embed-url-per-user",
+            "email": email,
+            "exception_type": type(exc).__name__,
+            "message": str(exc),
+        })
+        return None
+
+    token = _embed_url_auth_token(account.get("embedded_url") or "")
+    if not token or _embed_token_looks_expired(token):
+        # Serving an expired auth_id would leave the iframe stuck on "loading".
+        # Fall back to the service account instead (honest, working portal).
+        log_event({
+            "event": "dataris.graniot.embed_per_user.token_expired",
+            "operation": "resolve-embed-url-per-user",
+            "email": email,
+        })
+        return None
+    return account
+
+
 @router.get("/embed")
 async def get_embed_url(
     response: Response,
@@ -2620,13 +2715,19 @@ async def get_embed_url(
     one leaves the embedded portal stuck on "loading" (``/api/accounts/`` does
     not refresh it). Order of preference (``Cache-Control: no-store``):
 
-    1. If embed credentials/refresh token are configured, **mint a fresh access
-       token** on demand — this always yields a valid ``auth_id``.
-    2. Otherwise, fall back to the URL Graniot exposes via ``/api/accounts/``
+    1. If the authenticated Dataris user's email matches a Graniot account and
+       that account's ``auth_id`` is still valid, serve **their own portal**.
+    2. If embed credentials/refresh token are configured, **mint a fresh access
+       token** on demand for the service account — always a valid ``auth_id``.
+    3. Otherwise, fall back to the URL Graniot exposes via ``/api/accounts/``
        (may already be expired), then to a statically configured URL.
     """
-    _require_user(authorization)
+    user = _require_user(authorization)
     response.headers["Cache-Control"] = "no-store"
+
+    personal = await _embed_account_for_user(user)
+    if personal is not None:
+        return {"data": personal, "error": None}
 
     if _embed_minting_configured():
         access = await _mint_embed_access_token()
