@@ -26,6 +26,9 @@ def _default_embed_settings(monkeypatch):
     monkeypatch.setattr(graniot.settings, "GRANIOT_EMBED_USERNAME", None)
     monkeypatch.setattr(graniot.settings, "GRANIOT_EMBED_PASSWORD", None)
     monkeypatch.setattr(graniot.settings, "GRANIOT_EMBED_REFRESH_TOKEN", None)
+    monkeypatch.setattr(graniot.settings, "GRANIOT_EMBED_PER_USER_ENABLED", True)
+    # The accounts listing cache must never leak between tests.
+    graniot._cache_delete_prefix(graniot._EMBED_ACCOUNTS_CACHE_KEY)
 
 
 def _fake_jwt(exp: int) -> str:
@@ -268,3 +271,172 @@ def test_embed_endpoint_mint_rejects_expired_access(monkeypatch):
     with pytest.raises(HTTPException) as exc_info:
         asyncio.run(graniot.get_embed_url(response=response, authorization="Bearer test"))
     assert exc_info.value.status_code == 502
+
+
+# ---------------------------------------------------------------------------
+# Per-user embed matching (Dataris email == Graniot account_email)
+# ---------------------------------------------------------------------------
+
+
+def _mint_settings(monkeypatch):
+    monkeypatch.setattr(graniot.settings, "GRANIOT_EMBED_ACCOUNT_EMAIL", "gmateo@ingeoproyectos.com")
+    monkeypatch.setattr(graniot.settings, "GRANIOT_EMBED_USERNAME", "gmateo@dataris.es")
+    monkeypatch.setattr(graniot.settings, "GRANIOT_EMBED_PASSWORD", "secret")
+
+
+def test_embed_endpoint_serves_matching_user_portal(monkeypatch):
+    """A Dataris user whose email matches a Graniot account gets THEIR portal."""
+    personal = _fake_jwt(int(time.time()) + 3600)
+    fake_client = _FakeGraniotClient([
+        {
+            "account_email": "Cliente@Example.com",
+            "embedded_url": f"https://embed.graniot.com/?auth_id={personal}",
+            "account_access": "must-not-leak",
+        },
+        {
+            "account_email": "gmateo@ingeoproyectos.com",
+            "embedded_url": "https://embed.graniot.com/?auth_id=service-token",
+        },
+    ])
+    monkeypatch.setattr(graniot, "GraniotClient", lambda: fake_client)
+    monkeypatch.setattr(
+        graniot, "bearer_user", lambda authorization: {"id": "u1", "email": "cliente@example.com"}
+    )
+    _mint_settings(monkeypatch)
+    recorder = _patch_httpx(monkeypatch, _FakeResponse(200, {"access": _fake_jwt(int(time.time()) + 3600)}))
+    response = Response()
+
+    result = asyncio.run(graniot.get_embed_url(response=response, authorization="Bearer test"))
+
+    assert result["data"]["embedded_url"].endswith(f"auth_id={personal}")
+    assert result["data"]["account_email"] == "Cliente@Example.com"
+    assert "account_access" not in result["data"]
+    assert recorder == []  # the service-account mint was never needed
+    assert response.headers["cache-control"] == "no-store"
+
+
+def test_embed_endpoint_falls_back_to_mint_when_personal_token_expired(monkeypatch):
+    """Graniot never refreshes /api/accounts/ tokens: expired match → service account."""
+    expired_personal = _fake_jwt(int(time.time()) - 60)
+    minted = _fake_jwt(int(time.time()) + 3600)
+    fake_client = _FakeGraniotClient([
+        {
+            "account_email": "cliente@example.com",
+            "embedded_url": f"https://embed.graniot.com/?auth_id={expired_personal}",
+        },
+    ])
+    monkeypatch.setattr(graniot, "GraniotClient", lambda: fake_client)
+    monkeypatch.setattr(
+        graniot, "bearer_user", lambda authorization: {"id": "u1", "email": "cliente@example.com"}
+    )
+    _mint_settings(monkeypatch)
+    recorder = _patch_httpx(monkeypatch, _FakeResponse(200, {"access": minted}))
+    response = Response()
+
+    result = asyncio.run(graniot.get_embed_url(response=response, authorization="Bearer test"))
+
+    assert result["data"]["embedded_url"].endswith(f"auth_id={minted}")
+    assert recorder  # fell back to minting the service-account token
+
+
+def test_embed_endpoint_no_match_mints_service_token(monkeypatch):
+    """Users without a Graniot account keep the dedicated service portal."""
+    minted = _fake_jwt(int(time.time()) + 3600)
+    fake_client = _FakeGraniotClient([
+        {
+            "account_email": "otra@cuenta.com",
+            "embedded_url": f"https://embed.graniot.com/?auth_id={_fake_jwt(int(time.time()) + 3600)}",
+        },
+    ])
+    monkeypatch.setattr(graniot, "GraniotClient", lambda: fake_client)
+    monkeypatch.setattr(
+        graniot, "bearer_user", lambda authorization: {"id": "u1", "email": "sin-graniot@example.com"}
+    )
+    _mint_settings(monkeypatch)
+    recorder = _patch_httpx(monkeypatch, _FakeResponse(200, {"access": minted}))
+    response = Response()
+
+    result = asyncio.run(graniot.get_embed_url(response=response, authorization="Bearer test"))
+
+    assert result["data"]["embedded_url"].endswith(f"auth_id={minted}")
+    assert recorder
+
+
+def test_embed_endpoint_per_user_lookup_failure_still_mints(monkeypatch):
+    """If the accounts lookup blows up, the service-account fallback must survive."""
+
+    class _BoomClient:
+        async def get(self, path, **kwargs):
+            raise RuntimeError("graniot down")
+
+    minted = _fake_jwt(int(time.time()) + 3600)
+    monkeypatch.setattr(graniot, "GraniotClient", _BoomClient)
+    monkeypatch.setattr(
+        graniot, "bearer_user", lambda authorization: {"id": "u1", "email": "cliente@example.com"}
+    )
+    _mint_settings(monkeypatch)
+    _patch_httpx(monkeypatch, _FakeResponse(200, {"access": minted}))
+    response = Response()
+
+    result = asyncio.run(graniot.get_embed_url(response=response, authorization="Bearer test"))
+
+    assert result["data"]["embedded_url"].endswith(f"auth_id={minted}")
+
+
+def test_embed_endpoint_service_email_skips_accounts_lookup(monkeypatch):
+    """The service account itself always uses the minted token (fresher)."""
+    minted = _fake_jwt(int(time.time()) + 3600)
+    monkeypatch.setattr(
+        graniot, "GraniotClient", lambda: pytest.fail("must not consult /api/accounts/")
+    )
+    monkeypatch.setattr(
+        graniot, "bearer_user", lambda authorization: {"id": "u1", "email": "GMateo@Dataris.es"}
+    )
+    _mint_settings(monkeypatch)
+    _patch_httpx(monkeypatch, _FakeResponse(200, {"access": minted}))
+    response = Response()
+
+    result = asyncio.run(graniot.get_embed_url(response=response, authorization="Bearer test"))
+
+    assert result["data"]["embedded_url"].endswith(f"auth_id={minted}")
+
+
+def test_embed_endpoint_per_user_disabled_skips_accounts_lookup(monkeypatch):
+    """The kill-switch forces the service-account portal without touching Graniot."""
+    minted = _fake_jwt(int(time.time()) + 3600)
+    monkeypatch.setattr(graniot.settings, "GRANIOT_EMBED_PER_USER_ENABLED", False)
+    monkeypatch.setattr(
+        graniot, "GraniotClient", lambda: pytest.fail("must not consult /api/accounts/")
+    )
+    monkeypatch.setattr(
+        graniot, "bearer_user", lambda authorization: {"id": "u1", "email": "cliente@example.com"}
+    )
+    _mint_settings(monkeypatch)
+    _patch_httpx(monkeypatch, _FakeResponse(200, {"access": minted}))
+    response = Response()
+
+    result = asyncio.run(graniot.get_embed_url(response=response, authorization="Bearer test"))
+
+    assert result["data"]["embedded_url"].endswith(f"auth_id={minted}")
+
+
+def test_embed_accounts_listing_is_cached_between_requests(monkeypatch):
+    """Two embed resolutions reuse one /api/accounts/ call (short cache)."""
+    personal = _fake_jwt(int(time.time()) + 3600)
+    fake_client = _FakeGraniotClient([
+        {
+            "account_email": "cliente@example.com",
+            "embedded_url": f"https://embed.graniot.com/?auth_id={personal}",
+        },
+    ])
+    monkeypatch.setattr(graniot, "GraniotClient", lambda: fake_client)
+    monkeypatch.setattr(
+        graniot, "bearer_user", lambda authorization: {"id": "u1", "email": "cliente@example.com"}
+    )
+    _mint_settings(monkeypatch)
+    response = Response()
+
+    asyncio.run(graniot.get_embed_url(response=response, authorization="Bearer test"))
+    asyncio.run(graniot.get_embed_url(response=response, authorization="Bearer test"))
+
+    assert len(fake_client.calls) == 1
