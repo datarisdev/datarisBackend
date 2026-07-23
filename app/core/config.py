@@ -54,6 +54,11 @@ class Settings(BaseSettings):
     GRANIOT_EMBED_USERNAME: str | None = None
     GRANIOT_EMBED_PASSWORD: str | None = None
     GRANIOT_EMBED_REFRESH_TOKEN: str | None = None
+    # Per-user embed: when a Dataris user's email matches a Graniot account in
+    # /api/accounts/, serve THAT account's embedded portal (if its auth_id is
+    # still valid). Users without a match keep the dedicated service-account
+    # portal above. Kill-switch: set to false to force the service account.
+    GRANIOT_EMBED_PER_USER_ENABLED: bool = True
     # The public ReDoc spec does not declare a security scheme; make it configurable.
     # Common valid values are: X-API-Key, Api-Key, Authorization.
     GRANIOT_AUTH_HEADER: str = "X-API-Key"
