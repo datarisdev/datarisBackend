@@ -105,6 +105,11 @@ USER_SCOPED_TABLES = {
     "sig_harvest_records",
     "sig_pest_weed_records",
     "sig_harvest_overrides",
+    # Reportes de campo: las plantillas y los envíos se acotan por empresa
+    # (ver scoped_table_rows), no por usuario, para que el equipo de una empresa
+    # comparta formularios y vea los reportes de su propia empresa.
+    "report_templates",
+    "report_submissions",
     "sig_sync_cursors",
     "digiforms_raw_submissions",
 }
@@ -635,6 +640,30 @@ def user_parcel_ids(db: Dict[str, Any], user_id: str) -> set[str]:
     return {str(row.get("id")) for row in table(db, "parcels") if str(row.get("user_id") or "") == user_id and row.get("id")}
 
 
+def _company_for_user(db: Dict[str, Any], user_id: str) -> Optional[str]:
+    """Empresa a la que pertenece un usuario, sin importar `compat_extensions`.
+
+    Se resuelve por su fila de admin, por el `company_id` del perfil o, en su
+    defecto, casando el `company_name` del perfil contra el catálogo de
+    empresas. Es una copia mínima de `company_for_user` para no crear un import
+    circular entre este módulo y `compat_extensions`.
+    """
+    admin = next(
+        (a for a in table(db, "admin_users") if a.get("user_id") == user_id and a.get("is_active", True)),
+        None,
+    )
+    if admin and admin.get("company_id"):
+        return admin.get("company_id")
+    profile = next((p for p in table(db, "profiles") if p.get("user_id") == user_id), None)
+    if profile and profile.get("company_id"):
+        return profile.get("company_id")
+    if profile and profile.get("company_name"):
+        company = next((c for c in table(db, "companies") if c.get("name") == profile.get("company_name")), None)
+        if company:
+            return company.get("id")
+    return None
+
+
 def scoped_table_rows(db: Dict[str, Any], table_name: str, user: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     rows = table(db, table_name)
     if not user or table_name not in USER_SCOPED_TABLES:
@@ -656,6 +685,20 @@ def scoped_table_rows(db: Dict[str, Any], table_name: str, user: Optional[Dict[s
         ]
     if table_name == "extension_requests":
         return [row for row in rows if str(row.get("requested_by_user_id") or row.get("user_id") or "") == user_id]
+    if table_name == "report_templates":
+        # Plantillas del sistema (sin company_id) visibles para todos; las de una
+        # empresa, solo para esa empresa.
+        cid = str(_company_for_user(db, user_id) or "")
+        return [row for row in rows if not row.get("company_id") or str(row.get("company_id")) == cid]
+    if table_name == "report_submissions":
+        # Los envíos se comparten dentro de la empresa; además cada quien ve los
+        # suyos aunque su empresa no esté resuelta.
+        cid = str(_company_for_user(db, user_id) or "")
+        return [
+            row
+            for row in rows
+            if (cid and str(row.get("company_id") or "") == cid) or str(row.get("user_id") or "") == user_id
+        ]
     return [row for row in rows if str(row.get("user_id") or "") == user_id]
 
 
@@ -1113,6 +1156,60 @@ def create_manual_admin_user(payload: Dict[str, Any] = Body(default_factory=dict
         },
         "error": None,
     }
+
+
+@router.post("/reports/templates")
+def save_report_template(payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
+    """Crea o actualiza una plantilla de reporte. Solo para admins de empresa.
+
+    Es la vía oficial de guardado del builder: a diferencia del insert genérico,
+    exige `require_admin_context`, de modo que un usuario normal no puede alterar
+    el formulario que usa el resto de su empresa. La plantilla queda anclada a la
+    empresa del admin (salvo el superadmin, que puede fijar otra o dejarla como
+    plantilla de sistema).
+    """
+    with LOCK:
+        db = read_db()
+        ctx = require_admin_context(authorization, db)
+        admin = ctx["admin"]
+        is_super = admin.get("admin_role") == "superadmin"
+
+        key = str(payload.get("key") or "").strip()
+        if not key:
+            raise HTTPException(status_code=400, detail="La plantilla necesita una clave (key)")
+
+        # Un admin de empresa solo puede tocar plantillas de su empresa; el
+        # superadmin puede fijar cualquier company_id o dejarlo nulo (sistema).
+        company_id = payload.get("company_id") if is_super else admin.get("company_id")
+
+        rows = table(db, "report_templates")
+        template_id = payload.get("id")
+        t = now()
+        record = {
+            "key": key,
+            "name": str(payload.get("name") or key),
+            "version": int(payload.get("version") or 1),
+            "is_system": bool(payload.get("is_system", False)),
+            "schema": payload.get("schema") or {},
+            "catalogs": payload.get("catalogs") or {},
+            "company_id": company_id,
+            "updated_at": t,
+        }
+
+        existing = next((r for r in rows if template_id and r.get("id") == template_id), None)
+        if existing:
+            if not is_super and str(existing.get("company_id") or "") != str(admin.get("company_id") or ""):
+                raise HTTPException(status_code=403, detail="No puedes editar plantillas de otra empresa")
+            existing.update(record)
+            saved = existing
+        else:
+            record["id"] = template_id or str(uuid.uuid4())
+            record["created_at"] = t
+            rows.append(record)
+            saved = record
+
+        write_db(db)
+        return {"data": saved, "error": None}
 
 
 @router.post("/tables/{table_name}/query")
