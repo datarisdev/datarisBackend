@@ -1152,10 +1152,19 @@ async def deactivate_digiforms_user(link_id: str, authorization: Optional[str] =
 # ---------------------------------------------------------------------------
 
 
-def _visible_report_templates(db: Dict[str, Any], company_id: Optional[str]) -> List[Dict[str, Any]]:
-    """Plantillas que la empresa puede enlazar: las suyas y las del sistema."""
+def _visible_report_templates(db: Dict[str, Any], company_id: Optional[str], is_super: bool = False) -> List[Dict[str, Any]]:
+    """Plantillas que la empresa puede enlazar: las suyas y las del sistema.
+
+    El superadmin de la plataforma las ve todas, igual que en `scoped_table_rows`:
+    si no, alguien de DATARIS abría el desplegable para conectar un formulario y
+    no encontraba la plantilla del cliente al que quería configurársela.
+    """
     rows = table(db, "report_templates")
-    visible = [row for row in rows if not row.get("company_id") or str(row.get("company_id")) == str(company_id or "")]
+    visible = (
+        list(rows)
+        if is_super
+        else [row for row in rows if not row.get("company_id") or str(row.get("company_id")) == str(company_id or "")]
+    )
     latest: Dict[str, Dict[str, Any]] = {}
     for template in visible:
         key = str(template.get("key") or "")
@@ -1165,11 +1174,11 @@ def _visible_report_templates(db: Dict[str, Any], company_id: Optional[str]) -> 
     return sorted(latest.values(), key=lambda item: str(item.get("name") or ""))
 
 
-def _template_by_id(db: Dict[str, Any], template_id: str, company_id: Optional[str]) -> Dict[str, Any]:
+def _template_by_id(db: Dict[str, Any], template_id: str, company_id: Optional[str], is_super: bool = False) -> Dict[str, Any]:
     template = next((row for row in table(db, "report_templates") if str(row.get("id")) == str(template_id)), None)
     if not template:
         raise HTTPException(status_code=404, detail="La plantilla de reporte no existe")
-    if template.get("company_id") and str(template.get("company_id")) != str(company_id or ""):
+    if not is_super and template.get("company_id") and str(template.get("company_id")) != str(company_id or ""):
         raise HTTPException(status_code=403, detail="Esa plantilla pertenece a otra empresa")
     return template
 
@@ -1182,10 +1191,21 @@ def list_digiforms_forms(authorization: Optional[str] = Header(default=None)):
         db = read_db()
         scope = current_link_scope(db, user)
         company_id = scope.get("company_id")
+        is_super = (scope.get("admin") or {}).get("admin_role") == "superadmin"
         forms = safe_forms(forms_for_company(db, company_id))
+        nombres_empresa = {str(row.get("id")): row.get("name") for row in table(db, "companies")}
         templates = [
-            {"id": row.get("id"), "key": row.get("key"), "name": row.get("name"), "version": row.get("version")}
-            for row in _visible_report_templates(db, company_id)
+            {
+                "id": row.get("id"),
+                "key": row.get("key"),
+                "name": row.get("name"),
+                "version": row.get("version"),
+                # Para el superadmin la lista mezcla plantillas de varios
+                # clientes: sin saber de quién es cada una, elegir sería a ciegas.
+                "company_id": row.get("company_id"),
+                "company_name": nombres_empresa.get(str(row.get("company_id") or "")) if row.get("company_id") else None,
+            }
+            for row in _visible_report_templates(db, company_id, is_super)
         ]
         can_edit = is_admin(scope.get("admin"))
     return {"data": {"forms": forms, "report_templates": templates, "can_edit": can_edit}, "error": None}
@@ -1426,7 +1446,8 @@ def suggest_report_link_mapping(payload: Dict[str, Any] = Body(default_factory=d
         scope = require_company_admin_scope(db, user)
         company_id = str(scope.get("company_id") or "")
         form_id = str(payload.get("form_id") or "").strip()
-        template = _template_by_id(db, str(payload.get("report_template_id") or ""), company_id)
+        is_super = (scope.get("admin") or {}).get("admin_role") == "superadmin"
+        template = _template_by_id(db, str(payload.get("report_template_id") or ""), company_id, is_super)
         catalog_entry = find_form(db, company_id, form_id)
         if not catalog_entry:
             raise HTTPException(status_code=404, detail="Ese formulario no está en el catálogo de la empresa")
@@ -1460,7 +1481,8 @@ def save_report_link(payload: Dict[str, Any] = Body(default_factory=dict), autho
         catalog_entry = find_form(db, company_id, form_id)
         if not catalog_entry:
             raise HTTPException(status_code=404, detail="Ese formulario no está en el catálogo de la empresa")
-        template = _template_by_id(db, str(payload.get("report_template_id") or ""), company_id)
+        is_super = (scope.get("admin") or {}).get("admin_role") == "superadmin"
+        template = _template_by_id(db, str(payload.get("report_template_id") or ""), company_id, is_super)
 
         field_map = payload.get("field_map")
         if not isinstance(field_map, dict) or not field_map:

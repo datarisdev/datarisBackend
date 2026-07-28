@@ -238,6 +238,31 @@ def test_superadmin_ve_las_plantillas_de_cualquier_empresa(client, superadmin_to
     assert "plantilla-de-otro-cliente" in claves
 
 
+def test_el_panel_ofrece_al_superadmin_las_plantillas_de_otros_clientes(client, superadmin_token, connected_company):
+    """El desplegable de plantillas enlazables sigue la misma regla que las tablas.
+
+    El filtro vivía duplicado en dos sitios y sólo se corrigió uno: el listado de
+    plantillas salía vacío en el panel aunque la consulta directa sí las devolvía.
+    """
+    response = client.get("/api/compat/extensions/digiforms/forms", headers=_auth(superadmin_token))
+    claves = [item["key"] for item in response.json()["data"]["report_templates"]]
+    assert "plantilla-de-otro-cliente" in claves
+
+
+def test_el_superadmin_puede_enlazar_una_plantilla_de_otro_cliente(client, superadmin_token, connected_company):
+    """Configurar la integración de un cliente es justo el trabajo de DATARIS."""
+    listado = client.get("/api/compat/extensions/digiforms/forms", headers=_auth(superadmin_token))
+    ajena = next(
+        item for item in listado.json()["data"]["report_templates"] if item["key"] == "plantilla-de-otro-cliente"
+    )
+    response = client.post(
+        "/api/compat/extensions/digiforms/report-links/suggest",
+        headers=_auth(superadmin_token),
+        json={"form_id": "FORM-VISITA-001", "report_template_id": ajena["id"], "discovered_fields": ["Folio"]},
+    )
+    assert response.status_code == 200, response.text
+
+
 def test_los_envios_de_otra_empresa_siguen_siendo_privados(client, superadmin_token):
     """La excepción del superadmin llega a las plantillas, no a los datos de campo."""
     with compat.LOCK:
