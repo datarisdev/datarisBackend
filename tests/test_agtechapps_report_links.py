@@ -214,6 +214,49 @@ def test_usuario_sin_sesion_no_ve_la_configuracion(client):
     assert client.get("/api/compat/extensions/digiforms/forms").status_code == 401
 
 
+def test_superadmin_ve_las_plantillas_de_cualquier_empresa(client, superadmin_token, template_id):
+    """Un superadmin de DATARIS administra los formularios de todos los clientes.
+
+    Antes veía el listado vacío si las plantillas pertenecían a otra empresa,
+    porque el filtro por empresa se le aplicaba igual que a un usuario normal.
+    """
+    with compat.LOCK:
+        db = compat.read_db()
+        compat.table(db, "report_templates").append({
+            "id": str(uuid.uuid4()),
+            "key": "plantilla-de-otro-cliente",
+            "name": "Plantilla de otro cliente",
+            "version": 1,
+            "company_id": "otra-empresa-cualquiera",
+            "schema": {"tabs": []},
+            "catalogs": {},
+        })
+        compat.write_db(db)
+
+    response = client.post("/api/compat/tables/report_templates/query", headers=_auth(superadmin_token), json={})
+    claves = [row.get("key") for row in response.json()["data"]]
+    assert "plantilla-de-otro-cliente" in claves
+
+
+def test_los_envios_de_otra_empresa_siguen_siendo_privados(client, superadmin_token):
+    """La excepción del superadmin llega a las plantillas, no a los datos de campo."""
+    with compat.LOCK:
+        db = compat.read_db()
+        compat.table(db, "report_submissions").append({
+            "id": str(uuid.uuid4()),
+            "template_id": "cualquiera",
+            "template_key": "plantilla-de-otro-cliente",
+            "company_id": "otra-empresa-cualquiera",
+            "user_id": "usuario-de-otra-empresa",
+            "values": {"secreto": "dato de campo del cliente"},
+        })
+        compat.write_db(db)
+
+    response = client.post("/api/compat/tables/report_submissions/query", headers=_auth(superadmin_token), json={})
+    empresas = {str(row.get("company_id") or "") for row in response.json()["data"]}
+    assert "otra-empresa-cualquiera" not in empresas
+
+
 # ---------------------------------------------------------------------------
 # Listado de formularios del proveedor (GET api/form/{clientId})
 # ---------------------------------------------------------------------------

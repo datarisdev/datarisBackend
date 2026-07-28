@@ -668,6 +668,16 @@ def _company_for_user(db: Dict[str, Any], user_id: str) -> Optional[str]:
     return None
 
 
+def _is_platform_superadmin(db: Dict[str, Any], user_id: str) -> bool:
+    """Superadmin de la plataforma (personal de DATARIS), no de una empresa."""
+    return any(
+        row.get("user_id") == user_id
+        and row.get("is_active", True) is not False
+        and row.get("admin_role") == "superadmin"
+        for row in table(db, "admin_users")
+    )
+
+
 def scoped_table_rows(db: Dict[str, Any], table_name: str, user: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     rows = table(db, table_name)
     if not user or table_name not in USER_SCOPED_TABLES:
@@ -692,6 +702,15 @@ def scoped_table_rows(db: Dict[str, Any], table_name: str, user: Optional[Dict[s
     if table_name == "report_templates":
         # Plantillas del sistema (sin company_id) visibles para todos; las de una
         # empresa, solo para esa empresa.
+        #
+        # El superadmin de la plataforma es la excepción: administra los
+        # formularios de cualquier cliente, igual que ya ve todos los módulos
+        # (ver me_access.py). Sin esto, alguien de DATARIS abría Reportes de
+        # Campo y encontraba el listado vacío porque las plantillas existentes
+        # pertenecían a otras empresas. Los ENVÍOS no siguen esta regla: los
+        # datos que el cliente llena en campo se quedan en su empresa.
+        if _is_platform_superadmin(db, user_id):
+            return rows
         cid = str(_company_for_user(db, user_id) or "")
         return [row for row in rows if not row.get("company_id") or str(row.get("company_id")) == cid]
     if table_name in {"digiforms_forms", "digiforms_form_mappings"}:
