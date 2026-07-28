@@ -128,7 +128,7 @@ def safe_connection(connection: Optional[Dict[str, Any]]) -> Optional[Dict[str, 
 
 
 def safe_mapping(mapping: Dict[str, Any]) -> Dict[str, Any]:
-    return {
+    payload = {
         "id": mapping.get("id"),
         "company_id": mapping.get("company_id"),
         "form_type": mapping.get("form_type"),
@@ -141,6 +141,15 @@ def safe_mapping(mapping: Dict[str, Any]) -> Dict[str, Any]:
         "created_at": mapping.get("created_at"),
         "updated_at": mapping.get("updated_at"),
     }
+    # Los vínculos con plantillas de Reportes de Campo viven en esta misma tabla
+    # y llevan además a qué plantilla apuntan y cómo se traducen sus campos.
+    if mapping.get("report_template_id"):
+        payload.update({
+            "report_template_id": mapping.get("report_template_id"),
+            "report_template_key": mapping.get("report_template_key"),
+            "field_map": dict(mapping.get("field_map") or {}),
+        })
+    return payload
 
 
 def safe_mappings(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
