@@ -112,6 +112,10 @@ USER_SCOPED_TABLES = {
     "report_submissions",
     "sig_sync_cursors",
     "digiforms_raw_submissions",
+    # Catálogo de formularios que cada empresa tiene en AgtechApps: es
+    # configuración de un cliente y no debe verse desde otro.
+    "digiforms_forms",
+    "digiforms_form_mappings",
 }
 
 PARCEL_CHILD_TABLES = {
@@ -690,6 +694,11 @@ def scoped_table_rows(db: Dict[str, Any], table_name: str, user: Optional[Dict[s
         # empresa, solo para esa empresa.
         cid = str(_company_for_user(db, user_id) or "")
         return [row for row in rows if not row.get("company_id") or str(row.get("company_id")) == cid]
+    if table_name in {"digiforms_forms", "digiforms_form_mappings"}:
+        # Configuración de la integración: se comparte dentro de la empresa y no
+        # sale de ella. Sin empresa resuelta no se ve nada.
+        cid = str(_company_for_user(db, user_id) or "")
+        return [row for row in rows if cid and str(row.get("company_id") or "") == cid]
     if table_name == "report_submissions":
         # Los envíos se comparten dentro de la empresa; además cada quien ve los
         # suyos aunque su empresa no esté resuelta.

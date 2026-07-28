@@ -39,6 +39,11 @@ from app.services.digiforms_company_config import (
     safe_mappings,
     mappings_for_company,
 )
+from app.services.digiforms_report_links import (
+    is_report_form_type,
+    photos_from_image_urls,
+    values_from_response,
+)
 from app.api.routers.compat_extensions import company_for_user, extension_enabled_for
 from app.services.commercial_demo_seed import is_commercial_demo_user
 
@@ -539,11 +544,25 @@ def _initial_response_id_for_type(db: Dict[str, Any], company_id: Optional[str],
     return int(settings.DIGIFORMS_SYNC_INITIAL_RESPONSE_ID or 0)
 
 
+def _report_form_types(db: Dict[str, Any], company_id: Optional[str]) -> List[str]:
+    """Formularios de AgtechApps enlazados a una plantilla de Reportes."""
+    return [
+        str(row.get("form_type"))
+        for row in mappings_for_company(db, company_id)
+        if is_report_form_type(row.get("form_type"))
+        and row.get("is_enabled", True) is not False
+        and row.get("report_template_id")
+        and _safe_text(row.get("form_id"))
+    ]
+
+
 def _configured_form_types(db: Dict[str, Any], company_id: Optional[str]) -> List[str]:
     configured = tenant_configured_form_types(db, company_id)
-    if configured:
-        return configured
-    return [form_type for form_type in [HARVEST_FORM_TYPE, PEST_WEED_FORM_TYPE] if _form_id_for_type(db, company_id, form_type)]
+    if not configured:
+        configured = [form_type for form_type in [HARVEST_FORM_TYPE, PEST_WEED_FORM_TYPE] if _form_id_for_type(db, company_id, form_type)]
+    # Los formularios enlazados a plantillas se sincronizan en la misma pasada
+    # que los dos formatos históricos, con su propio cursor cada uno.
+    return [*configured, *_report_form_types(db, company_id)]
 
 
 def _initial_sync_dates_for_type(db: Dict[str, Any], company_id: Optional[str], form_type: str) -> Tuple[str, str]:
@@ -736,6 +755,201 @@ def _persist_raw_api_submissions(
     return persisted
 
 
+def _report_submission_record(
+    row: Dict[str, Any],
+    index: int,
+    features: Sequence[Tuple[str, str, BaseGeometry]],
+    *,
+    form_type: str,
+    schema: Dict[str, Any],
+    field_map: Dict[str, str],
+) -> Dict[str, Any]:
+    """Convierte una respuesta de AgtechApps en un envío de reporte.
+
+    A diferencia de cosecha y malezas, aquí no se descarta la respuesta cuando
+    no trae coordenadas: un reporte sin GPS sigue siendo un reporte válido y
+    perderlo sería peor que no poder pintarlo en el mapa. Queda marcado para que
+    la capa del SIG lo ignore y el módulo de Reportes sí lo muestre.
+    """
+    coords = _parse_coordinates(row)
+    lat, lng = coords if coords else (None, None)
+    parcel_id, feature_key = _match_point(lat, lng, features) if coords else (None, None)
+    values, missing = values_from_response(schema, field_map, row)
+    return {
+        "external_response_id": _stable_external_id(form_type, row, index),
+        "values": values,
+        "photos": photos_from_image_urls(row.get("_image_urls") or []),
+        "unmapped_template_fields": missing,
+        "lat": lat,
+        "lng": lng,
+        "parcel_id": parcel_id,
+        "feature_key": feature_key,
+        "has_location": coords is not None,
+        "outside_registered_parcel": coords is not None and feature_key is None,
+        "digiforms_state": _safe_text(_first_value(row, ["State", "EstadoAprobacion", "ApprovalState"], "0")) or "0",
+        "dynamic_fields": _json_safe(dynamic_fields_from_payload(row)),
+        "raw_payload": _json_safe(row.get("_raw_api_payload") or {key: value for key, value in row.items() if key not in {"_hyperlinks", "_raw_api_payload"}}),
+    }
+
+
+def _persist_report_submissions(
+    *,
+    db: Dict[str, Any],
+    user_id: str,
+    company_id: Optional[str],
+    form_type: str,
+    form_id: str,
+    response_rows: Sequence[Dict[str, Any]],
+    image_rows: Sequence[Dict[str, Any]],
+    parcels: Sequence[Dict[str, Any]],
+    cursor_before: int,
+    sync_mode: str,
+    initial_sync_start_date: Optional[str] = None,
+    initial_sync_end_date: Optional[str] = None,
+    warning: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Aterriza las respuestas de un formulario enlazado como envíos de reporte.
+
+    El destino es `report_submissions`, la misma tabla que llena la captura
+    manual, de modo que un reporte llenado desde la app de AgtechApps se abre,
+    se ve y se exporta igual que uno llenado en Dataris. Las coordenadas se
+    conservan en la fila para que el SIG pueda pintarlas como una capa más.
+    """
+    mapping = mapping_for_company(db, company_id, form_type) or {}
+    template_id = str(mapping.get("report_template_id") or "")
+    template = next((row for row in table(db, "report_templates") if str(row.get("id")) == template_id), None)
+    if not template:
+        raise HTTPException(status_code=400, detail="El formulario está enlazado a una plantilla que ya no existe.")
+
+    schema = template.get("schema") or {}
+    field_map = dict(mapping.get("field_map") or {})
+    features = _build_feature_index(parcels)
+    image_map = _api_image_map(image_rows)
+
+    run_id = str(uuid.uuid4())
+    timestamp = now()
+    raw_rows_persisted = _persist_raw_api_submissions(
+        db=db,
+        user_id=user_id,
+        company_id=company_id,
+        form_type=form_type,
+        form_id=form_id,
+        response_rows=response_rows,
+        image_map=image_map,
+        timestamp=timestamp,
+    )
+
+    destination = table(db, "report_submissions")
+    existing_by_external = {
+        str(item.get("external_response_id")): item
+        for item in destination
+        if str(item.get("template_id") or "") == template_id
+        and _same_company_or_legacy_user(item, company_id=company_id, user_id=user_id)
+        and item.get("external_response_id")
+    }
+
+    imported_rows = 0
+    updated_rows = 0
+    duplicate_rows = 0
+    without_location = 0
+    outside_rows = 0
+    seen_in_response: set[str] = set()
+    unmapped_counter: Dict[str, int] = {}
+
+    for index, api_row in enumerate(response_rows[:MAX_ROWS_PER_IMPORT]):
+        row = dict(api_row)
+        response_id = response_id_from_payload(row)
+        row["_image_urls"] = image_map.get(response_id, [])
+        row.setdefault("State", state_from_payload(row))
+        parsed = _report_submission_record(row, index, features, form_type=form_type, schema=schema, field_map=field_map)
+
+        external_id = str(parsed["external_response_id"])
+        if external_id in seen_in_response:
+            duplicate_rows += 1
+            continue
+        seen_in_response.add(external_id)
+        if not parsed["has_location"]:
+            without_location += 1
+        if parsed["outside_registered_parcel"]:
+            outside_rows += 1
+        for field_key in parsed["unmapped_template_fields"]:
+            unmapped_counter[field_key] = unmapped_counter.get(field_key, 0) + 1
+
+        common = {
+            **parsed,
+            "template_id": template_id,
+            "template_key": template.get("key"),
+            "company_id": company_id,
+            "user_id": user_id,
+            "status": "submitted",
+            "source": DIGIFORMS_RESULTS_API_SOURCE,
+            "digiforms_form_id": form_id,
+            "import_run_id": run_id,
+            "updated_at": timestamp,
+        }
+        existing = existing_by_external.get(external_id)
+        if existing:
+            existing.update(common)
+            updated_rows += 1
+        else:
+            item = {"id": str(uuid.uuid4()), "created_at": timestamp, **common}
+            destination.append(item)
+            existing_by_external[external_id] = item
+            imported_rows += 1
+
+    cursor_after = _highest_response_id(response_rows, cursor_before)
+    cursor = _cursor_row(db, company_id, user_id, form_type, create=True)
+    if cursor is not None:
+        cursor.update({
+            "form_id": form_id,
+            "last_response_id": cursor_after,
+            "last_sync_at": timestamp,
+            "last_success_at": timestamp,
+            "last_error": None,
+            "last_request_mode": sync_mode,
+            "updated_at": timestamp,
+        })
+
+    run = {
+        "id": run_id,
+        "user_id": user_id,
+        "company_id": company_id,
+        "form_type": form_type,
+        "form_id": form_id,
+        "report_template_id": template_id,
+        "report_template_key": template.get("key"),
+        "source": DIGIFORMS_RESULTS_API_SOURCE,
+        "file_name": "API por fechas" if sync_mode == "initial_date_range" else "API incremental",
+        "status": "completed",
+        "total_rows": len(response_rows),
+        "valid_rows": len(seen_in_response),
+        "imported_rows": imported_rows,
+        "updated_rows": updated_rows,
+        "duplicate_rows": duplicate_rows,
+        "invalid_rows": 0,
+        "rows_without_location": without_location,
+        "outside_registered_parcel_rows": outside_rows,
+        "parcel_features_received": len(features),
+        "images_received": len(image_rows),
+        "raw_rows_persisted": raw_rows_persisted,
+        "discovered_fields": discover_field_names(response_rows),
+        # Qué campos de la plantilla quedaron vacíos y en cuántas respuestas: es
+        # la señal de que el mapeo está incompleto o que cambió el formulario.
+        "unmapped_template_fields": unmapped_counter,
+        "mapped_fields": len(field_map),
+        "sync_mode": sync_mode,
+        "initial_sync_start_date": initial_sync_start_date,
+        "initial_sync_end_date": initial_sync_end_date,
+        "cursor_before": cursor_before,
+        "cursor_after": cursor_after,
+        "warning": warning,
+        "created_at": timestamp,
+        "updated_at": timestamp,
+    }
+    table(db, "sig_import_runs").append(run)
+    return run
+
+
 def _persist_api_records(
     *,
     db: Dict[str, Any],
@@ -752,6 +966,23 @@ def _persist_api_records(
     initial_sync_end_date: Optional[str] = None,
     warning: Optional[str] = None,
 ) -> Dict[str, Any]:
+    if is_report_form_type(form_type):
+        return _persist_report_submissions(
+            db=db,
+            user_id=user_id,
+            company_id=company_id,
+            form_type=form_type,
+            form_id=form_id,
+            response_rows=response_rows,
+            image_rows=image_rows,
+            parcels=parcels,
+            cursor_before=cursor_before,
+            sync_mode=sync_mode,
+            initial_sync_start_date=initial_sync_start_date,
+            initial_sync_end_date=initial_sync_end_date,
+            warning=warning,
+        )
+
     features = _build_feature_index(parcels)
     image_map = _api_image_map(image_rows)
     parser = _harvest_record if form_type == HARVEST_FORM_TYPE else _pest_weed_record
@@ -951,6 +1182,10 @@ def _sync_types(db: Dict[str, Any], company_id: Optional[str], payload: Dict[str
     requested = _safe_text(payload.get("form_type") or "all")
     if requested in {HARVEST_FORM_TYPE, PEST_WEED_FORM_TYPE}:
         return [requested]
+    # Se puede pedir la sincronización de un solo formulario enlazado, útil para
+    # el botón "sincronizar ahora" de un vínculo concreto.
+    if is_report_form_type(requested):
+        return [requested] if requested in _report_form_types(db, company_id) else []
     return _configured_form_types(db, company_id)
 
 
@@ -1256,6 +1491,46 @@ def list_pest_weed_records(include_non_approved: bool = Query(default=False), au
         db = read_db(); company_id = _company_id_for_user(db, user_id)
         rows = [_safe_record(row) for row in table(db, "sig_pest_weed_records") if _same_company_or_legacy_user(row, company_id=company_id, user_id=user_id) and (include_non_approved or _safe_text(row.get("digiforms_state") or "0") == "0")]
         rows.sort(key=lambda row: str(row.get("updated_at") or row.get("created_at") or ""), reverse=True)
+    return {"data": rows, "error": None, "count": len(rows)}
+
+
+@router.get("/report-records")
+def list_report_records(
+    template_key: Optional[str] = Query(default=None),
+    include_non_approved: bool = Query(default=False),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Envíos de reporte georreferenciados, para pintarlos como capa del SIG.
+
+    Sólo devuelve los que llegaron con coordenadas: el resto existe igual en el
+    módulo de Reportes, pero no tiene dónde dibujarse en el mapa.
+    """
+    user = _require_user(authorization); user_id = str(user.get("id") or "")
+    # Se recorta el payload crudo de AgtechApps y los campos dinámicos: pintar
+    # un punto no los necesita y en un formulario con muchas preguntas
+    # multiplicarían el peso de la respuesta sin que nadie los lea.
+    campos_de_mapa = (
+        "id", "external_response_id", "template_id", "template_key", "values", "photos",
+        "lat", "lng", "parcel_id", "feature_key", "outside_registered_parcel",
+        "digiforms_form_id", "source", "created_at", "updated_at",
+    )
+    with LOCK:
+        db = read_db(); company_id = _company_id_for_user(db, user_id)
+        rows = [
+            {key: row.get(key) for key in campos_de_mapa}
+            for row in table(db, "report_submissions")
+            if _same_company_or_legacy_user(row, company_id=company_id, user_id=user_id)
+            and row.get("lat") is not None
+            and row.get("lng") is not None
+            and (not template_key or str(row.get("template_key") or "") == template_key)
+            and (include_non_approved or _safe_text(row.get("digiforms_state") or "0") == "0")
+        ]
+        rows.sort(key=lambda row: str(row.get("updated_at") or row.get("created_at") or ""), reverse=True)
+        # El nombre de la plantilla evita que el frontend tenga que cruzar tablas
+        # sólo para poner una etiqueta en el mapa.
+        names = {str(item.get("id")): item.get("name") for item in table(db, "report_templates")}
+    for row in rows:
+        row["template_name"] = names.get(str(row.get("template_id") or "")) or row.get("template_key")
     return {"data": rows, "error": None, "count": len(rows)}
 
 
