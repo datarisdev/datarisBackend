@@ -67,71 +67,55 @@ DEFAULT_LABOR_STANDARDS: list[dict[str, Any]] = [
     {"labor_name": "Aplicación foliar", "category": "foliar", "hours_per_ha": 1.2},
 ]
 
-# Campos extra por categoría. Sin estos, los indicadores de sostenibilidad no
-# se pueden calcular: son las columnas que la hoja añade a cada bloque.
+# Columnas que la hoja añade a los renglones de cada bloque. Son datos de la
+# labor concreta —el riego del 12 de mayo consumió tantos kWh— y sin ellos los
+# indicadores de sostenibilidad no se pueden calcular.
 _EXTRA_FIELDS: dict[str, list[dict[str, Any]]] = {
     "acondicionamiento": [
-        {"name": "diesel_l", "label": "Diesel", "type": "number", "unit": "L/ha"},
-        {
-            "name": "tipo_labranza",
-            "label": "Tipo de labranza",
-            "type": "select",
-            "options": ["Convencional", "Conservación", "Cero labranza", "Mínima"],
-        },
-        {"name": "cobertura_pct", "label": "Cobertura", "type": "number", "unit": "%"},
+        {"name": "diesel_l", "label": "L de diesel", "type": "number", "unit": "L"},
     ],
     "siembra": [
-        {"name": "camas", "label": "Número de camas", "type": "number"},
-        {"name": "hibrido", "label": "Híbrido / variedad", "type": "text"},
-        {
-            "name": "densidad_siembra",
-            "label": "Densidad de siembra",
-            "type": "number",
-            "unit": "sem o kg/ha",
-        },
-        {
-            "name": "densidad_poblacion",
-            "label": "Densidad de población",
-            "type": "number",
-            "unit": "pl/ha",
-        },
+        {"name": "diesel_l", "label": "L de diesel", "type": "number", "unit": "L"},
     ],
     "riego": [
-        {"name": "kwh", "label": "Energía", "type": "number", "unit": "kWh"},
-        {"name": "m3", "label": "Volumen de agua", "type": "number", "unit": "m³"},
+        {"name": "kwh", "label": "Kwh/riego", "type": "number", "unit": "kWh"},
+        {"name": "m3", "label": "M³/riego", "type": "number", "unit": "m³"},
         {"name": "horas_riego", "label": "Horas de riego", "type": "number", "unit": "h"},
     ],
     "fertilizante": [
-        {"name": "n_units", "label": "Unidades de N", "type": "number"},
-        {"name": "p_units", "label": "Unidades de P", "type": "number"},
-        {"name": "k_units", "label": "Unidades de K", "type": "number"},
+        {"name": "n_units", "label": "Unidades N", "type": "number"},
+        {"name": "p_units", "label": "Unidades P", "type": "number"},
+        {"name": "k_units", "label": "Unidades K", "type": "number"},
     ],
     "malezas": [
         {
             "name": "ia_grams",
-            "label": "Ingrediente activo",
+            "label": "g de i.a./L ó Kg",
             "type": "number",
-            "unit": "g de i.a./ha",
+            "unit": "g de i.a.",
         },
     ],
     "plagas": [
         {
             "name": "ia_grams",
-            "label": "Ingrediente activo",
+            "label": "g de i.a./L ó Kg",
             "type": "number",
-            "unit": "g de i.a./ha",
+            "unit": "g de i.a.",
         },
         {"name": "plaga", "label": "Plaga objetivo", "type": "text"},
     ],
     "enfermedades": [
         {
             "name": "ia_grams",
-            "label": "Ingrediente activo",
+            "label": "g de i.a./L ó Kg",
             "type": "number",
-            "unit": "g de i.a./ha",
+            "unit": "g de i.a.",
         },
         {"name": "enfermedad", "label": "Enfermedad objetivo", "type": "text"},
     ],
+    # La hoja parte el bloque foliar en "Aplicación 1" y "Aplicación 2", cada una
+    # con su subtotal. Aquí el número de aplicación es un campo y los subtotales
+    # se agrupan por él, así que no hay tope de dos.
     "foliar": [
         {"name": "aplicacion", "label": "Número de aplicación", "type": "number"},
     ],
@@ -147,12 +131,75 @@ _EXTRA_FIELDS: dict[str, list[dict[str, Any]]] = {
     ],
 }
 
-# Atributos del ciclo completo (no de una labor concreta).
-CYCLE_ATTRIBUTE_FIELDS: list[dict[str, Any]] = [
-    {"name": "superficie_sembrada", "label": "Superficie sembrada", "type": "number", "unit": "ha"},
-    {"name": "sistema_riego", "label": "Sistema de riego", "type": "text"},
-    {"name": "tipo_suelo", "label": "Tipo de suelo", "type": "text"},
-]
+# Datos que la hoja escribe al pie de un bloque y que describen el ciclo, no la
+# labor: el tipo de labranza se decide una vez, no en cada paso de rastra. Antes
+# estaban como columnas de cada renglón, lo que obligaba a repetir el híbrido en
+# las seis líneas de siembra y dejaba seis respuestas distintas a la misma
+# pregunta. Se guardan en `crop_cycles.attributes`.
+_BLOCK_ATTRIBUTES: dict[str, list[dict[str, Any]]] = {
+    "acondicionamiento": [
+        {
+            "name": "tipo_labranza",
+            "label": "Tipo de labranza",
+            "type": "select",
+            "options": ["Convencional", "Conservación", "Cero labranza", "Mínima"],
+        },
+        {
+            "name": "cobertura_pct",
+            "label": "Porcentaje de cobertura",
+            "type": "number",
+            "unit": "%",
+        },
+    ],
+    "siembra": [
+        {"name": "camas", "label": "Número de camas", "type": "number"},
+        {"name": "hibrido", "label": "Híbrido/variedad", "type": "text"},
+        {
+            "name": "densidad_siembra",
+            "label": "Densidad de siembra",
+            "type": "number",
+            "unit": "sem ó Kg/ha",
+        },
+        {
+            "name": "densidad_poblacion",
+            "label": "Densidad de población",
+            "type": "number",
+            "unit": "pl/ha",
+        },
+    ],
+}
+
+# Subtotales que la hoja calcula al cierre de cada bloque. Se declaran aquí —y
+# no en el componente— porque son parte del formato: la plantilla de caña cierra
+# sus bloques con otros números. Las claves las resuelve `kpi.block_totals`.
+_BLOCK_TOTALS: dict[str, list[dict[str, Any]]] = {
+    "acondicionamiento": [
+        {"key": "diesel_l_per_ha", "label": "Litros de diesel/ha", "decimals": 2},
+    ],
+    "siembra": [
+        {"key": "diesel_l_per_ha", "label": "Litros de diesel/ha", "decimals": 2},
+    ],
+    "riego": [
+        {"key": "kwh_per_ha", "label": "Kwh/ha", "decimals": 2},
+        {"key": "m3_per_ha", "label": "M cub/ha", "decimals": 2},
+    ],
+    "fertilizante": [
+        {"key": "n_units", "label": "Nitrógeno", "decimals": 2},
+        {"key": "p_units", "label": "Fósforo", "decimals": 2},
+        {"key": "k_units", "label": "Potasio", "decimals": 2},
+    ],
+    "malezas": [{"key": "ia_grams", "label": "Total gramos de i.a.", "decimals": 2}],
+    "plagas": [{"key": "ia_grams", "label": "Total gramos de i.a.", "decimals": 2}],
+    "enfermedades": [{"key": "ia_grams", "label": "Total gramos de i.a.", "decimals": 2}],
+    "cosecha": [
+        {"key": "rendimiento_ton_ha", "label": "Rendimiento", "decimals": 2},
+    ],
+}
+
+# Atributos del ciclo que no cuelgan de ningún bloque. Hoy todos los que trae la
+# hoja pertenecen a uno, así que la lista queda vacía y existe para las
+# plantillas que un usuario arme por su cuenta.
+CYCLE_ATTRIBUTE_FIELDS: list[dict[str, Any]] = []
 
 
 def _categories(only: list[str] | None = None) -> list[dict[str, Any]]:
@@ -162,7 +209,15 @@ def _categories(only: list[str] | None = None) -> list[dict[str, Any]]:
             "key": key,
             "label": CATEGORY_LABELS[key],
             "fields": deepcopy(_EXTRA_FIELDS.get(key, [])),
+            # Cada bloque se abre con sus renglones, se cierra con sus
+            # subtotales y, si la hoja los pide, con los datos del ciclo que
+            # describen ese bloque. Es el orden del formato en papel.
+            "attributes": deepcopy(_BLOCK_ATTRIBUTES.get(key, [])),
+            "totals": deepcopy(_BLOCK_TOTALS.get(key, [])),
             "supports_inputs": key in {"fertilizante", "malezas", "plagas", "enfermedades", "foliar"},
+            # El bloque foliar de la hoja se subdivide por aplicación, con un
+            # subtotal por cada una.
+            "group_by": "aplicacion" if key == "foliar" else None,
         }
         for key in keys
     ]

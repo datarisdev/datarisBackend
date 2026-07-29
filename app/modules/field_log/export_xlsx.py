@@ -168,6 +168,17 @@ def build_workbook(summary: dict[str, Any], entries: list[dict[str, Any]], sensi
 
     category_costs = {item["category"]: item for item in costs["categories"]}
 
+    # El formato en papel cierra cada bloque con sus propias líneas: los litros
+    # de diesel del acondicionamiento, los kWh y m³ de los riegos, la fórmula
+    # N-P-K, los gramos de i.a. Se reproducen aquí para que el archivo exportado
+    # se lea igual que el original y no como un simple listado de labores.
+    template = summary.get("template") or {}
+    blocks = kpis.get("blocks") or {}
+    cycle_attributes = (cycle.get("attributes") or {}) if isinstance(cycle, dict) else {}
+    declarations = {
+        item.get("key"): item for item in (template.get("categories") or []) if item.get("key")
+    }
+
     for category in LOG_CATEGORIES:
         block = by_category.get(category) or []
         subtotal = category_costs.get(category, {}).get("cost_per_ha", 0.0)
@@ -197,6 +208,23 @@ def build_workbook(summary: dict[str, Any], entries: list[dict[str, Any]], sensi
                 ],
                 number_format=_DECIMAL,
             )
+
+        declaration = declarations.get(category) or {}
+        block_totals = blocks.get(category) or {}
+        for total in declaration.get("totals") or []:
+            value = block_totals.get(total.get("key"))
+            if value in (None, ""):
+                continue
+            row = _write_row(ws, row, [total.get("label"), "", value], number_format=_DECIMAL)
+
+        for attribute in declaration.get("attributes") or []:
+            value = cycle_attributes.get(attribute.get("name"))
+            if value in (None, ""):
+                continue
+            label = attribute.get("label")
+            unit = attribute.get("unit")
+            row = _write_row(ws, row, [f"{label} ({unit})" if unit else label, "", value])
+
     row = _write_row(
         ws,
         row,

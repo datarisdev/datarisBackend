@@ -16,6 +16,13 @@ from typing import Any, Sequence
 DEFAULT_YIELD_STEPS = 10
 DEFAULT_PRICE_STEPS = 9
 
+# Pasos de la hoja: el eje de rendimiento va de 4.5 a 9 t/ha de media en media
+# tonelada, y el de precio de 4 450 a 5 650 $/t de 150 en 150. Son incrementos
+# con los que un productor razona ("media tonelada más", "cien pesos menos");
+# un paso porcentual daría 0.45 t/ha y 133.50 $/t, que se leen peor.
+DEFAULT_YIELD_STEP = 0.5
+DEFAULT_PRICE_STEP = 150.0
+
 
 def _build_axis(center: float, step: float, count: int) -> list[float]:
     """Eje centrado en el valor actual, con `count` valores en total."""
@@ -50,14 +57,12 @@ def build_matrix(
     if yield_values:
         yields = [float(value) for value in yield_values]
     else:
-        step = yield_step or max(round(base_yield * 0.1, 2), 0.1)
-        yields = _build_axis(base_yield, step, DEFAULT_YIELD_STEPS)
+        yields = _build_axis(base_yield, yield_step or DEFAULT_YIELD_STEP, DEFAULT_YIELD_STEPS)
 
     if price_values:
         prices = [float(value) for value in price_values]
     else:
-        step = price_step or max(round(base_price * 0.03, 2), 1.0)
-        prices = _build_axis(base_price, step, DEFAULT_PRICE_STEPS)
+        prices = _build_axis(base_price, price_step or DEFAULT_PRICE_STEP, DEFAULT_PRICE_STEPS)
 
     rows = []
     for yield_value in yields:
