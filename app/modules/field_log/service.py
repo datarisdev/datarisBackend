@@ -29,6 +29,7 @@ from app.modules.field_log.templates import (
     get_system_template,
     list_system_templates,
 )
+from app.services import compat_mirror
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +51,10 @@ def _is_admin(current_user: dict[str, Any]) -> bool:
 
 
 def assert_parcel_access(db: Session, parcel_id: UUID, current_user: dict[str, Any]):
-    parcel = repo.get_parcel(db, parcel_id)
+    # Las parcelas del usuario viven en el almacén compat, no en la tabla, así
+    # que buscarlas solo en `parcels` devolvía 404 para lotes que el usuario
+    # está viendo en pantalla. `ensure_parcel` las refleja la primera vez.
+    parcel = repo.get_parcel(db, parcel_id) or compat_mirror.ensure_parcel(db, parcel_id)
     if not parcel:
         raise HTTPException(status_code=404, detail="Parcela no encontrada")
     if str(parcel.user_id) != str(current_user["id"]) and not _is_admin(current_user):
@@ -78,8 +82,11 @@ def create_cycle(
     data = payload.model_dump()
     # Si no se indica superficie, se hereda la de la parcela: los costos de la
     # bitácora son siempre por hectárea y sin área no hay forma de totalizar.
+    # Se relee la parcela del almacén compat porque el lote pudo redibujarse en
+    # Mapeo después de reflejarse, y heredar la superficie vieja falsearía todo
+    # el costeo del ciclo.
     if data.get("area_ha") is None:
-        data["area_ha"] = parcel.area
+        data["area_ha"] = compat_mirror.refresh_parcel(db, parcel).area
     if not data.get("template_key"):
         data["template_key"] = DEFAULT_TEMPLATE_KEY
 
@@ -107,7 +114,13 @@ def serialize_cycles(db: Session, cycles: list[CropCycle]) -> list[dict[str, Any
     """Añade a cada ciclo el resumen que necesita la lista, sin N+1."""
     cycle_ids = [cycle.id for cycle in cycles]
     aggregates = repo.cycle_aggregates(db, cycle_ids)
-    names = repo.parcel_names(db, [cycle.parcel_id for cycle in cycles])
+    parcel_ids = [cycle.parcel_id for cycle in cycles]
+    names = repo.parcel_names(db, parcel_ids)
+    # Un ciclo cuya parcela aún no está reflejada en la tabla aparecería sin
+    # nombre; el almacén compat sí lo tiene.
+    missing = [parcel_id for parcel_id in parcel_ids if parcel_id not in names]
+    if missing:
+        names.update(compat_mirror.compat_parcel_names(missing))
 
     serialized = []
     for cycle in cycles:
@@ -175,7 +188,7 @@ def create_entry(
         if existing:
             return existing
 
-    parcel = parcel or repo.get_parcel(db, cycle.parcel_id)
+    parcel = parcel or compat_mirror.ensure_parcel(db, cycle.parcel_id)
     location = payload.location.model_dump() if payload.location else None
 
     entry = FieldLogEntry(
@@ -230,7 +243,7 @@ def update_entry(db: Session, *, cycle: CropCycle, entry: FieldLogEntry, payload
 
     if location is not None:
         entry.location = location
-        parcel = repo.get_parcel(db, cycle.parcel_id)
+        parcel = compat_mirror.ensure_parcel(db, cycle.parcel_id)
         entry.location_verified = verify_location(location, _geometry_for(cycle, parcel))
 
     if "quantity" in data or "unit_cost" in data or "cost_per_ha" in data:
@@ -331,7 +344,7 @@ def upsert_phenology(
     """Crea o actualiza la etapa. Una etapa se observa una vez por ciclo."""
     record = repo.get_phenology_by_stage(db, cycle.id, payload.stage_code)
     location = payload.location.model_dump() if payload.location else None
-    parcel = repo.get_parcel(db, cycle.parcel_id)
+    parcel = compat_mirror.ensure_parcel(db, cycle.parcel_id)
     verified = verify_location(location, _geometry_for(cycle, parcel)) if location else None
 
     if record is None:

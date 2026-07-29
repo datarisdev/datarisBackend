@@ -1,4 +1,3 @@
-import uuid
 from typing import Any
 
 from fastapi import Depends, HTTPException, status
@@ -43,24 +42,9 @@ def _ensure_mirrored_user(db: Session, compat_user: dict[str, Any]) -> None:
     `users`. Se refleja acá una fila mínima para que esos inserts no truenen
     con ForeignKeyViolation la primera vez que un usuario compat las usa.
     """
-    try:
-        user_uuid = uuid.UUID(str(compat_user.get("id")))
-    except (TypeError, ValueError):
-        return
-    if db.query(User).filter(User.id == user_uuid).first():
-        return
-    db.add(
-        User(
-            id=user_uuid,
-            email=compat_user.get("email") or f"{user_uuid}@compat.dataris.local",
-            password_hash=compat_user.get("password_hash") or "",
-            is_active=True,
-        )
-    )
-    try:
-        db.commit()
-    except Exception:
-        db.rollback()
+    from app.services.compat_mirror import ensure_mirrored_user
+
+    ensure_mirrored_user(db, compat_user)
 
 
 def get_current_admin(token: str = Depends(oauth2_scheme_admin), db: Session = Depends(get_db)):
