@@ -13,9 +13,11 @@ import pytest
 from app.modules.field_log.kpi import (
     EntryInputSnapshot,
     EntrySnapshot,
+    block_totals,
     compute_kpis,
     cost_summary,
     economics,
+    group_totals,
     sustainability,
 )
 from app.modules.field_log.sensitivity import build_matrix
@@ -210,3 +212,84 @@ class TestComputeKpis:
 
         assert result["economics"]["investment_per_ha"] == pytest.approx(1500.0)
         assert result["sustainability"]["water_m3_per_ha"] == pytest.approx(1200.0)
+
+
+class TestBlockTotals:
+    """El pie de cada bloque, que en la hoja son las sumas bajo cada sección."""
+
+    def test_irrigation_block_closes_with_kwh_and_cubic_metres(self):
+        # La hoja: D50 = SUM(H42:H49) y F50 = SUM(I42:I49).
+        totals = block_totals(
+            [
+                _entry("riego", 900, kwh=310, m3=1200),
+                _entry("riego", 850, kwh=290, m3=1100),
+                _entry("siembra", 4000),
+            ]
+        )
+
+        assert totals["riego"]["kwh_per_ha"] == pytest.approx(600)
+        assert totals["riego"]["m3_per_ha"] == pytest.approx(2300)
+        assert totals["riego"]["cost_per_ha"] == pytest.approx(1750)
+
+    def test_fertilizer_block_closes_with_the_npk_formula(self):
+        totals = block_totals(
+            [
+                EntrySnapshot(
+                    category="fertilizante",
+                    cost_per_ha=3200,
+                    data={"n_units": 120, "p_units": 40},
+                    inputs=(EntryInputSnapshot(n_units=30, k_units=60),),
+                )
+            ]
+        )
+
+        assert totals["fertilizante"]["n_units"] == pytest.approx(150)
+        assert totals["fertilizante"]["p_units"] == pytest.approx(40)
+        assert totals["fertilizante"]["k_units"] == pytest.approx(60)
+
+    def test_active_ingredient_totals_stay_inside_their_block(self):
+        """Un herbicida no puede engordar el total de insecticida del bloque vecino."""
+        totals = block_totals(
+            [_entry("malezas", 500, ia_grams=720), _entry("plagas", 400, ia_grams=180)]
+        )
+
+        assert totals["malezas"]["ia_grams"] == pytest.approx(720)
+        assert totals["plagas"]["ia_grams"] == pytest.approx(180)
+
+    def test_diesel_adds_up_where_the_sheet_asks_for_it(self):
+        totals = block_totals(
+            [_entry("acondicionamiento", 1200, diesel_l=18), _entry("acondicionamiento", 900, diesel_l=12)]
+        )
+
+        assert totals["acondicionamiento"]["diesel_l_per_ha"] == pytest.approx(30)
+
+    def test_a_block_without_entries_has_no_subtotals(self):
+        """Un bloque vacío se muestra vacío, no con ceros que parezcan medidos."""
+        assert block_totals([_entry("riego", 100)])["cosecha"] == {}
+
+
+class TestFoliarApplications:
+    def test_costs_are_grouped_by_application_number(self):
+        # La hoja fija dos aplicaciones (G89 = G90+G95); aquí salen las que haya.
+        groups = group_totals(
+            [
+                _entry("foliar", 300, aplicacion=1),
+                _entry("foliar", 250, aplicacion=1),
+                _entry("foliar", 400, aplicacion=2),
+                _entry("foliar", 150, aplicacion=3),
+            ],
+            category="foliar",
+            field="aplicacion",
+        )
+
+        assert [group["value"] for group in groups] == ["1", "2", "3"]
+        assert [group["cost_per_ha"] for group in groups] == [550, 400, 150]
+
+    def test_entries_without_application_number_go_last(self):
+        groups = group_totals(
+            [_entry("foliar", 100), _entry("foliar", 200, aplicacion=1)],
+            category="foliar",
+            field="aplicacion",
+        )
+
+        assert groups[-1]["value"] is None

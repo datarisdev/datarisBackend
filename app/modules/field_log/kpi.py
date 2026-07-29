@@ -101,6 +101,83 @@ def cost_summary(entries: Sequence[EntrySnapshot]) -> dict[str, Any]:
     }
 
 
+def block_totals(entries: Sequence[EntrySnapshot]) -> dict[str, dict[str, float]]:
+    """Pie de cada bloque, tal como lo cierra la hoja.
+
+    Son las mismas sumas que el formato lleva bajo cada sección —`SUM(H20:H26)`
+    para el diesel del acondicionamiento, `SUM(H42:H49)` y `SUM(I42:I49)` para
+    los kWh y los m³ de los riegos, `SUM(H62:H69)` para los gramos de i.a. de
+    malezas, `SUM(H52:H57)` y hermanas para la fórmula N-P-K— pero acotadas al
+    bloque, que es lo que hace legible el cierre de cada categoría. Los
+    indicadores por tonelada de `sustainability` siguen calculándose aparte
+    sobre todo el ciclo.
+    """
+    totals: dict[str, dict[str, float]] = {category: {} for category in LOG_CATEGORIES}
+
+    for category in LOG_CATEGORIES:
+        block = [entry for entry in entries if entry.category == category]
+        if not block:
+            continue
+
+        values: dict[str, float] = {"cost_per_ha": sum(_number(e.cost_per_ha) for e in block)}
+        one = {category}
+
+        diesel = _sum_field(block, one, "diesel_l", "litros_diesel")
+        if diesel:
+            values["diesel_l_per_ha"] = diesel
+
+        if category == "riego":
+            values["kwh_per_ha"] = _sum_field(block, one, "kwh", "kwh_por_riego", "energy_kwh")
+            values["m3_per_ha"] = _sum_field(block, one, "m3", "m3_por_riego", "water_m3")
+
+        if category == "fertilizante":
+            for key, aliases in (
+                ("n_units", ("n_units", "unidades_n")),
+                ("p_units", ("p_units", "unidades_p")),
+                ("k_units", ("k_units", "unidades_k")),
+            ):
+                values[key] = _sum_field(block, one, *aliases) + _sum_inputs(block, one, key)
+
+        if category in {"malezas", "plagas", "enfermedades"}:
+            values["ia_grams"] = _ia_grams(block, category)
+
+        if category == "cosecha":
+            values["rendimiento_ton_ha"] = _sum_field(block, one, "rendimiento_ton_ha", "rendimiento")
+
+        totals[category] = values
+
+    return totals
+
+
+def group_totals(entries: Sequence[EntrySnapshot], *, category: str, field: str) -> list[dict[str, Any]]:
+    """Subtotales dentro de un bloque, como las dos aplicaciones foliares.
+
+    La hoja fija dos (`G89 = G90+G95`); aquí el número de aplicación es un dato
+    y salen tantos grupos como haya, que es lo que pasa en un ciclo con presión
+    de plaga alta.
+    """
+    buckets: dict[str, float] = {}
+    for entry in entries:
+        if entry.category != category:
+            continue
+        raw = (entry.data or {}).get(field)
+        key = str(raw).strip() if raw not in (None, "") else ""
+        buckets[key] = buckets.get(key, 0.0) + _number(entry.cost_per_ha)
+
+    def sort_key(value: str) -> tuple[int, float | str]:
+        if not value:
+            return (2, "")
+        try:
+            return (0, float(value))
+        except ValueError:
+            return (1, value)
+
+    return [
+        {"value": key or None, "cost_per_ha": total}
+        for key, total in sorted(buckets.items(), key=lambda item: sort_key(item[0]))
+    ]
+
+
 def economics(
     entries: Sequence[EntrySnapshot],
     *,
@@ -232,6 +309,8 @@ def compute_kpis(
         "economics": economic,
         "sustainability": sustainability(entries, yield_ton_ha=yield_ton_ha),
         "costs": summary,
+        "blocks": block_totals(entries),
+        "foliar_applications": group_totals(entries, category="foliar", field="aplicacion"),
         "budget_per_ha": budget_per_ha,
         "budget_usage_percentage": budget_usage,
         "entry_count": len(entries),

@@ -247,3 +247,73 @@ class TestExport:
 
     def test_file_name_is_safe_for_downloads(self):
         assert default_file_name("Ciclo O/I 2026") == "Bitacora - Ciclo O_I 2026.xlsx"
+
+
+class TestBlockFootersInTheExport:
+    """El archivo exportado cierra cada bloque como el formato en papel."""
+
+    def _summary_with_blocks(self):
+        base = TestExport()._summary()
+        base["cycle"]["attributes"] = {"tipo_labranza": "Conservación", "cobertura_pct": 30}
+        base["kpis"]["blocks"] = {
+            "acondicionamiento": {"cost_per_ha": 1800.0, "diesel_l_per_ha": 39.0},
+            "riego": {"cost_per_ha": 1750.0, "kwh_per_ha": 600.0, "m3_per_ha": 2300.0},
+        }
+        base["template"] = {
+            "categories": [
+                {
+                    "key": "acondicionamiento",
+                    "totals": [{"key": "diesel_l_per_ha", "label": "Litros de diesel/ha"}],
+                    "attributes": [
+                        {"name": "tipo_labranza", "label": "Tipo de labranza", "type": "select"},
+                        {
+                            "name": "cobertura_pct",
+                            "label": "Porcentaje de cobertura",
+                            "type": "number",
+                            "unit": "%",
+                        },
+                    ],
+                },
+                {
+                    "key": "riego",
+                    "totals": [
+                        {"key": "kwh_per_ha", "label": "Kwh/ha"},
+                        {"key": "m3_per_ha", "label": "M cub/ha"},
+                    ],
+                },
+            ]
+        }
+        return base
+
+    def _text(self, content: bytes) -> str:
+        ws = load_workbook(BytesIO(content)).active
+        return "\n".join(
+            str(cell.value) for row in ws.iter_rows() for cell in row if cell.value is not None
+        )
+
+    def test_each_block_closes_with_its_own_totals(self):
+        text = self._text(
+            build_workbook(self._summary_with_blocks(), [], TestExport()._sensitivity())
+        )
+
+        assert "Litros de diesel/ha" in text
+        assert "39" in text
+        assert "Kwh/ha" in text
+        assert "M cub/ha" in text
+
+    def test_cycle_data_lands_under_its_own_block(self):
+        """El tipo de labranza vive bajo acondicionamiento, como en la hoja."""
+        text = self._text(
+            build_workbook(self._summary_with_blocks(), [], TestExport()._sensitivity())
+        )
+
+        assert "Tipo de labranza" in text
+        assert "Conservación" in text
+        assert "Porcentaje de cobertura (%)" in text
+
+    def test_a_template_without_declarations_exports_as_before(self):
+        """Una plantilla vieja, sin pies declarados, no rompe la exportación."""
+        summary = TestExport()._summary()
+        text = self._text(build_workbook(summary, [], TestExport()._sensitivity()))
+
+        assert "RESUMEN DE COSTOS" in text
