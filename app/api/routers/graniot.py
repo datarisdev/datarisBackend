@@ -27,7 +27,7 @@ except Exception:  # pragma: no cover - fallback for older Shapely builds
     shapely_make_valid = None
 from PIL import Image, ImageDraw
 
-from app.api.routers.compat import LOCK, bearer_user, now, read_db, table, write_db
+from app.api.routers.compat import LOCK, bearer_user, now, read_db, require_admin_context, table, write_db
 from app.core.config import settings
 from app.services.graniot_client import GraniotAPIError, GraniotClient, GraniotNotConfigured
 from app.services.graniot_debug import clear_logs, get_log_file_path, log_event, read_logs, safe_payload
@@ -2678,18 +2678,50 @@ def _embed_service_account_emails() -> set[str]:
     }
 
 
+GRANIOT_ACCOUNTS_MAX_PAGES = int(os.getenv("GRANIOT_ACCOUNTS_MAX_PAGES", "20"))
+
+
+async def _fetch_all_accounts(client: GraniotClient, *, operation: str) -> List[Dict[str, Any]]:
+    """Read every Graniot account, following pagination when present.
+
+    ``/api/accounts/`` may answer with a plain list or with a DRF paginated
+    object (``{"count", "next", "results"}``). Reading only the first page would
+    silently hide accounts, and a user whose account is not seen here is treated
+    as "has no Graniot account" (their lots would never be uploaded).
+    """
+    accounts: List[Dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    path: Optional[str] = "/api/accounts/"
+
+    for _ in range(max(1, GRANIOT_ACCOUNTS_MAX_PAGES)):
+        if not path or path in seen_urls:
+            break
+        seen_urls.add(path)
+        payload = await client.get(
+            path,
+            include_client_id=False,
+            debug_context={"operation": operation, "page": len(seen_urls)},
+        )
+        accounts.extend(_items(payload))
+        next_url = payload.get("next") if isinstance(payload, dict) else None
+        path = str(next_url) if next_url else None
+
+    # La misma cuenta puede repetirse entre páginas si Graniot reordena.
+    deduped: Dict[str, Dict[str, Any]] = {}
+    for account in accounts:
+        key = str(account.get("id") or account.get("account_email") or len(deduped))
+        deduped.setdefault(key, account)
+    return list(deduped.values())
+
+
 async def _fetch_embed_accounts(*, refresh: bool = False) -> Any:
     """Fetch (with a short cache) the Graniot accounts listing for embed matching."""
     cached = None if refresh else _cache_get(_EMBED_ACCOUNTS_CACHE_KEY)
     if cached is not None:
         return cached
     client = GraniotClient()
-    payload = await client.get(
-        "/api/accounts/",
-        include_client_id=False,
-        debug_context={"operation": "resolve-embed-url-per-user"},
-    )
-    return _cache_set(_EMBED_ACCOUNTS_CACHE_KEY, payload, GRANIOT_EMBED_ACCOUNTS_CACHE_TTL_SECONDS)
+    accounts = await _fetch_all_accounts(client, operation="resolve-embed-url-per-user")
+    return _cache_set(_EMBED_ACCOUNTS_CACHE_KEY, accounts, GRANIOT_EMBED_ACCOUNTS_CACHE_TTL_SECONDS)
 
 
 async def _embed_account_for_user(user: Dict[str, Any]) -> Optional[Dict[str, str]]:
@@ -3656,6 +3688,59 @@ async def _probe_target_account(target: Dict[str, Any]) -> Dict[str, Any]:
             probe[label] = None
             probe[f"{label}_error"] = str(exc)[:300]
     return probe
+
+
+@router.get("/accounts")
+async def list_graniot_accounts(
+    refresh: bool = Query(default=True),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Cuentas de Graniot y qué usuario de Dataris recibe cada una (solo admin).
+
+    Sirve para ver de un vistazo qué usuarios pueden recibir sus lotes en su
+    propio portal y cuáles no tienen cuenta en Graniot todavía. Nunca devuelve
+    ``account_access`` ni el ``auth_id`` del portal.
+    """
+    db = read_db()
+    require_admin_context(authorization, db)
+
+    client = GraniotClient()
+    try:
+        accounts = await _fetch_all_accounts(client, operation="list-graniot-accounts")
+    except Exception as exc:
+        _raise_graniot_error(exc)
+
+    dataris_users = {
+        str(user.get("email") or "").strip().lower(): user
+        for user in (db.get("users") or [])
+        if user.get("email")
+    }
+    matched_emails = set()
+    items: List[Dict[str, Any]] = []
+    for account in accounts:
+        email = str(account.get("account_email") or "").strip().lower()
+        if email:
+            matched_emails.add(email)
+        items.append({
+            "id": account.get("id"),
+            "account_email": account.get("account_email"),
+            "client_id": _account_client_id(account),
+            "has_account_token": bool(_account_access_token(account)),
+            "dataris_user": bool(email and email in dataris_users),
+        })
+    items.sort(key=lambda item: str(item.get("account_email") or "").lower())
+
+    users_without_account = sorted(email for email in dataris_users if email not in matched_emails)
+    return {
+        "data": {
+            "count": len(items),
+            "accounts": items,
+            "dataris_users_total": len(dataris_users),
+            "dataris_users_with_account": sum(1 for item in items if item["dataris_user"]),
+            "dataris_users_without_account": users_without_account,
+        },
+        "error": None,
+    }
 
 
 @router.get("/parcels/sync-target")

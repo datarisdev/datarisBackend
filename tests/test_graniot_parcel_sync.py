@@ -606,3 +606,59 @@ def test_cambiar_el_numero_de_poligonos_rehace_las_parcelas(client: TestClient, 
     assert "DELETE" in methods, "la parcela anterior debe eliminarse"
     assert "POST" in methods, "y volver a crearse con los polígonos nuevos"
     assert "PATCH" not in methods
+
+
+def test_las_cuentas_se_leen_siguiendo_la_paginacion(monkeypatch):
+    """Una respuesta paginada no debe dejar cuentas fuera.
+
+    Un usuario cuya cuenta viva en la segunda página se trataría como "sin
+    cuenta en Graniot" y sus lotes no se subirían a ninguna parte.
+    """
+    pages = {
+        "/api/accounts/": {
+            "count": 4,
+            "next": "https://app.graniot.com/api/accounts/?page=2",
+            "results": [_account("uno@example.com", account_id="acc-1"), _account("dos@example.com", account_id="acc-2")],
+        },
+        "https://app.graniot.com/api/accounts/?page=2": {
+            "count": 4,
+            "next": None,
+            "results": [_account("tres@example.com", account_id="acc-3"), _account(SUPERADMIN["email"], account_id="acc-4")],
+        },
+    }
+
+    class _Paginated(FakeGraniotClient):
+        async def get(self, path, params=None, **kwargs):
+            self._record("GET", path, params=params)
+            if path in pages:
+                return pages[path]
+            return await super().get(path, params=params, **kwargs)
+
+    monkeypatch.setattr(graniot, "GraniotClient", _Paginated)
+
+    accounts = asyncio.run(graniot._fetch_all_accounts(_Paginated(), operation="test"))
+    assert [a["account_email"] for a in accounts] == [
+        "uno@example.com", "dos@example.com", "tres@example.com", SUPERADMIN["email"],
+    ]
+
+    # Y la resolución encuentra al usuario aunque esté en la última página.
+    graniot._cache_delete_prefix(graniot._EMBED_ACCOUNTS_CACHE_KEY)
+    target = asyncio.run(graniot._resolve_sync_target(SUPERADMIN["email"]))
+    assert target["mode"] == graniot.SYNC_MODE_TOKEN
+    assert target["account_id"] == "acc-4"
+
+
+def test_listado_de_cuentas_es_solo_para_admin_y_no_filtra_tokens(client: TestClient, token: str):
+    response = client.get("/api/graniot/accounts", headers=_auth(token))
+
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["count"] == 1
+    account = data["accounts"][0]
+    assert account["account_email"] == SUPERADMIN["email"]
+    assert account["dataris_user"] is True
+    assert "account_access" not in account and "embedded_url" not in account
+    assert isinstance(data["dataris_users_without_account"], list)
+
+    anonymous = client.get("/api/graniot/accounts")
+    assert anonymous.status_code == 401
