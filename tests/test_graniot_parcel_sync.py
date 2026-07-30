@@ -58,7 +58,8 @@ def _live_jwt(minutes: int = 60, user_id: int | None = 1528) -> str:
 
     payload = {"token_type": "access", "exp": int(time.time()) + minutes * 60}
     if user_id is not None:
-        payload["user_id"] = user_id
+        # Graniot emite el id numérico del usuario en la clave "id".
+        payload["id"] = user_id
     return f"{b64({'typ': 'JWT', 'alg': 'HS256'})}.{b64(payload)}.sig"
 
 
