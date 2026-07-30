@@ -3604,6 +3604,7 @@ async def _probe_target_account(target: Dict[str, Any]) -> Dict[str, Any]:
 async def get_parcel_sync_target(
     refresh: bool = Query(default=False),
     probe: bool = Query(default=False),
+    probe_mode: Optional[str] = Query(default=None, description="token|client_id|service: fuerza el modo solo en la sonda"),
     authorization: Optional[str] = Header(default=None),
 ):
     """Diagnostics: which Graniot account receives this user's lots."""
@@ -3622,7 +3623,14 @@ async def get_parcel_sync_target(
         "sync_mode_setting": str(settings.GRANIOT_PARCEL_SYNC_MODE or "auto"),
     }
     if probe:
-        data["probe"] = await _probe_target_account(target)
+        # probe_mode permite comprobar el camino alternativo (por ejemplo si el
+        # `client_id` privilegiado alcanza la cuenta) sin cambiar la
+        # configuración del entorno: la sonda solo lee.
+        probed = dict(target)
+        requested = str(probe_mode or "").strip().lower()
+        if requested in {SYNC_MODE_TOKEN, SYNC_MODE_CLIENT_ID, SYNC_MODE_SERVICE}:
+            probed["mode"] = requested
+        data["probe"] = await _probe_target_account(probed)
     return {"data": data, "error": None}
 
 
