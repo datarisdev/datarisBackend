@@ -20,7 +20,7 @@ from time import monotonic
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
-from fastapi import APIRouter, Body, File, Form, Header, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Body, File, Form, Header, HTTPException, UploadFile
 from starlette.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, Response
 from jose import ExpiredSignatureError, JWTError, jwt
@@ -105,8 +105,17 @@ USER_SCOPED_TABLES = {
     "sig_harvest_records",
     "sig_pest_weed_records",
     "sig_harvest_overrides",
+    # Reportes de campo: las plantillas y los envíos se acotan por empresa
+    # (ver scoped_table_rows), no por usuario, para que el equipo de una empresa
+    # comparta formularios y vea los reportes de su propia empresa.
+    "report_templates",
+    "report_submissions",
     "sig_sync_cursors",
     "digiforms_raw_submissions",
+    # Catálogo de formularios que cada empresa tiene en AgtechApps: es
+    # configuración de un cliente y no debe verse desde otro.
+    "digiforms_forms",
+    "digiforms_form_mappings",
 }
 
 PARCEL_CHILD_TABLES = {
@@ -635,6 +644,40 @@ def user_parcel_ids(db: Dict[str, Any], user_id: str) -> set[str]:
     return {str(row.get("id")) for row in table(db, "parcels") if str(row.get("user_id") or "") == user_id and row.get("id")}
 
 
+def _company_for_user(db: Dict[str, Any], user_id: str) -> Optional[str]:
+    """Empresa a la que pertenece un usuario, sin importar `compat_extensions`.
+
+    Se resuelve por su fila de admin, por el `company_id` del perfil o, en su
+    defecto, casando el `company_name` del perfil contra el catálogo de
+    empresas. Es una copia mínima de `company_for_user` para no crear un import
+    circular entre este módulo y `compat_extensions`.
+    """
+    admin = next(
+        (a for a in table(db, "admin_users") if a.get("user_id") == user_id and a.get("is_active", True)),
+        None,
+    )
+    if admin and admin.get("company_id"):
+        return admin.get("company_id")
+    profile = next((p for p in table(db, "profiles") if p.get("user_id") == user_id), None)
+    if profile and profile.get("company_id"):
+        return profile.get("company_id")
+    if profile and profile.get("company_name"):
+        company = next((c for c in table(db, "companies") if c.get("name") == profile.get("company_name")), None)
+        if company:
+            return company.get("id")
+    return None
+
+
+def _is_platform_superadmin(db: Dict[str, Any], user_id: str) -> bool:
+    """Superadmin de la plataforma (personal de DATARIS), no de una empresa."""
+    return any(
+        row.get("user_id") == user_id
+        and row.get("is_active", True) is not False
+        and row.get("admin_role") == "superadmin"
+        for row in table(db, "admin_users")
+    )
+
+
 def scoped_table_rows(db: Dict[str, Any], table_name: str, user: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     rows = table(db, table_name)
     if not user or table_name not in USER_SCOPED_TABLES:
@@ -656,6 +699,34 @@ def scoped_table_rows(db: Dict[str, Any], table_name: str, user: Optional[Dict[s
         ]
     if table_name == "extension_requests":
         return [row for row in rows if str(row.get("requested_by_user_id") or row.get("user_id") or "") == user_id]
+    if table_name == "report_templates":
+        # Plantillas del sistema (sin company_id) visibles para todos; las de una
+        # empresa, solo para esa empresa.
+        #
+        # El superadmin de la plataforma es la excepción: administra los
+        # formularios de cualquier cliente, igual que ya ve todos los módulos
+        # (ver me_access.py). Sin esto, alguien de DATARIS abría Reportes de
+        # Campo y encontraba el listado vacío porque las plantillas existentes
+        # pertenecían a otras empresas. Los ENVÍOS no siguen esta regla: los
+        # datos que el cliente llena en campo se quedan en su empresa.
+        if _is_platform_superadmin(db, user_id):
+            return rows
+        cid = str(_company_for_user(db, user_id) or "")
+        return [row for row in rows if not row.get("company_id") or str(row.get("company_id")) == cid]
+    if table_name in {"digiforms_forms", "digiforms_form_mappings"}:
+        # Configuración de la integración: se comparte dentro de la empresa y no
+        # sale de ella. Sin empresa resuelta no se ve nada.
+        cid = str(_company_for_user(db, user_id) or "")
+        return [row for row in rows if cid and str(row.get("company_id") or "") == cid]
+    if table_name == "report_submissions":
+        # Los envíos se comparten dentro de la empresa; además cada quien ve los
+        # suyos aunque su empresa no esté resuelta.
+        cid = str(_company_for_user(db, user_id) or "")
+        return [
+            row
+            for row in rows
+            if (cid and str(row.get("company_id") or "") == cid) or str(row.get("user_id") or "") == user_id
+        ]
     return [row for row in rows if str(row.get("user_id") or "") == user_id]
 
 
@@ -1115,6 +1186,60 @@ def create_manual_admin_user(payload: Dict[str, Any] = Body(default_factory=dict
     }
 
 
+@router.post("/reports/templates")
+def save_report_template(payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
+    """Crea o actualiza una plantilla de reporte. Solo para admins de empresa.
+
+    Es la vía oficial de guardado del builder: a diferencia del insert genérico,
+    exige `require_admin_context`, de modo que un usuario normal no puede alterar
+    el formulario que usa el resto de su empresa. La plantilla queda anclada a la
+    empresa del admin (salvo el superadmin, que puede fijar otra o dejarla como
+    plantilla de sistema).
+    """
+    with LOCK:
+        db = read_db()
+        ctx = require_admin_context(authorization, db)
+        admin = ctx["admin"]
+        is_super = admin.get("admin_role") == "superadmin"
+
+        key = str(payload.get("key") or "").strip()
+        if not key:
+            raise HTTPException(status_code=400, detail="La plantilla necesita una clave (key)")
+
+        # Un admin de empresa solo puede tocar plantillas de su empresa; el
+        # superadmin puede fijar cualquier company_id o dejarlo nulo (sistema).
+        company_id = payload.get("company_id") if is_super else admin.get("company_id")
+
+        rows = table(db, "report_templates")
+        template_id = payload.get("id")
+        t = now()
+        record = {
+            "key": key,
+            "name": str(payload.get("name") or key),
+            "version": int(payload.get("version") or 1),
+            "is_system": bool(payload.get("is_system", False)),
+            "schema": payload.get("schema") or {},
+            "catalogs": payload.get("catalogs") or {},
+            "company_id": company_id,
+            "updated_at": t,
+        }
+
+        existing = next((r for r in rows if template_id and r.get("id") == template_id), None)
+        if existing:
+            if not is_super and str(existing.get("company_id") or "") != str(admin.get("company_id") or ""):
+                raise HTTPException(status_code=403, detail="No puedes editar plantillas de otra empresa")
+            existing.update(record)
+            saved = existing
+        else:
+            record["id"] = template_id or str(uuid.uuid4())
+            record["created_at"] = t
+            rows.append(record)
+            saved = record
+
+        write_db(db)
+        return {"data": saved, "error": None}
+
+
 @router.post("/tables/{table_name}/query")
 def query(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
     user = bearer_user(authorization)
@@ -1237,7 +1362,12 @@ def update(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict)
 
 
 @router.post("/tables/{table_name}/delete")
-def delete(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
+def delete(
+    table_name: str,
+    background_tasks: BackgroundTasks,
+    payload: Dict[str, Any] = Body(default_factory=dict),
+    authorization: Optional[str] = Header(default=None),
+):
     user = bearer_user(authorization)
     with LOCK:
         db = read_db()
@@ -1247,6 +1377,10 @@ def delete(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict)
         ids = {id(r) for r in targets}
         db["tables"][table_name] = [r for r in rows if id(r) not in ids]
         write_db(db)
+    if table_name == "parcels":
+        # The lot is gone locally; remove its parcels from the user's Graniot
+        # account too so both sides stay in sync.
+        schedule_graniot_parcel_delete(background_tasks, user, targets)
     return {"data": targets, "error": None, "count": len(targets)}
 
 
@@ -1329,8 +1463,124 @@ async def helicopter_copilot(
         raise HTTPException(status_code=500, detail=f"Error generando copiloto de aplicación aérea: {exc}")
 
 
+# ---------------------------------------------------------------------------
+# Graniot mirror for lots
+# ---------------------------------------------------------------------------
+# The Satélite module embeds each user's own Graniot portal, so a lot created in
+# Dataris must also exist in that user's Graniot account (and disappear from it
+# when the lot is deleted). Both operations go through Graniot's API, which is
+# what removes the dependency on Graniot's commercial team.
+#
+# Everything here is best-effort: Graniot being slow or unreachable must never
+# break creating or deleting a lot in Dataris. Failures are recorded in the
+# lot's `graniot_sync_error` field (see the graniot router) and in the logs.
+
+
+def _graniot_log(event: str, **fields: Any) -> None:
+    try:
+        from app.services.graniot_debug import log_event
+
+        log_event({"event": event, **fields})
+    except Exception:
+        pass
+
+
+async def _graniot_sync_parcels_task(user: Dict[str, Any], parcel_ids: List[str]) -> None:
+    from app.api.routers.graniot import sync_local_parcel_to_graniot
+
+    for parcel_id in parcel_ids:
+        try:
+            await sync_local_parcel_to_graniot(
+                user,
+                parcel_id,
+                {"metadata": {"origin": "dataris-autosync"}},
+                require_account=True,
+            )
+            _graniot_log(
+                "dataris.compat.parcel_autosync.ok",
+                operation="parcel-autosync",
+                local_parcel_id=parcel_id,
+            )
+        except HTTPException as exc:
+            # 409 = the user has no Graniot account with that email. Expected for
+            # Dataris-only users; nothing is pushed anywhere.
+            _graniot_log(
+                "dataris.compat.parcel_autosync.skipped" if exc.status_code == 409 else "dataris.compat.parcel_autosync.failed",
+                operation="parcel-autosync",
+                local_parcel_id=parcel_id,
+                status_code=exc.status_code,
+                message=str(exc.detail),
+            )
+        except Exception as exc:  # noqa: BLE001 — a background task must never bubble up
+            _graniot_log(
+                "dataris.compat.parcel_autosync.failed",
+                operation="parcel-autosync",
+                local_parcel_id=parcel_id,
+                exception_type=type(exc).__name__,
+                message=str(exc),
+            )
+
+
+async def _graniot_delete_parcels_task(user: Dict[str, Any], snapshots: List[Dict[str, Any]]) -> None:
+    from app.api.routers.graniot import delete_parcel_from_graniot
+
+    for snapshot in snapshots:
+        try:
+            # The local row is already gone, so there is nothing left to clear.
+            result = await delete_parcel_from_graniot(user, snapshot, clear_local=False)
+            _graniot_log(
+                "dataris.compat.parcel_autodelete.failed" if result.get("failed") else "dataris.compat.parcel_autodelete.ok",
+                operation="parcel-autodelete",
+                local_parcel_id=snapshot.get("id"),
+                deleted=result.get("deleted"),
+                missing=result.get("missing"),
+                failed=result.get("failed"),
+            )
+        except Exception as exc:  # noqa: BLE001 — a background task must never bubble up
+            _graniot_log(
+                "dataris.compat.parcel_autodelete.failed",
+                operation="parcel-autodelete",
+                local_parcel_id=snapshot.get("id"),
+                exception_type=type(exc).__name__,
+                message=str(exc),
+            )
+
+
+def schedule_graniot_parcel_sync(
+    background: Optional[BackgroundTasks],
+    user: Optional[Dict[str, Any]],
+    parcels: Iterable[Dict[str, Any]],
+) -> None:
+    if background is None or not user or not settings.GRANIOT_PARCEL_AUTOSYNC_ENABLED:
+        return
+    if not settings.GRANIOT_PARCEL_SYNC_PER_USER_ENABLED:
+        return
+    parcel_ids = [str(row.get("id")) for row in parcels if isinstance(row, dict) and row.get("id")]
+    if not parcel_ids:
+        return
+    background.add_task(_graniot_sync_parcels_task, dict(user), parcel_ids)
+
+
+def schedule_graniot_parcel_delete(
+    background: Optional[BackgroundTasks],
+    user: Optional[Dict[str, Any]],
+    parcels: Iterable[Dict[str, Any]],
+) -> None:
+    if background is None or not user or not settings.GRANIOT_PARCEL_AUTODELETE_ENABLED:
+        return
+    snapshots = [
+        dict(row)
+        for row in parcels
+        if isinstance(row, dict) and (row.get("graniot_parcel_id") or row.get("graniot_parcels") or row.get("graniot_raw"))
+    ]
+    if not snapshots:
+        return
+    background.add_task(_graniot_delete_parcels_task, dict(user), snapshots)
+
+
 @router.post("/parcels/upload")
 async def upload_parcel_from_satellite(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     name: str = Form(...),
     authorization: Optional[str] = Header(default=None),
@@ -1390,6 +1640,7 @@ async def upload_parcel_from_satellite(
                 })
                 created_rows.append(upsert_user_parcel(db, user["id"], row))
             write_db(db)
+        schedule_graniot_parcel_sync(background_tasks, user, created_rows)
         return {"data": {"parcel": created_rows[0], "parcels": created_rows}, "error": None}
     except ValueError as exc:
         try:
@@ -1503,6 +1754,7 @@ async def resolve_google_maps_link(
 
 @router.post("/parcels/create-manual")
 def create_manual_parcel(
+    background_tasks: BackgroundTasks,
     payload: Dict[str, Any] = Body(default_factory=dict),
     authorization: Optional[str] = Header(default=None),
 ):
@@ -1533,6 +1785,7 @@ def create_manual_parcel(
         db = read_db()
         row = upsert_user_parcel(db, user["id"], row)
         write_db(db)
+    schedule_graniot_parcel_sync(background_tasks, user, [row])
     return {"data": {"parcel": row}, "error": None}
 
 

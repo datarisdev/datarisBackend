@@ -24,9 +24,21 @@ def _text(value: Any) -> str:
     return "" if value is None else str(value).strip()
 
 
-def _normalize(value: Any) -> str:
+def normalize_key(value: Any) -> str:
+    """Reduce un nombre de campo a su forma comparable.
+
+    DigiForms devuelve las preguntas tal como las escribió quien armó el
+    formulario ("Método de Cosecha", "metodo_cosecha", "MetodoCosecha"), así que
+    cualquier cruce con nombres de Dataris tiene que ignorar acentos, mayúsculas
+    y separadores. Es pública porque el enlazador de plantillas la necesita para
+    proponer el mapeo de campos.
+    """
     replacements = str.maketrans("áéíóúüñ", "aeiouun")
     return "".join(ch for ch in _text(value).lower().translate(replacements) if ch.isalnum())
+
+
+def _normalize(value: Any) -> str:
+    return normalize_key(value)
 
 
 def _first_value(payload: Dict[str, Any], aliases: Iterable[str], default: Any = None) -> Any:
@@ -160,6 +172,50 @@ def extract_image_rows(payload: Any) -> List[Dict[str, Any]]:
     return images
 
 
+def extract_form_rows(payload: Any) -> List[Dict[str, Any]]:
+    """Normaliza el listado de formularios de `GET api/form/{clientId}`.
+
+    El proveedor responde `{"Forms": [{Id, Title, Description, ValidFrom,
+    ValidTo, Status, Category, ReferenceId, IsPublic}]}`. Se acepta también una
+    lista suelta por si otra versión del servicio omite el envoltorio.
+
+    Ojo con dos formatos del contrato: `IsPublic` llega como CADENA ("false") y
+    `Status` es un identificador de estatus, no un texto legible.
+    """
+    raw_forms: Any = payload
+    if isinstance(payload, dict):
+        raw_forms = _first_value(payload, ["Forms", "Form", "Data", "Results"], []) or []
+    if not isinstance(raw_forms, list):
+        return []
+
+    forms: List[Dict[str, Any]] = []
+    for item in raw_forms:
+        if not isinstance(item, dict):
+            continue
+        form_id = _text(_first_value(item, ["Id", "FormId", "IdFormulario"], ""))
+        if not form_id:
+            continue
+        title = _text(_first_value(item, ["Title", "FormTitle", "Nombre"], ""))
+        description = _text(_first_value(item, ["Description", "FormDescription"], ""))
+        is_public_raw = _text(_first_value(item, ["IsPublic", "isPublic"], ""))
+        forms.append({
+            "form_id": form_id,
+            # El título es lo que reconoce una persona; si viene vacío se cae a
+            # la descripción y, en último caso, al propio identificador.
+            "name": title or description or form_id,
+            "description": description,
+            "title": title,
+            "category": _text(_first_value(item, ["Category", "Categoria"], "")),
+            "status": _text(_first_value(item, ["Status", "StatusId"], "")),
+            "reference_id": _text(_first_value(item, ["ReferenceId", "RefId"], "")),
+            "valid_from": _text(_first_value(item, ["ValidFrom"], "")),
+            "valid_to": _text(_first_value(item, ["ValidTo"], "")),
+            "is_public": is_public_raw.lower() in {"true", "1", "si", "sí", "yes"},
+            "raw": item,
+        })
+    return forms
+
+
 def response_id_from_payload(payload: Dict[str, Any]) -> str:
     return _text(
         _first_value(
@@ -270,8 +326,23 @@ class DigiformsDataAPI:
         if response.status_code >= 400:
             excerpt = _error_excerpt(response.text)
             suffix = f" Respuesta del proveedor: {excerpt}" if excerpt else ""
+            # Los dos errores que el proveedor documenta tienen una causa
+            # concreta y accionable; traducirlos evita que el operador vea sólo
+            # un número y no sepa qué corregir.
+            if response.status_code == 400:
+                message = (
+                    "AgtechApps rechazó la petición: el ClientId no coincide con el del usuario técnico autenticado. "
+                    "Revisa ClientId y usuario en la configuración de la empresa."
+                )
+            elif response.status_code == 401:
+                message = (
+                    "AgtechApps no autorizó la consulta. Suele indicar un problema con la suscripción del cliente "
+                    "o credenciales incorrectas."
+                )
+            else:
+                message = f"DigiForms Data API respondió con error HTTP {response.status_code}."
             raise DigiformsDataAPIError(
-                f"DigiForms Data API respondió con error HTTP {response.status_code}.{suffix}",
+                f"{message}{suffix}",
                 status_code=response.status_code,
                 response_text=response.text,
             )
@@ -283,6 +354,17 @@ class DigiformsDataAPI:
                 status_code=response.status_code,
                 response_text=response.text,
             ) from exc
+
+    async def get_forms(self, client_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Listado de formularios del cliente (`GET api/form/{clientId}`).
+
+        Es lo que permite ofrecer los formularios por nombre en lugar de pedir
+        que alguien copie el identificador interno. El `clientId` de la ruta debe
+        ser el mismo del usuario autenticado o el proveedor responde 400.
+        """
+        target = quote(str(client_id or self.config.client_id), safe="")
+        payload = await self._request_json(f"form/{target}")
+        return extract_form_rows(payload)
 
     async def get_all_results_since(self, form_id: str, last_response_id: int | str) -> Any:
         client_id = quote(self.config.client_id, safe="")

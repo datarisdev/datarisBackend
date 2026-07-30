@@ -28,6 +28,16 @@ from app.services.digiforms_company_config import (
     safe_mappings,
 )
 from app.services.digiforms_data_api import DigiformsDataAPI, DigiformsDataAPIError
+from app.services.digiforms_report_links import (
+    find_form,
+    forms_for_company,
+    is_report_form_type,
+    report_form_type_for,
+    safe_form,
+    safe_forms,
+    suggest_field_map,
+    template_fields,
+)
 from app.services.commercial_demo_seed import DEMO_COMPANY_ID, is_commercial_demo_user
 
 router = APIRouter(prefix="/compat/extensions", tags=["Compatibility Extensions"])
@@ -1129,3 +1139,421 @@ async def deactivate_digiforms_user(link_id: str, authorization: Optional[str] =
         row.update({"active": False, "external_status": "deactivated_in_digiforms", "last_api_action": "deactivate", "last_api_status": "deactivated_in_digiforms", "last_api_response": external_response, "deactivated_at": t, "updated_at": t})
         create_operation_log(db, user_id=user.get("id"), action="deactivate_user", status="ok", target_user_id=digiforms_user_id, response=external_response); write_db(db); data = safe_digiforms_link(row)
     return {"data": data, "error": None}
+
+
+# ---------------------------------------------------------------------------
+# Catálogo de formularios de AgtechApps
+#
+# El proveedor no expone ninguna ruta para listar los formularios de un cliente
+# (su Data API se limita a `results/GetAll` e `images`), así que el listado se
+# mantiene aquí. Registrar un formulario una vez, con nombre legible, es lo que
+# permite elegirlo después en un desplegable en lugar de pegar el FormId interno
+# en cada pantalla.
+# ---------------------------------------------------------------------------
+
+
+def _visible_report_templates(db: Dict[str, Any], company_id: Optional[str], is_super: bool = False) -> List[Dict[str, Any]]:
+    """Plantillas que la empresa puede enlazar: las suyas y las del sistema.
+
+    El superadmin de la plataforma las ve todas, igual que en `scoped_table_rows`:
+    si no, alguien de DATARIS abría el desplegable para conectar un formulario y
+    no encontraba la plantilla del cliente al que quería configurársela.
+    """
+    rows = table(db, "report_templates")
+    visible = (
+        list(rows)
+        if is_super
+        else [row for row in rows if not row.get("company_id") or str(row.get("company_id")) == str(company_id or "")]
+    )
+    latest: Dict[str, Dict[str, Any]] = {}
+    for template in visible:
+        key = str(template.get("key") or "")
+        current = latest.get(key)
+        if not current or int(template.get("version") or 0) > int(current.get("version") or 0):
+            latest[key] = template
+    return sorted(latest.values(), key=lambda item: str(item.get("name") or ""))
+
+
+def _template_by_id(db: Dict[str, Any], template_id: str, company_id: Optional[str], is_super: bool = False) -> Dict[str, Any]:
+    template = next((row for row in table(db, "report_templates") if str(row.get("id")) == str(template_id)), None)
+    if not template:
+        raise HTTPException(status_code=404, detail="La plantilla de reporte no existe")
+    if not is_super and template.get("company_id") and str(template.get("company_id")) != str(company_id or ""):
+        raise HTTPException(status_code=403, detail="Esa plantilla pertenece a otra empresa")
+    return template
+
+
+@router.get("/digiforms/forms")
+def list_digiforms_forms(authorization: Optional[str] = Header(default=None)):
+    """Catálogo de formularios de AgtechApps y plantillas enlazables."""
+    user = require_user(authorization)
+    with LOCK:
+        db = read_db()
+        scope = current_link_scope(db, user)
+        company_id = scope.get("company_id")
+        is_super = (scope.get("admin") or {}).get("admin_role") == "superadmin"
+        forms = safe_forms(forms_for_company(db, company_id))
+        nombres_empresa = {str(row.get("id")): row.get("name") for row in table(db, "companies")}
+        templates = [
+            {
+                "id": row.get("id"),
+                "key": row.get("key"),
+                "name": row.get("name"),
+                "version": row.get("version"),
+                # Para el superadmin la lista mezcla plantillas de varios
+                # clientes: sin saber de quién es cada una, elegir sería a ciegas.
+                "company_id": row.get("company_id"),
+                "company_name": nombres_empresa.get(str(row.get("company_id") or "")) if row.get("company_id") else None,
+            }
+            for row in _visible_report_templates(db, company_id, is_super)
+        ]
+        can_edit = is_admin(scope.get("admin"))
+    return {"data": {"forms": forms, "report_templates": templates, "can_edit": can_edit}, "error": None}
+
+
+@router.post("/digiforms/forms")
+def upsert_digiforms_form(payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
+    """Registra un formulario de AgtechApps en el catálogo de la empresa."""
+    user = require_user(authorization)
+    with LOCK:
+        db = read_db()
+        scope = require_company_admin_scope(db, user, str(payload.get("company_id") or "") or None)
+        company_id = str(scope.get("company_id") or "")
+        form_id = str(payload.get("form_id") or "").strip()
+        if not form_id:
+            raise HTTPException(status_code=400, detail="Indica el FormId interno del formulario en AgtechApps")
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Ponle un nombre al formulario para poder reconocerlo")
+        timestamp = now()
+        row = find_form(db, company_id, form_id)
+        values = {
+            "company_id": company_id,
+            "form_id": form_id,
+            "name": name,
+            "description": str(payload.get("description") or "").strip(),
+            "updated_at": timestamp,
+        }
+        if row:
+            row.update(values)
+        else:
+            row = {"id": str(uuid.uuid4()), "created_at": timestamp, "discovered_fields": [], "verification_status": "not_tested", **values}
+            table(db, "digiforms_forms").append(row)
+        write_db(db)
+        data = safe_form(row)
+    return {"data": data, "error": None}
+
+
+@router.post("/digiforms/forms/import")
+async def import_digiforms_forms(payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
+    """Trae el listado de formularios directamente desde AgtechApps.
+
+    Evita tener que copiar identificadores a mano: el proveedor publica los
+    formularios del cliente en `GET api/form/{clientId}`. Los que ya estaban en
+    el catálogo se actualizan conservando lo que Dataris sabe de ellos (las
+    preguntas descubiertas y su verificación); los registrados a mano que no
+    aparecen en el listado se respetan, porque pueden ser de otro cliente o
+    haberse creado antes de que existiera este endpoint.
+    """
+    user = require_user(authorization)
+    with LOCK:
+        db = read_db()
+        scope = require_company_admin_scope(db, user, str(payload.get("company_id") or "") or None)
+        company_id = str(scope.get("company_id") or "")
+        credentials = _company_runtime_connection(db, company_id)
+
+    if not credentials.get("client_id") or not credentials.get("api_user") or not credentials.get("api_password"):
+        raise HTTPException(status_code=400, detail="Configura primero ClientId, usuario técnico y contraseña de AgtechApps")
+
+    api = DigiformsDataAPI(
+        client_id=credentials.get("client_id"),
+        api_user=credentials.get("api_user"),
+        api_password=credentials.get("api_password"),
+    )
+    try:
+        remote_forms = await api.get_forms()
+    except DigiformsDataAPIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    created = 0
+    updated = 0
+    with LOCK:
+        db = read_db()
+        rows = table(db, "digiforms_forms")
+        timestamp = now()
+        for remote in remote_forms:
+            existing = find_form(db, company_id, remote["form_id"])
+            values = {
+                "name": remote["name"],
+                "description": remote["description"],
+                "category": remote["category"],
+                "provider_status": remote["status"],
+                "reference_id": remote["reference_id"],
+                "valid_from": remote["valid_from"],
+                "valid_to": remote["valid_to"],
+                "is_public": remote["is_public"],
+                "source": "agtechapps_catalog",
+                "updated_at": timestamp,
+            }
+            if existing:
+                # El nombre puesto a mano no se pisa si el proveedor no trae uno
+                # mejor: alguien pudo renombrarlo para reconocerlo.
+                if not remote["name"] or remote["name"] == remote["form_id"]:
+                    values.pop("name")
+                existing.update(values)
+                updated += 1
+            else:
+                rows.append({
+                    "id": str(uuid.uuid4()),
+                    "company_id": company_id,
+                    "form_id": remote["form_id"],
+                    "discovered_fields": [],
+                    "verification_status": "not_tested",
+                    "created_at": timestamp,
+                    **values,
+                })
+                created += 1
+        write_db(db)
+        forms = safe_forms(forms_for_company(db, company_id))
+
+    return {
+        "data": {"forms": forms, "created": created, "updated": updated, "received": len(remote_forms)},
+        "error": None,
+        "message": f"{len(remote_forms)} formularios recibidos de AgtechApps ({created} nuevos).",
+    }
+
+
+@router.delete("/digiforms/forms/{row_id}")
+def delete_digiforms_form(row_id: str, authorization: Optional[str] = Header(default=None)):
+    user = require_user(authorization)
+    with LOCK:
+        db = read_db()
+        scope = require_company_admin_scope(db, user)
+        company_id = str(scope.get("company_id") or "")
+        rows = table(db, "digiforms_forms")
+        row = next((item for item in rows if str(item.get("id")) == row_id and str(item.get("company_id") or "") == company_id), None)
+        if not row:
+            raise HTTPException(status_code=404, detail="Ese formulario no está en el catálogo")
+        # Un formulario enlazado no se borra a la ligera: dejaría el vínculo
+        # apuntando a un formulario que ya no se puede elegir en la interfaz.
+        linked = next(
+            (item for item in mappings_for_company(db, company_id)
+             if str(item.get("form_id") or "") == str(row.get("form_id") or "") and item.get("report_template_id")),
+            None,
+        )
+        if linked:
+            raise HTTPException(status_code=400, detail="Primero quita el vínculo de este formulario con su plantilla de reporte")
+        rows.remove(row)
+        write_db(db)
+    return {"data": {"ok": True}, "error": None}
+
+
+@router.post("/digiforms/forms/verify")
+async def verify_digiforms_form(payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
+    """Consulta el formulario en AgtechApps y guarda los campos que descubre.
+
+    Es el paso que convierte un FormId opaco en algo utilizable: la Data API
+    devuelve las preguntas reales del formato, y con ellas se puede proponer el
+    mapeo contra una plantilla sin que nadie los teclee.
+    """
+    user = require_user(authorization)
+    with LOCK:
+        db = read_db()
+        scope = require_company_admin_scope(db, user, str(payload.get("company_id") or "") or None)
+        company_id = str(scope.get("company_id") or "")
+        form_id = str(payload.get("form_id") or "").strip()
+        if not form_id:
+            raise HTTPException(status_code=400, detail="Indica el formulario que quieres comprobar")
+        credentials = _company_runtime_connection(db, company_id)
+        default_start, default_end = _default_initial_sync_dates()
+        start_date = _clean_iso_date(payload.get("start_date"), default_start)
+        end_date = _clean_iso_date(payload.get("end_date"), default_end)
+
+    if not credentials.get("client_id") or not credentials.get("api_user") or not credentials.get("api_password"):
+        raise HTTPException(status_code=400, detail="Configura primero ClientId, usuario técnico y contraseña de AgtechApps")
+
+    api = DigiformsDataAPI(
+        client_id=credentials.get("client_id"),
+        api_user=credentials.get("api_user"),
+        api_password=credentials.get("api_password"),
+    )
+    try:
+        probe = await api.test_results_connection(form_id, 0, start_date=start_date, end_date=end_date)
+        error_message = None
+    except DigiformsDataAPIError as exc:
+        probe = {"ok": False, "records_received": 0, "discovered_fields": []}
+        error_message = str(exc)
+
+    with LOCK:
+        db = read_db()
+        row = find_form(db, company_id, form_id)
+        timestamp = now()
+        if row is not None:
+            row.update({
+                "discovered_fields": list(probe.get("discovered_fields") or []) or list(row.get("discovered_fields") or []),
+                "last_verified_at": timestamp,
+                "last_records_seen": int(probe.get("records_received") or 0),
+                "verification_status": "ok" if not error_message else "error",
+                "verification_error": error_message,
+                "updated_at": timestamp,
+            })
+            write_db(db)
+            data = safe_form(row)
+        else:
+            data = {"form_id": form_id, "discovered_fields": list(probe.get("discovered_fields") or [])}
+    return {
+        "data": {**data, "ok": not error_message, "records_received": int(probe.get("records_received") or 0), "message": error_message},
+        "error": None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Vínculos formulario de AgtechApps ↔ plantilla de Reportes de Campo
+# ---------------------------------------------------------------------------
+
+
+@router.get("/digiforms/report-links")
+def list_report_links(authorization: Optional[str] = Header(default=None)):
+    user = require_user(authorization)
+    with LOCK:
+        db = read_db()
+        scope = current_link_scope(db, user)
+        company_id = scope.get("company_id")
+        links = [
+            safe_mappings([row])[0]
+            for row in mappings_for_company(db, company_id)
+            if is_report_form_type(row.get("form_type"))
+        ]
+        forms = {str(item.get("form_id")): item for item in forms_for_company(db, company_id)}
+        for link in links:
+            catalog_entry = forms.get(str(link.get("form_id") or ""))
+            link["form_name"] = (catalog_entry or {}).get("name") or link.get("form_id")
+            link["discovered_fields"] = list((catalog_entry or {}).get("discovered_fields") or [])
+        can_edit = is_admin(scope.get("admin"))
+    return {"data": {"links": links, "can_edit": can_edit}, "error": None}
+
+
+@router.post("/digiforms/report-links/suggest")
+def suggest_report_link_mapping(payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
+    """Propone el mapeo de campos entre un formulario y una plantilla.
+
+    No guarda nada: la interfaz enseña la propuesta para que un admin la revise
+    antes de confirmarla.
+    """
+    user = require_user(authorization)
+    with LOCK:
+        db = read_db()
+        scope = require_company_admin_scope(db, user)
+        company_id = str(scope.get("company_id") or "")
+        form_id = str(payload.get("form_id") or "").strip()
+        is_super = (scope.get("admin") or {}).get("admin_role") == "superadmin"
+        template = _template_by_id(db, str(payload.get("report_template_id") or ""), company_id, is_super)
+        catalog_entry = find_form(db, company_id, form_id)
+        if not catalog_entry:
+            raise HTTPException(status_code=404, detail="Ese formulario no está en el catálogo de la empresa")
+        discovered = list(payload.get("discovered_fields") or catalog_entry.get("discovered_fields") or [])
+        schema = template.get("schema") or {}
+        suggestion = suggest_field_map(schema, discovered)
+        fields = template_fields(schema)
+    return {
+        "data": {
+            "field_map": suggestion,
+            "template_fields": fields,
+            "discovered_fields": discovered,
+            "unmapped_template_fields": [f["key"] for f in fields if f.get("kind") != "table" and f["key"] not in suggestion],
+            "unused_api_fields": [name for name in discovered if name not in suggestion.values()],
+        },
+        "error": None,
+    }
+
+
+@router.post("/digiforms/report-links")
+def save_report_link(payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
+    """Enlaza un formulario de AgtechApps con una plantilla de Reportes."""
+    user = require_user(authorization)
+    with LOCK:
+        db = read_db()
+        scope = require_company_admin_scope(db, user, str(payload.get("company_id") or "") or None)
+        company_id = str(scope.get("company_id") or "")
+        form_id = str(payload.get("form_id") or "").strip()
+        if not form_id:
+            raise HTTPException(status_code=400, detail="Elige el formulario de AgtechApps")
+        catalog_entry = find_form(db, company_id, form_id)
+        if not catalog_entry:
+            raise HTTPException(status_code=404, detail="Ese formulario no está en el catálogo de la empresa")
+        is_super = (scope.get("admin") or {}).get("admin_role") == "superadmin"
+        template = _template_by_id(db, str(payload.get("report_template_id") or ""), company_id, is_super)
+
+        field_map = payload.get("field_map")
+        if not isinstance(field_map, dict) or not field_map:
+            # Sin mapeo explícito se propone uno: enlazar y que no llegue nada
+            # sería la peor combinación posible.
+            field_map = suggest_field_map(template.get("schema") or {}, catalog_entry.get("discovered_fields") or [])
+        field_map = {str(key): str(value) for key, value in field_map.items() if str(key) and str(value)}
+
+        form_type = report_form_type_for(form_id)
+        default_start, default_end = _default_initial_sync_dates()
+        previous = mapping_for_company(db, company_id, form_type) or {}
+        initial_response_id = int(payload.get("initial_response_id") or previous.get("initial_response_id") or 0)
+        start_date = _clean_iso_date(payload.get("initial_sync_start_date"), str(previous.get("initial_sync_start_date") or default_start))
+        end_date = _clean_iso_date(payload.get("initial_sync_end_date"), str(previous.get("initial_sync_end_date") or default_end))
+        timestamp = now()
+
+        mapping = _upsert_form_mapping(
+            db,
+            company_id=company_id,
+            form_type=form_type,
+            form_id=form_id,
+            display_name=str(payload.get("display_name") or catalog_entry.get("name") or template.get("name") or "Reporte"),
+            initial_response_id=initial_response_id,
+            initial_sync_start_date=start_date,
+            initial_sync_end_date=end_date,
+            timestamp=timestamp,
+        )
+        mapping.update({
+            "report_template_id": template.get("id"),
+            "report_template_key": template.get("key"),
+            "field_map": field_map,
+            "is_enabled": payload.get("is_enabled", True) is not False,
+        })
+
+        # Un vínculo nuevo, o uno que cambia de plantilla, arranca su cursor
+        # desde el principio para no perderse respuestas ya existentes.
+        if not previous or previous.get("report_template_id") != template.get("id") or payload.get("reset_cursor") is True:
+            _reset_company_cursor(
+                db,
+                company_id=company_id,
+                form_type=form_type,
+                form_id=form_id,
+                initial_response_id=initial_response_id,
+                timestamp=timestamp,
+            )
+        write_db(db)
+        data = safe_mappings([mapping])[0]
+    return {"data": data, "error": None, "message": "Formulario enlazado con la plantilla de reporte."}
+
+
+@router.delete("/digiforms/report-links/{form_id}")
+def delete_report_link(form_id: str, authorization: Optional[str] = Header(default=None)):
+    user = require_user(authorization)
+    with LOCK:
+        db = read_db()
+        scope = require_company_admin_scope(db, user)
+        company_id = str(scope.get("company_id") or "")
+        form_type = report_form_type_for(form_id)
+        rows = table(db, "digiforms_form_mappings")
+        row = next(
+            (item for item in rows
+             if str(item.get("company_id") or "") == company_id and str(item.get("form_type") or "") == form_type),
+            None,
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="Ese formulario no está enlazado")
+        rows.remove(row)
+        # El cursor se va con el vínculo: si mañana se vuelve a enlazar, conviene
+        # que reimporte desde el inicio en lugar de heredar una posición vieja.
+        cursors = table(db, "sig_sync_cursors")
+        for cursor in [item for item in cursors if str(item.get("company_id") or "") == company_id and item.get("form_type") == form_type]:
+            cursors.remove(cursor)
+        write_db(db)
+    return {"data": {"ok": True}, "error": None}
