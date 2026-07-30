@@ -3690,9 +3690,50 @@ async def _probe_target_account(target: Dict[str, Any]) -> Dict[str, Any]:
     return probe
 
 
+async def _fetch_farm_managers(client: GraniotClient, limit: int = 40) -> Dict[str, Any]:
+    """Gestores dados de alta dentro de las fincas de la cuenta.
+
+    Son personas creadas *dentro* de una cuenta de Graniot y NO aparecen en
+    ``/api/accounts/``: no tienen portal propio, así que sus emails no sirven
+    para repartir los lotes por usuario. Se listan solo como diagnóstico, para
+    distinguirlos de las cuentas reales.
+    """
+    result: Dict[str, Any] = {"farms": 0, "managers": [], "error": None}
+    try:
+        farms = _items(await client.get("/api/farms/", debug_context={"operation": "list-farm-managers"}))
+    except Exception as exc:  # noqa: BLE001 — diagnóstico, nunca rompe la respuesta
+        result["error"] = str(exc)[:300]
+        return result
+
+    result["farms"] = len(farms)
+    seen: Dict[str, Dict[str, Any]] = {}
+    for farm in farms[:limit]:
+        farm_id = _clean_id(farm.get("id"))
+        if not farm_id:
+            continue
+        try:
+            managers = _items(await client.get(
+                f"/api/farms/{farm_id}/managers/",
+                debug_context={"operation": "list-farm-managers", "farm_id": farm_id},
+            ))
+        except Exception:
+            continue
+        for manager in managers:
+            key = str(manager.get("key") or manager.get("id") or manager.get("name"))
+            entry = seen.setdefault(key, {
+                "id": manager.get("id"),
+                "name": manager.get("name"),
+                "farms": [],
+            })
+            entry["farms"].append(farm.get("name") or farm_id)
+    result["managers"] = list(seen.values())
+    return result
+
+
 @router.get("/accounts")
 async def list_graniot_accounts(
     refresh: bool = Query(default=True),
+    include_managers: bool = Query(default=False),
     authorization: Optional[str] = Header(default=None),
 ):
     """Cuentas de Graniot y qué usuario de Dataris recibe cada una (solo admin).
@@ -3731,16 +3772,16 @@ async def list_graniot_accounts(
     items.sort(key=lambda item: str(item.get("account_email") or "").lower())
 
     users_without_account = sorted(email for email in dataris_users if email not in matched_emails)
-    return {
-        "data": {
-            "count": len(items),
-            "accounts": items,
-            "dataris_users_total": len(dataris_users),
-            "dataris_users_with_account": sum(1 for item in items if item["dataris_user"]),
-            "dataris_users_without_account": users_without_account,
-        },
-        "error": None,
+    data: Dict[str, Any] = {
+        "count": len(items),
+        "accounts": items,
+        "dataris_users_total": len(dataris_users),
+        "dataris_users_with_account": sum(1 for item in items if item["dataris_user"]),
+        "dataris_users_without_account": users_without_account,
     }
+    if include_managers:
+        data["farm_managers"] = await _fetch_farm_managers(client)
+    return {"data": data, "error": None}
 
 
 @router.get("/parcels/sync-target")
