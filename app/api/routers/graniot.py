@@ -2781,10 +2781,13 @@ def _jwt_payload(token: Any) -> Dict[str, Any]:
 def _account_client_id(account: Optional[Dict[str, Any]]) -> Optional[str]:
     """Value for Graniot's privileged ``client_id`` parameter.
 
-    ``/api/accounts/`` returns ids like ``acc-82910c84-…`` while ``client_id``
-    identifies the *user* Graniot must act as, which is the numeric ``user_id``
-    carried by the account/embed SimpleJWT. Prefer that id and keep the account
-    id only as a last resort.
+    ``client_id`` identifies the *user* Graniot must act as, which is the numeric
+    ``user_id`` carried by the account/embed SimpleJWT.
+
+    The account ids in ``/api/accounts/`` look like ``acc-82910c84-…`` and are
+    NOT valid here: sending one makes Graniot answer HTTP 500 (verified against
+    the live API). So when no numeric user id is available there is no usable
+    client_id, and the caller keeps the account token as the only way in.
     """
     if not isinstance(account, dict):
         return None
@@ -2793,10 +2796,11 @@ def _account_client_id(account: Optional[Dict[str, Any]]) -> Optional[str]:
         _embed_url_auth_token(account.get("embedded_url") or ""),
     ]
     for token in tokens:
-        user_id = _clean_id(_jwt_payload(token).get("user_id"))
-        if user_id:
+        payload = _jwt_payload(token)
+        user_id = _clean_id(payload.get("user_id") or payload.get("uid"))
+        if user_id and user_id.isdigit():
             return user_id
-    return _account_id_value(account)
+    return None
 
 
 def _account_access_token(account: Optional[Dict[str, Any]]) -> Optional[str]:
