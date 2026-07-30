@@ -3761,6 +3761,7 @@ async def _fetch_farm_managers(client: GraniotClient, limit: int = 40) -> Dict[s
 async def list_graniot_accounts(
     refresh: bool = Query(default=True),
     include_managers: bool = Query(default=False),
+    probe_client_id: Optional[str] = Query(default=None, description="Comprueba qué ve la API key actuando como este client_id"),
     authorization: Optional[str] = Header(default=None),
 ):
     """Cuentas de Graniot y qué usuario de Dataris recibe cada una (solo admin).
@@ -3818,6 +3819,15 @@ async def list_graniot_accounts(
             if entry.get("account_id") and str(entry.get("account_id")) not in known_ids
         })
         data["farm_managers"] = managers
+    if probe_client_id:
+        # Los vínculos de finca identifican a la cuenta por email, no por el
+        # "acc-<uuid>" de /api/accounts/. Esto comprueba con qué identificador
+        # acepta Graniot actuar en nombre de otra cuenta.
+        data["client_id_probe"] = await _probe_target_account({
+            "mode": SYNC_MODE_CLIENT_ID,
+            "client_id": str(probe_client_id).strip(),
+        })
+        data["client_id_probe"]["client_id"] = str(probe_client_id).strip()
     return {"data": data, "error": None}
 
 
