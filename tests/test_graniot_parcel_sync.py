@@ -138,7 +138,11 @@ class FakeGraniotClient:
 
     async def patch(self, path, json_body=None, params=None, **kwargs):
         self._record("PATCH", path, json_body=json_body)
-        return {"id": 90001, "properties": {"key": "key-0"}}
+        # Graniot solo acepta la forma documentada: id + parcelGeoJson. La forma
+        # de creación (`geom`) responde HTTP 500 en la API real.
+        if "geom" in (json_body or {}) or "parcelGeoJson" not in (json_body or {}):
+            raise graniot.GraniotAPIError(500, "Server Error (500)")
+        return {"id": (json_body or {}).get("id"), "properties": {"key": "key-0"}}
 
     async def delete(self, path, params=None, **kwargs):
         self._record("DELETE", path, params=params)
@@ -528,3 +532,77 @@ def test_sin_user_id_numerico_no_hay_client_id_utilizable():
     without_token = asyncio.run(graniot._resolve_sync_target(SUPERADMIN["email"]))
     assert without_token["mode"] == graniot.SYNC_MODE_SERVICE
     assert without_token["reason"] == "account_without_id"
+
+
+def test_actualizar_usa_el_contrato_documentado_de_patch(client: TestClient, token: str):
+    created = client.post(
+        "/api/compat/parcels/create-manual",
+        headers=_auth(token),
+        json={"name": "Lote actualizable", "geometry": polygon(0.15)},
+    )
+    assert created.status_code == 200, created.text
+    parcel_id = created.json()["data"]["parcel"]["id"]
+
+    FakeGraniotClient.reset()
+    updated = client.post(
+        f"/api/graniot/parcels/sync-local/{parcel_id}",
+        headers=_auth(token),
+        json={"force_update": True},
+    )
+    assert updated.status_code == 200, updated.text
+
+    patches = [c for c in FakeGraniotClient.calls if c["method"] == "PATCH"]
+    assert len(patches) == 1
+    body = patches[0]["json_body"]
+    assert body["id"] == 90001
+    assert "geom" not in body
+    feature = body["parcelGeoJson"]["features"][0]
+    assert feature["id"] == 90001
+    assert feature["geometry"]["type"] == "Polygon"
+    # La metadata del PATCH debe ser plana: Graniot la documenta clave/valor.
+    assert all(isinstance(value, (str, int, float, bool)) for value in body["metadata"].values())
+
+    stored = client.post(
+        "/api/compat/tables/parcels/query",
+        headers=_auth(token),
+        json={"filters": [{"column": "id", "op": "eq", "value": parcel_id}], "single": True},
+    ).json()["data"]
+    # Tras actualizar, el lote conserva su identidad en Graniot.
+    assert str(stored["graniot_parcel_id"]) == "90001"
+    assert not stored.get("graniot_sync_error")
+
+
+def test_cambiar_el_numero_de_poligonos_rehace_las_parcelas(client: TestClient, token: str):
+    created = client.post(
+        "/api/compat/parcels/create-manual",
+        headers=_auth(token),
+        json={"name": "Lote que cambia", "geometry": polygon(0.2)},
+    )
+    parcel_id = created.json()["data"]["parcel"]["id"]
+
+    # Dos polígonos donde antes había uno: no se puede emparejar 1 a 1.
+    multi = {
+        "type": "MultiPolygon",
+        "coordinates": [polygon(0.2)["coordinates"], polygon(0.25)["coordinates"]],
+    }
+    client.post(
+        "/api/compat/tables/parcels/update",
+        headers=_auth(token),
+        json={
+            "filters": [{"column": "id", "op": "eq", "value": parcel_id}],
+            "data": {"geometry": multi, "geometry_geojson": multi},
+        },
+    )
+
+    FakeGraniotClient.reset()
+    resynced = client.post(
+        f"/api/graniot/parcels/sync-local/{parcel_id}",
+        headers=_auth(token),
+        json={"force_update": True},
+    )
+    assert resynced.status_code == 200, resynced.text
+
+    methods = [c["method"] for c in FakeGraniotClient.calls if c["path"].startswith("/api/parcels/")]
+    assert "DELETE" in methods, "la parcela anterior debe eliminarse"
+    assert "POST" in methods, "y volver a crearse con los polígonos nuevos"
+    assert "PATCH" not in methods

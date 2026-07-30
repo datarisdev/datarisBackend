@@ -2465,17 +2465,38 @@ def _build_graniot_parcels_payload(feature_collection: Dict[str, Any], farm_ref:
     }
 
 
-def _build_graniot_single_parcel_payload(parcels_payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Build a single-parcel PATCH payload for already-synced local parcels."""
-    parcels = parcels_payload.get("parcels") if isinstance(parcels_payload, dict) else []
-    if not isinstance(parcels, list) or not parcels:
-        raise HTTPException(status_code=400, detail="No hay lote para actualizar en Graniot")
-    first = parcels[0]
+def _flat_metadata(metadata: Any) -> Dict[str, Any]:
+    """Graniot documents PATCH metadata as flat key/value pairs."""
+    flat: Dict[str, Any] = {}
+    if not isinstance(metadata, dict):
+        return flat
+    for key, value in metadata.items():
+        if value in (None, ""):
+            continue
+        flat[str(key)] = value if isinstance(value, (str, int, float, bool)) else _json_dumps(value)
+    return flat
+
+
+def _build_graniot_parcel_patch_payload(parcel: Dict[str, Any], remote_id: Any) -> Dict[str, Any]:
+    """Build the PATCH /api/parcels/{id}/ body documented by Graniot.
+
+    Updating a parcel does NOT reuse the create shape: it expects ``id``, an
+    optional ``name``/flat ``metadata`` and the geometry under
+    ``parcelGeoJson`` as a FeatureCollection whose feature carries the parcel id.
+    Sending the create-style ``geom`` key makes Graniot answer HTTP 500.
+    """
+    geometry = (parcel.get("geom") or {}).get("geometry") if isinstance(parcel.get("geom"), dict) else None
+    if not geometry:
+        raise HTTPException(status_code=400, detail="No hay geometría para actualizar en Graniot")
+    reference = _as_int_if_numeric(remote_id)
     return {
-        "farm": parcels_payload.get("farm"),
-        "name": first.get("name"),
-        "metadata": first.get("metadata") or {},
-        "geom": first.get("geom"),
+        "id": reference,
+        "name": parcel.get("name"),
+        "metadata": _flat_metadata(parcel.get("metadata")),
+        "parcelGeoJson": {
+            "type": "FeatureCollection",
+            "features": [{"id": reference, "type": "Feature", "geometry": geometry}],
+        },
     }
 
 
@@ -3275,26 +3296,50 @@ async def sync_local_parcel_to_graniot(
             "payload": safe_payload(graniot_payload),
         })
 
-        # A lot that already exists in Graniot must be patched, never posted
+        # A lot that already exists in Graniot must be updated, never posted
         # again: re-uploading the same file updates the local row in place and a
         # second POST would leave duplicated parcels in the user's portal.
-        if local.get("graniot_parcel_id") and (payload.get("force_update") or prefer_update):
-            patch_payload = _build_graniot_single_parcel_payload(graniot_payload)
-            raw = await client.patch(
-                f"/api/parcels/{local['graniot_parcel_id']}/",
-                json_body=patch_payload,
-                params=None,
-                debug_context={
-                    "operation": "sync-local-parcel",
-                    "attempt": "force-update-confirmed-geom-payload",
-                    "local_parcel_id": parcel_id,
-                    "farm_id": farm_id,
-                    "farm_ref": farm_ref,
-                },
-            )
-            last_payload_error = _payload_error_message(raw)
-            if last_payload_error:
-                raise GraniotAPIError(400, last_payload_error, raw)
+        remote_ids = _remote_parcel_ids(local)
+        parcels_to_send = graniot_payload.get("parcels") or []
+        wants_update = bool(remote_ids) and bool(payload.get("force_update") or prefer_update)
+
+        if wants_update and len(remote_ids) != len(parcels_to_send):
+            # El lote pasó a tener otro número de polígonos: actualizar uno por
+            # uno dejaría parcelas de sobra o de menos en el portal, así que se
+            # borra lo anterior y se vuelve a crear.
+            log_event({
+                "event": "dataris.sync_local_parcel.recreating",
+                "operation": "sync-local-parcel",
+                "local_parcel_id": parcel_id,
+                "remote_ids": remote_ids,
+                "new_parcel_count": len(parcels_to_send),
+            })
+            await delete_parcel_from_graniot(user, local, clear_local=False)
+            remote_ids = []
+            wants_update = False
+
+        if wants_update:
+            features: List[Dict[str, Any]] = []
+            for remote_id, parcel in zip(remote_ids, parcels_to_send):
+                patch_payload = _build_graniot_parcel_patch_payload(parcel, remote_id)
+                patched = await client.patch(
+                    f"/api/parcels/{remote_id}/",
+                    json_body=patch_payload,
+                    params=None,
+                    debug_context={
+                        "operation": "sync-local-parcel",
+                        "attempt": "update-confirmed-parcelgeojson-payload",
+                        "local_parcel_id": parcel_id,
+                        "graniot_parcel_id": remote_id,
+                        "farm_id": farm_id,
+                    },
+                )
+                last_payload_error = _payload_error_message(patched)
+                if last_payload_error:
+                    raise GraniotAPIError(400, last_payload_error, patched)
+                for item in _items(patched) or [{}]:
+                    features.append(item if isinstance(item, dict) else {})
+            raw = {"type": "FeatureCollection", "features": features}
         else:
             # Graniot support confirmed this endpoint expects exactly:
             # farm as an object, parcels as an array, and each parcel geometry
@@ -3318,6 +3363,15 @@ async def sync_local_parcel_to_graniot(
 
         ids = _extract_graniot_ids(raw)
         graniot_subparcels = _public_graniot_subparcels(raw)
+        if wants_update:
+            # Una actualización puede responder sin repetir los identificadores:
+            # el lote sigue siendo el mismo, así que se conservan los que había.
+            ids = {
+                key: (value if value not in (None, "") else local.get(key))
+                for key, value in ids.items()
+            }
+            if not graniot_subparcels:
+                graniot_subparcels = local.get("graniot_parcels") or []
         log_event({
             "event": "dataris.sync_local_parcel.graniot_raw_success",
             "operation": "sync-local-parcel",
