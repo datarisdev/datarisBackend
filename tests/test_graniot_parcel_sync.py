@@ -290,6 +290,53 @@ def test_borrado_tolera_parcelas_ya_inexistentes():
     assert result["failed"] == []
 
 
+def test_borrado_de_lotes_heredados_reintenta_con_la_cuenta_de_servicio():
+    # El lote se sincronizó antes del reparto por usuario: vive en la cuenta de
+    # la API key, donde el token del usuario no lo encuentra.
+    FakeGraniotClient.delete_status = {}
+
+    class _OnlyServiceCanDelete(FakeGraniotClient):
+        async def delete(self, path, params=None, **kwargs):
+            self._record("DELETE", path, params=params)
+            if self.access_token or self.client_id:
+                raise graniot.GraniotAPIError(404, "Not found")
+            return None
+
+    original = graniot.GraniotClient
+    graniot.GraniotClient = _OnlyServiceCanDelete
+    try:
+        result = asyncio.run(
+            graniot.delete_parcel_from_graniot(
+                {"id": "u1", "email": SUPERADMIN["email"]},
+                {"id": "p1", "graniot_parcel_id": 900},
+                clear_local=False,
+            )
+        )
+    finally:
+        graniot.GraniotClient = original
+
+    assert result["deleted"] == ["900"]
+    assert result["missing"] == []
+    attempts = [call for call in FakeGraniotClient.calls if call["method"] == "DELETE"]
+    assert len(attempts) == 2, "primero con la cuenta del usuario y luego con la de servicio"
+    assert attempts[0]["access_token"] and not attempts[1]["access_token"]
+
+
+def test_borrado_no_reintenta_cuando_el_lote_sabe_su_cuenta():
+    FakeGraniotClient.delete_status = {"/api/parcels/900/": 404}
+
+    result = asyncio.run(
+        graniot.delete_parcel_from_graniot(
+            {"id": "u1", "email": SUPERADMIN["email"]},
+            {"id": "p1", "graniot_parcel_id": 900, "graniot_account_email": SUPERADMIN["email"]},
+            clear_local=False,
+        )
+    )
+
+    assert result["missing"] == ["900"]
+    assert len([call for call in FakeGraniotClient.calls if call["method"] == "DELETE"]) == 1
+
+
 def test_borrado_informa_los_fallos_reales():
     FakeGraniotClient.delete_status = {"/api/parcels/900/": 500}
 

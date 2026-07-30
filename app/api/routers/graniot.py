@@ -3442,29 +3442,49 @@ async def delete_parcel_from_graniot(
     result["target"] = _public_sync_target(target)
     client = _client_for_target(target)
 
-    for remote_id in remote_ids:
+    async def _try_delete(active: GraniotClient, remote_id: str, attempt: str) -> Optional[GraniotAPIError]:
+        """Return None when the parcel is gone, or the error that prevented it."""
         try:
-            await client.delete(
+            await active.delete(
                 f"/api/parcels/{remote_id}/",
                 debug_context={
                     "operation": "delete-local-parcel",
+                    "attempt": attempt,
                     "local_parcel_id": (local or {}).get("id"),
                     "graniot_parcel_id": remote_id,
                     "mode": target.get("mode"),
                 },
             )
-            result["deleted"].append(remote_id)
+            return None
         except GraniotAPIError as exc:
-            if exc.status_code in {404, 410}:
-                result["missing"].append(remote_id)
-                continue
-            result["failed"].append({
-                "graniot_parcel_id": remote_id,
-                "status_code": exc.status_code,
-                "message": str(exc),
-            })
+            return exc
         except Exception as exc:  # noqa: BLE001 — keep deleting the other parcels
-            result["failed"].append({"graniot_parcel_id": remote_id, "message": str(exc)})
+            return GraniotAPIError(500, str(exc))
+
+    # Lots synced before parcels were split per user live in the API key owner's
+    # account, where the user's own token/client_id cannot reach them. Only those
+    # (no stored account) get a second attempt with the service client.
+    legacy_fallback = target.get("mode") != SYNC_MODE_SERVICE and not str(
+        (local or {}).get("graniot_account_email") or ""
+    ).strip()
+    service_client: Optional[GraniotClient] = None
+
+    for remote_id in remote_ids:
+        error = await _try_delete(client, remote_id, "target-account")
+        if error is not None and legacy_fallback and error.status_code in {403, 404, 410}:
+            service_client = service_client or GraniotClient()
+            error = await _try_delete(service_client, remote_id, "legacy-service-account")
+        if error is None:
+            result["deleted"].append(remote_id)
+            continue
+        if error.status_code in {404, 410}:
+            result["missing"].append(remote_id)
+            continue
+        result["failed"].append({
+            "graniot_parcel_id": remote_id,
+            "status_code": error.status_code,
+            "message": str(error),
+        })
 
     if clear_local and not result["failed"]:
         cleared = _clear_local_graniot_fields(str((local or {}).get("id") or ""), (user or {}).get("id"))
