@@ -3737,8 +3737,13 @@ async def _fetch_farm_managers(client: GraniotClient, limit: int = 40) -> Dict[s
                 ),
                 None,
             )
-            key = str(email or manager.get("key") or manager.get("id") or name or json.dumps(manager, sort_keys=True, default=str))
+            # Cada "manager" es en realidad un vínculo cuenta↔finca: agruparlos
+            # por account_id dice cuántas cuentas de Graniot tienen fincas, que
+            # puede ser más que las que /api/accounts/ deja ver.
+            account_id = _clean_id(manager.get("account_id"))
+            key = str(account_id or email or manager.get("key") or name or json.dumps(manager, sort_keys=True, default=str))
             entry = seen.setdefault(key, {
+                "account_id": account_id,
                 "id": manager.get("id"),
                 "name": name,
                 "email": email,
@@ -3802,7 +3807,17 @@ async def list_graniot_accounts(
         "dataris_users_without_account": users_without_account,
     }
     if include_managers:
-        data["farm_managers"] = await _fetch_farm_managers(client)
+        managers = await _fetch_farm_managers(client)
+        known_ids = {str(item.get("id")) for item in items if item.get("id")}
+        managers["accounts_with_farms"] = len({
+            entry.get("account_id") for entry in managers.get("managers") or [] if entry.get("account_id")
+        })
+        managers["accounts_not_listed"] = sorted({
+            str(entry.get("account_id"))
+            for entry in managers.get("managers") or []
+            if entry.get("account_id") and str(entry.get("account_id")) not in known_ids
+        })
+        data["farm_managers"] = managers
     return {"data": data, "error": None}
 
 
