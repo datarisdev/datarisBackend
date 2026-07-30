@@ -3868,12 +3868,23 @@ async def list_graniot_accounts(
         email = str(account.get("account_email") or "").strip().lower()
         if email:
             matched_emails.add(email)
+        claims = _jwt_payload(account.get("account_access")) or _jwt_payload(
+            _embed_url_auth_token(account.get("embedded_url") or "")
+        )
         items.append({
             "id": account.get("id"),
             "account_email": account.get("account_email"),
             "client_id": _account_client_id(account),
             "has_account_token": bool(_account_access_token(account)),
             "dataris_user": bool(email and email in dataris_users),
+            # Qué identificadores trae el token: Graniot solo acepta como
+            # client_id el id numérico del usuario.
+            "token_claims": sorted(claims.keys()),
+            "token_ids": {
+                key: claims.get(key)
+                for key in ("user_id", "uid", "sub", "account_id", "id")
+                if claims.get(key) is not None
+            },
         })
     items.sort(key=lambda item: str(item.get("account_email") or "").lower())
 
