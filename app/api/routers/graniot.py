@@ -3911,6 +3911,35 @@ async def create_graniot_account(
     }
 
 
+@router.delete("/accounts/{account_id}")
+async def delete_graniot_account(
+    account_id: str,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Da de baja una cuenta de Graniot creada desde Dataris (solo admin).
+
+    Permite deshacer un alta equivocada. No toca las fincas ni las parcelas de
+    la cuenta: solo retira el acceso que Dataris había dado de alta.
+    """
+    db = read_db()
+    require_admin_context(authorization, db)
+
+    client = GraniotClient()
+    try:
+        await client.delete(
+            f"/api/accounts/{account_id}/",
+            debug_context={"operation": "delete-graniot-account", "account_id": account_id},
+        )
+    except GraniotAPIError as exc:
+        if exc.status_code not in {404, 410}:
+            _raise_graniot_error(exc)
+    except Exception as exc:
+        _raise_graniot_error(exc)
+
+    _cache_delete_prefix(_EMBED_ACCOUNTS_CACHE_KEY)
+    return {"data": {"account_id": account_id, "deleted": True}, "error": None}
+
+
 @router.get("/parcels/sync-target")
 async def get_parcel_sync_target(
     refresh: bool = Query(default=False),
