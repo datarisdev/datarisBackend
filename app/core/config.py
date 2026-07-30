@@ -69,6 +69,9 @@ class Settings(BaseSettings):
     # - "auto": use the account token (account_access) when Graniot exposes it,
     #   otherwise fall back to the privileged `client_id` query parameter.
     # - "token" / "client_id": force one of them.
+    # Verified against the live API: `account_access` works, and `client_id` is
+    # only usable with a numeric Graniot user id (the account ids returned by
+    # /api/accounts/, "acc-<uuid>", make Graniot answer HTTP 500).
     GRANIOT_PARCEL_SYNC_MODE: str = "auto"
     # Push new lots to Graniot automatically (upload + manual drawing).
     GRANIOT_PARCEL_AUTOSYNC_ENABLED: bool = True

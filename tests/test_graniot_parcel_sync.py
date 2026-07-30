@@ -180,7 +180,8 @@ def test_target_usa_el_token_de_la_cuenta_del_usuario():
     assert target["account_email"] == SUPERADMIN["email"]
     assert target["account_id"] == "acc-1528"
     # client_id identifica al *usuario* de Graniot, no a la cuenta: se toma del
-    # user_id del JWT porque el id de /api/accounts/ es del tipo "acc-…".
+    # user_id numérico del JWT porque el id de /api/accounts/ ("acc-…") hace que
+    # Graniot responda HTTP 500.
     assert target["client_id"] == "1528"
     assert target["access_token"]
     # Los datos que llegan al navegador nunca incluyen el token.
@@ -510,3 +511,20 @@ def test_quitar_de_graniot_mantiene_el_lote_en_dataris(client: TestClient, token
     assert row["name"] == "Lote solo Dataris"
     assert not row.get("graniot_parcel_id")
     assert not row.get("graniot_synced_at")
+
+
+def test_sin_user_id_numerico_no_hay_client_id_utilizable():
+    # El id de cuenta "acc-<uuid>" no vale como client_id: Graniot responde 500.
+    # Sin user_id numérico en el JWT, el token de la cuenta es la única vía.
+    FakeGraniotClient.accounts = [_account(SUPERADMIN["email"], user_id=None)]
+
+    target = asyncio.run(graniot._resolve_sync_target(SUPERADMIN["email"]))
+    assert target["mode"] == graniot.SYNC_MODE_TOKEN
+    assert target["client_id"] is None
+
+    FakeGraniotClient.accounts = [_account(SUPERADMIN["email"], token=_expired_jwt(), user_id=None)]
+    graniot._cache_delete_prefix(graniot._EMBED_ACCOUNTS_CACHE_KEY)
+
+    without_token = asyncio.run(graniot._resolve_sync_target(SUPERADMIN["email"]))
+    assert without_token["mode"] == graniot.SYNC_MODE_SERVICE
+    assert without_token["reason"] == "account_without_id"
