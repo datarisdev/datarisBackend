@@ -30,23 +30,35 @@ from app.main import app  # noqa: E402
 from app.api.routers import compat, graniot  # noqa: E402
 
 SUPERADMIN = {"email": "admin@dataris.local", "password": "admin123456"}
-POLYGON = {
-    "type": "Polygon",
-    "coordinates": [[
-        [-90.5, 14.5],
-        [-90.5, 14.51],
-        [-90.49, 14.51],
-        [-90.49, 14.5],
-        [-90.5, 14.5],
-    ]],
-}
+def polygon(offset: float = 0.0) -> dict:
+    """Polígono propio para cada caso.
+
+    El almacén compat deduplica los lotes de un usuario por geometría, así que
+    dos casos con el mismo polígono se pisarían la fila entre ellos.
+    """
+    west, south = -90.5 + offset, 14.5 + offset
+    return {
+        "type": "Polygon",
+        "coordinates": [[
+            [west, south],
+            [west, south + 0.01],
+            [west + 0.01, south + 0.01],
+            [west + 0.01, south],
+            [west, south],
+        ]],
+    }
 
 
-def _live_jwt(minutes: int = 60) -> str:
+POLYGON = polygon()
+
+
+def _live_jwt(minutes: int = 60, user_id: int | None = 1528) -> str:
     def b64(data: dict) -> str:
         return base64.urlsafe_b64encode(json.dumps(data).encode()).rstrip(b"=").decode()
 
     payload = {"token_type": "access", "exp": int(time.time()) + minutes * 60}
+    if user_id is not None:
+        payload["user_id"] = user_id
     return f"{b64({'typ': 'JWT', 'alg': 'HS256'})}.{b64(payload)}.sig"
 
 
@@ -58,12 +70,12 @@ def _expired_jwt() -> str:
     return f"{b64({'typ': 'JWT', 'alg': 'HS256'})}.{b64(payload)}.sig"
 
 
-def _account(email: str, *, account_id: str = "1528", token: str | None = None) -> dict:
+def _account(email: str, *, account_id: str = "acc-1528", token: str | None = None, user_id: int | None = 1528) -> dict:
     return {
         "id": account_id,
         "account_email": email,
-        "embedded_url": f"https://embed.graniot.com/?auth_id={_live_jwt()}",
-        "account_access": token if token is not None else _live_jwt(),
+        "embedded_url": f"https://embed.graniot.com/?auth_id={_live_jwt(user_id=user_id)}",
+        "account_access": token if token is not None else _live_jwt(user_id=user_id),
     }
 
 
@@ -166,7 +178,10 @@ def test_target_usa_el_token_de_la_cuenta_del_usuario():
 
     assert target["mode"] == graniot.SYNC_MODE_TOKEN
     assert target["account_email"] == SUPERADMIN["email"]
-    assert target["account_id"] == "1528"
+    assert target["account_id"] == "acc-1528"
+    # client_id identifica al *usuario* de Graniot, no a la cuenta: se toma del
+    # user_id del JWT porque el id de /api/accounts/ es del tipo "acc-…".
+    assert target["client_id"] == "1528"
     assert target["access_token"]
     # Los datos que llegan al navegador nunca incluyen el token.
     assert "access_token" not in graniot._public_sync_target(target)
@@ -179,7 +194,7 @@ def test_target_cae_a_client_id_si_graniot_no_expone_token_vivo():
     target = asyncio.run(graniot._resolve_sync_target(SUPERADMIN["email"]))
 
     assert target["mode"] == graniot.SYNC_MODE_CLIENT_ID
-    assert target["account_id"] == "1528"
+    assert target["client_id"] == "1528"
     assert target["access_token"] is None
 
 
@@ -215,7 +230,7 @@ def test_target_sobrevive_a_graniot_caido(monkeypatch):
 
 
 def test_target_reutiliza_la_cuenta_guardada_en_el_lote():
-    FakeGraniotClient.accounts = [_account("dueño@example.com", account_id="1529"), _account(SUPERADMIN["email"])]
+    FakeGraniotClient.accounts = [_account("dueño@example.com", account_id="acc-1529", user_id=1529), _account(SUPERADMIN["email"])]
 
     target = asyncio.run(
         graniot._sync_target_for_row(
@@ -227,7 +242,7 @@ def test_target_reutiliza_la_cuenta_guardada_en_el_lote():
     # El lote se creó en otra cuenta: las actualizaciones y el borrado deben
     # seguir apuntando a ella.
     assert target["account_email"] == "dueño@example.com"
-    assert target["account_id"] == "1529"
+    assert target["account_id"] == "acc-1529"
 
 
 # --- Cliente impersonado ---------------------------------------------------
@@ -412,7 +427,7 @@ def test_crear_y_borrar_lote_se_refleja_en_graniot(client: TestClient, token: st
     stored = client.post(
         "/api/compat/tables/parcels/query",
         headers=_auth(token),
-        json={"filters": [{"type": "eq", "column": "id", "value": parcel_id}], "single": True},
+        json={"filters": [{"column": "id", "op": "eq", "value": parcel_id}], "single": True},
     )
     assert stored.status_code == 200, stored.text
     row = stored.json()["data"]
@@ -425,13 +440,39 @@ def test_crear_y_borrar_lote_se_refleja_en_graniot(client: TestClient, token: st
     removed = client.post(
         "/api/compat/tables/parcels/delete",
         headers=_auth(token),
-        json={"filters": [{"type": "eq", "column": "id", "value": parcel_id}]},
+        json={"filters": [{"column": "id", "op": "eq", "value": parcel_id}]},
     )
     assert removed.status_code == 200, removed.text
 
     deletes = [call for call in FakeGraniotClient.calls if call["method"] == "DELETE"]
     assert [call["path"] for call in deletes] == ["/api/parcels/90001/"]
     assert deletes[0]["access_token"], "el borrado debe ir a la cuenta que tiene el lote"
+
+
+def test_resubir_el_mismo_lote_actualiza_en_vez_de_duplicar(client: TestClient, token: str):
+    created = client.post(
+        "/api/compat/parcels/create-manual",
+        headers=_auth(token),
+        json={"name": "Lote reenviado", "geometry": polygon(0.05)},
+    )
+    assert created.status_code == 200, created.text
+    parcel_id = created.json()["data"]["parcel"]["id"]
+    assert [c for c in FakeGraniotClient.calls if c["method"] == "POST" and c["path"] == "/api/parcels/"]
+
+    FakeGraniotClient.reset()
+    # Mismo nombre y misma geometría: compat actualiza la fila existente, así que
+    # el lote ya tiene parcelas en Graniot y volver a hacer POST las duplicaría.
+    again = client.post(
+        "/api/compat/parcels/create-manual",
+        headers=_auth(token),
+        json={"name": "Lote reenviado", "geometry": polygon(0.05)},
+    )
+    assert again.status_code == 200, again.text
+    assert again.json()["data"]["parcel"]["id"] == parcel_id
+
+    assert not [c for c in FakeGraniotClient.calls if c["method"] == "POST" and c["path"] == "/api/parcels/"]
+    patches = [c for c in FakeGraniotClient.calls if c["method"] == "PATCH"]
+    assert patches and patches[0]["path"] == "/api/parcels/90001/"
 
 
 def test_endpoint_de_diagnostico_expone_la_cuenta_destino(client: TestClient, token: str):
@@ -449,7 +490,7 @@ def test_quitar_de_graniot_mantiene_el_lote_en_dataris(client: TestClient, token
     created = client.post(
         "/api/compat/parcels/create-manual",
         headers=_auth(token),
-        json={"name": "Lote solo Dataris", "geometry": POLYGON},
+        json={"name": "Lote solo Dataris", "geometry": polygon(0.1)},
     )
     assert created.status_code == 200, created.text
     parcel_id = created.json()["data"]["parcel"]["id"]
@@ -463,7 +504,7 @@ def test_quitar_de_graniot_mantiene_el_lote_en_dataris(client: TestClient, token
     stored = client.post(
         "/api/compat/tables/parcels/query",
         headers=_auth(token),
-        json={"filters": [{"type": "eq", "column": "id", "value": parcel_id}], "single": True},
+        json={"filters": [{"column": "id", "op": "eq", "value": parcel_id}], "single": True},
     )
     row = stored.json()["data"]
     assert row["name"] == "Lote solo Dataris"

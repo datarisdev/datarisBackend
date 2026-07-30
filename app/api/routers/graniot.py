@@ -2767,6 +2767,38 @@ def _account_id_value(account: Optional[Dict[str, Any]]) -> Optional[str]:
     return _clean_id(account.get("id") or account.get("account_id") or account.get("user_id"))
 
 
+def _jwt_payload(token: Any) -> Dict[str, Any]:
+    """Decode the public payload of a SimpleJWT token (no signature check)."""
+    try:
+        part = str(token or "").split(".")[1]
+        part += "=" * (-len(part) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(part.encode("utf-8")))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _account_client_id(account: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Value for Graniot's privileged ``client_id`` parameter.
+
+    ``/api/accounts/`` returns ids like ``acc-82910c84-…`` while ``client_id``
+    identifies the *user* Graniot must act as, which is the numeric ``user_id``
+    carried by the account/embed SimpleJWT. Prefer that id and keep the account
+    id only as a last resort.
+    """
+    if not isinstance(account, dict):
+        return None
+    tokens = [
+        account.get("account_access"),
+        _embed_url_auth_token(account.get("embedded_url") or ""),
+    ]
+    for token in tokens:
+        user_id = _clean_id(_jwt_payload(token).get("user_id"))
+        if user_id:
+            return user_id
+    return _account_id_value(account)
+
+
 def _account_access_token(account: Optional[Dict[str, Any]]) -> Optional[str]:
     if not isinstance(account, dict):
         return None
@@ -2783,6 +2815,7 @@ def _public_sync_target(target: Dict[str, Any]) -> Dict[str, Any]:
         "user_email": target.get("user_email"),
         "account_email": target.get("account_email"),
         "account_id": target.get("account_id"),
+        "client_id": target.get("client_id"),
         "has_account_token": bool(target.get("access_token")),
         "reason": target.get("reason"),
     }
@@ -2806,6 +2839,7 @@ async def _resolve_sync_target(
         "user_email": normalized or None,
         "account_email": None,
         "account_id": None,
+        "client_id": None,
         "access_token": None,
         "reason": None,
     }
@@ -2836,21 +2870,19 @@ async def _resolve_sync_target(
         return target
 
     target["account_email"] = str(account.get("account_email") or normalized)
-    account_id = _account_id_value(account)
+    target["account_id"] = _account_id_value(account)
+    target["client_id"] = _account_client_id(account)
     token = _account_access_token(account)
     mode = str(settings.GRANIOT_PARCEL_SYNC_MODE or "auto").strip().lower()
 
     if mode in {"auto", SYNC_MODE_TOKEN} and token:
         target["mode"] = SYNC_MODE_TOKEN
         target["access_token"] = token
-        target["account_id"] = account_id
         return target
-    if mode in {"auto", SYNC_MODE_CLIENT_ID} and account_id:
+    if mode in {"auto", SYNC_MODE_CLIENT_ID} and target["client_id"]:
         target["mode"] = SYNC_MODE_CLIENT_ID
-        target["account_id"] = account_id
         return target
 
-    target["account_id"] = account_id
     target["reason"] = "token_unavailable" if mode == SYNC_MODE_TOKEN else "account_without_id"
     return target
 
@@ -2882,7 +2914,7 @@ def _client_for_target(target: Dict[str, Any]) -> GraniotClient:
     if mode == SYNC_MODE_TOKEN:
         return GraniotClient(access_token=target.get("access_token"))
     if mode == SYNC_MODE_CLIENT_ID:
-        return GraniotClient(client_id=target.get("account_id"))
+        return GraniotClient(client_id=target.get("client_id") or target.get("account_id"))
     return GraniotClient()
 
 
@@ -3152,6 +3184,7 @@ async def sync_local_parcel_to_graniot(
     payload: Optional[Dict[str, Any]] = None,
     *,
     require_account: bool = False,
+    prefer_update: bool = False,
 ) -> Dict[str, Any]:
     """Create/update the Graniot parcels of a local Dataris lot.
 
@@ -3238,7 +3271,10 @@ async def sync_local_parcel_to_graniot(
             "payload": safe_payload(graniot_payload),
         })
 
-        if local.get("graniot_parcel_id") and payload.get("force_update"):
+        # A lot that already exists in Graniot must be patched, never posted
+        # again: re-uploading the same file updates the local row in place and a
+        # second POST would leave duplicated parcels in the user's portal.
+        if local.get("graniot_parcel_id") and (payload.get("force_update") or prefer_update):
             patch_payload = _build_graniot_single_parcel_payload(graniot_payload)
             raw = await client.patch(
                 f"/api/parcels/{local['graniot_parcel_id']}/",
@@ -3537,9 +3573,37 @@ async def unsync_local_parcel(
     return {"data": result, "error": None}
 
 
+async def _probe_target_account(target: Dict[str, Any]) -> Dict[str, Any]:
+    """What the target account actually sees in Graniot (support diagnostics).
+
+    Useful to confirm that a lot landed in the user's own account: the partner
+    API key can list every client's parcels, so counting them with the key
+    proves nothing — asking *as the account* does.
+    """
+    client = _client_for_target(target)
+    probe: Dict[str, Any] = {"mode": target.get("mode")}
+    for label, path in (("farms", "/api/farms/"), ("parcels", "/api/parcels/")):
+        try:
+            payload = await client.get(path, debug_context={"operation": "probe-parcel-sync-target"})
+            items = _items(payload)
+            probe[label] = len(items)
+            probe[f"{label}_sample"] = [
+                {
+                    "id": item.get("id"),
+                    "name": (item.get("properties") or {}).get("name") if isinstance(item.get("properties"), dict) else item.get("name"),
+                }
+                for item in items[-5:]
+            ]
+        except Exception as exc:  # noqa: BLE001 — diagnostics must not fail the request
+            probe[label] = None
+            probe[f"{label}_error"] = str(exc)[:300]
+    return probe
+
+
 @router.get("/parcels/sync-target")
 async def get_parcel_sync_target(
     refresh: bool = Query(default=False),
+    probe: bool = Query(default=False),
     authorization: Optional[str] = Header(default=None),
 ):
     """Diagnostics: which Graniot account receives this user's lots."""
@@ -3549,16 +3613,17 @@ async def get_parcel_sync_target(
         refresh=refresh,
         operation="resolve-parcel-sync-target",
     )
-    return {
-        "data": {
-            **_public_sync_target(target),
-            "per_user_enabled": bool(settings.GRANIOT_PARCEL_SYNC_PER_USER_ENABLED),
-            "autosync_enabled": bool(settings.GRANIOT_PARCEL_AUTOSYNC_ENABLED),
-            "autodelete_enabled": bool(settings.GRANIOT_PARCEL_AUTODELETE_ENABLED),
-            "requires_account": bool(settings.GRANIOT_PARCEL_SYNC_REQUIRE_ACCOUNT),
-        },
-        "error": None,
+    data = {
+        **_public_sync_target(target),
+        "per_user_enabled": bool(settings.GRANIOT_PARCEL_SYNC_PER_USER_ENABLED),
+        "autosync_enabled": bool(settings.GRANIOT_PARCEL_AUTOSYNC_ENABLED),
+        "autodelete_enabled": bool(settings.GRANIOT_PARCEL_AUTODELETE_ENABLED),
+        "requires_account": bool(settings.GRANIOT_PARCEL_SYNC_REQUIRE_ACCOUNT),
+        "sync_mode_setting": str(settings.GRANIOT_PARCEL_SYNC_MODE or "auto"),
     }
+    if probe:
+        data["probe"] = await _probe_target_account(target)
+    return {"data": data, "error": None}
 
 
 # ---- Dataris Graniot NDVI map-layer orchestration -------------------------

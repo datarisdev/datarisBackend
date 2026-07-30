@@ -762,8 +762,18 @@ def upsert_user_parcel(db: Dict[str, Any], user_id: str, row: Dict[str, Any]) ->
     existing = find_existing_user_parcel(parcel_rows, row, user_id)
     if existing is not None:
         preserved_id = existing.get("id") or row.get("id")
+        # El lote sigue siendo el mismo, así que conserva su vínculo con Graniot:
+        # sin esto, volver a subir el archivo perdería el id remoto y la
+        # sincronización crearía una parcela duplicada en el portal del usuario,
+        # dejando la anterior huérfana.
+        preserved_graniot = {
+            key: value
+            for key, value in existing.items()
+            if key.startswith("graniot_") and key not in row
+        }
         existing.clear()
         existing.update(row)
+        existing.update(preserved_graniot)
         existing["id"] = preserved_id
         existing["user_id"] = user_id
         return existing
@@ -1495,6 +1505,10 @@ async def _graniot_sync_parcels_task(user: Dict[str, Any], parcel_ids: List[str]
                 parcel_id,
                 {"metadata": {"origin": "dataris-autosync"}},
                 require_account=True,
+                # Re-subir el mismo archivo actualiza la fila local en su sitio:
+                # si ya tiene parcelas en Graniot hay que actualizarlas, no
+                # crear un duplicado en el portal del usuario.
+                prefer_update=True,
             )
             _graniot_log(
                 "dataris.compat.parcel_autosync.ok",
