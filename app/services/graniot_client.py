@@ -31,11 +31,26 @@ class GraniotClient:
     retries common Graniot/API-key formats automatically.
 
     Keep GRANIOT_API_KEY only in backend env vars. Never expose it with VITE_*.
+
+    Acting on behalf of one Graniot account
+    --------------------------------------
+    Farm/parcel endpoints are documented as "Provides get_effective_user() for
+    views where a privileged user can act on behalf of another user via
+    `client_id` parameter". Dataris uses that so a lot uploaded by a Dataris
+    user is created inside *their* Graniot account (the same account whose
+    portal is embedded in the Satélite module), not in the API key owner's
+    account. Two ways, both supported here:
+
+    - ``access_token``: the account's own token (``account_access`` from
+      ``/api/accounts/``). Requests are sent as that user. When this is set the
+      API-key fallbacks are disabled on purpose: silently falling back to the
+      partner key would create the parcel in the wrong account.
+    - ``client_id``: sent as a query parameter with the privileged API key.
     """
 
     AUTH_FAILURE_CODES = {401, 403}
 
-    def __init__(self) -> None:
+    def __init__(self, *, access_token: Optional[str] = None, client_id: Optional[str] = None) -> None:
         self.base_url = (settings.GRANIOT_BASE_URL or "https://app.graniot.com").rstrip("/")
         self.api_key = settings.GRANIOT_API_KEY
         # Graniot accepts API keys through X-API-Key. Keep env overrides for
@@ -43,11 +58,17 @@ class GraniotClient:
         self.auth_header = (settings.GRANIOT_AUTH_HEADER or "X-API-Key").strip()
         self.auth_scheme = (settings.GRANIOT_AUTH_SCHEME or "").strip()
         self.timeout = float(settings.GRANIOT_TIMEOUT_SECONDS or 60)
-        self.client_id = settings.GRANIOT_CLIENT_ID
+        self.access_token = str(access_token or "").strip() or None
+        self.client_id = str(client_id).strip() if client_id not in (None, "") else settings.GRANIOT_CLIENT_ID
 
     @property
     def is_configured(self) -> bool:
-        return bool(self.api_key)
+        return bool(self.api_key or self.access_token)
+
+    @property
+    def acts_on_behalf(self) -> bool:
+        """True when requests are scoped to one specific Graniot account."""
+        return bool(self.access_token or self.client_id)
 
     def _auth_header_value(self, scheme: str) -> str:
         raw = (self.api_key or "").strip()
@@ -59,6 +80,8 @@ class GraniotClient:
         return f"{scheme} {raw}".strip()
 
     def _headers_for(self, header_name: str, scheme: str, accept: str) -> Dict[str, str]:
+        if self.access_token:
+            return {"Accept": accept, "Authorization": f"Bearer {self.access_token}"}
         if not self.api_key:
             raise GraniotNotConfigured("GRANIOT_API_KEY no está configurada en el backend")
 
@@ -72,6 +95,10 @@ class GraniotClient:
 
     def _auth_candidates(self, accept: str) -> List[Dict[str, str]]:
         configured = self._headers_for(self.auth_header, self.auth_scheme, accept)
+        if self.access_token:
+            # Impersonated requests must never fall back to the partner API key:
+            # that would write into the wrong Graniot account without failing.
+            return [configured]
         candidates = [configured]
 
         common_pairs: Iterable[Tuple[str, str]] = (
@@ -96,7 +123,9 @@ class GraniotClient:
 
     def _params(self, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         clean = {k: v for k, v in (params or {}).items() if v is not None and v != ""}
-        if self.client_id and "client_id" not in clean:
+        # With an account token the request already *is* that user, so client_id
+        # is unnecessary (and Graniot rejects it for non-privileged tokens).
+        if self.client_id and not self.access_token and "client_id" not in clean:
             clean["client_id"] = self.client_id
         return clean
 
@@ -243,6 +272,9 @@ class GraniotClient:
 
     async def patch(self, path: str, json_body: Any = None, params: Optional[Dict[str, Any]] = None, debug_context: Optional[Dict[str, Any]] = None) -> Any:
         return await self.request("PATCH", path, params=params, json_body=json_body, debug_context=debug_context)
+
+    async def delete(self, path: str, params: Optional[Dict[str, Any]] = None, debug_context: Optional[Dict[str, Any]] = None) -> Any:
+        return await self.request("DELETE", path, params=params, debug_context=debug_context)
 
     async def binary_get(self, path: str, params: Optional[Dict[str, Any]] = None, *, use_auth: bool = True, debug_context: Optional[Dict[str, Any]] = None, include_client_id: bool = True) -> httpx.Response:
         return await self.request("GET", path, params=params, accept="*/*", use_auth=use_auth, debug_context=debug_context, include_client_id=include_client_id)

@@ -2252,8 +2252,8 @@ async def _create_farm_on_graniot(client: GraniotClient, name: str, farm_type: s
         {"last_payload": last_payload, "attempts": attempts_used},
     )
 
-async def _create_default_farm(client: GraniotClient) -> str:
-    name = settings.GRANIOT_DEFAULT_FARM_NAME or "Dataris"
+async def _create_default_farm(client: GraniotClient, *, name: Optional[str] = None) -> str:
+    name = str(name or "").strip() or settings.GRANIOT_DEFAULT_FARM_NAME or "Dataris"
     farm_type = settings.GRANIOT_DEFAULT_FARM_TYPE or "PRO"
     farm = await _create_farm_on_graniot(client, name, farm_type, True)
     farm_id = farm.get("id")
@@ -2353,6 +2353,19 @@ def _first_polygon_feature(feature_collection: Dict[str, Any], name: str, fallba
     return {"type": "Feature", "geometry": fallback_geometry, "properties": {"name": name}}
 
 
+def _coerce_coordinates(value: Any) -> Any:
+    """Turn nested tuples into JSON lists.
+
+    Shapely's ``mapping()`` (used when a lot is normalized on creation) returns
+    coordinates as nested tuples. Rows read straight from the in-memory compat
+    store therefore carry tuples instead of lists, and the previous
+    ``isinstance(..., list)`` checks silently rejected a perfectly valid polygon.
+    """
+    if isinstance(value, (list, tuple)):
+        return [_coerce_coordinates(item) for item in value]
+    return value
+
+
 def _polygon_geometries(geometry: Any) -> List[Dict[str, Any]]:
     """Return Polygon geometries accepted by Graniot's parcels array.
 
@@ -2365,14 +2378,14 @@ def _polygon_geometries(geometry: Any) -> List[Dict[str, Any]]:
 
     geom_type = geometry.get("type")
     coordinates = geometry.get("coordinates")
-    if geom_type == "Polygon" and isinstance(coordinates, list):
-        return [{"type": "Polygon", "coordinates": coordinates}]
+    if geom_type == "Polygon" and isinstance(coordinates, (list, tuple)):
+        return [{"type": "Polygon", "coordinates": _coerce_coordinates(coordinates)}]
 
-    if geom_type == "MultiPolygon" and isinstance(coordinates, list):
+    if geom_type == "MultiPolygon" and isinstance(coordinates, (list, tuple)):
         polygons: List[Dict[str, Any]] = []
         for polygon_coordinates in coordinates:
-            if isinstance(polygon_coordinates, list) and polygon_coordinates:
-                polygons.append({"type": "Polygon", "coordinates": polygon_coordinates})
+            if isinstance(polygon_coordinates, (list, tuple)) and polygon_coordinates:
+                polygons.append({"type": "Polygon", "coordinates": _coerce_coordinates(polygon_coordinates)})
         return polygons
 
     return []
@@ -2466,7 +2479,13 @@ def _build_graniot_single_parcel_payload(parcels_payload: Dict[str, Any]) -> Dic
     }
 
 
-async def _resolve_farm_id(client: GraniotClient, local: Dict[str, Any], payload: Dict[str, Any]) -> str:
+async def _resolve_farm_id(
+    client: GraniotClient,
+    local: Dict[str, Any],
+    payload: Dict[str, Any],
+    *,
+    allow_global_default: bool = True,
+) -> str:
     # Acepta camelCase y snake_case porque el frontend puede enviar farmId,
     # mientras que Graniot y el backend usan farm_id/graniot_farm_id.
     candidates = [
@@ -2477,8 +2496,12 @@ async def _resolve_farm_id(client: GraniotClient, local: Dict[str, Any], payload
         payload.get("farm"),
         local.get("graniot_farm_id"),
         local.get("farm_id"),
-        settings.GRANIOT_DEFAULT_FARM_ID,
     ]
+    # GRANIOT_DEFAULT_FARM_ID belongs to the API key owner. While acting on
+    # behalf of another Graniot account it would either fail or, worse, attach
+    # the parcel to a farm the user cannot see in their portal.
+    if allow_global_default:
+        candidates.append(settings.GRANIOT_DEFAULT_FARM_ID)
     for value in candidates:
         clean = _clean_id(value)
         if clean:
@@ -2493,7 +2516,7 @@ async def _resolve_farm_id(client: GraniotClient, local: Dict[str, Any], payload
         # If listing farms is not available for this key, try creating one below.
         pass
 
-    return await _create_default_farm(client)
+    return await _create_default_farm(client, name=None if allow_global_default else settings.GRANIOT_PARCEL_SYNC_FARM_NAME)
 
 
 def _public_parcel(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -2634,9 +2657,9 @@ def _embed_service_account_emails() -> set[str]:
     }
 
 
-async def _fetch_embed_accounts() -> Any:
+async def _fetch_embed_accounts(*, refresh: bool = False) -> Any:
     """Fetch (with a short cache) the Graniot accounts listing for embed matching."""
-    cached = _cache_get(_EMBED_ACCOUNTS_CACHE_KEY)
+    cached = None if refresh else _cache_get(_EMBED_ACCOUNTS_CACHE_KEY)
     if cached is not None:
         return cached
     client = GraniotClient()
@@ -2702,6 +2725,165 @@ async def _embed_account_for_user(user: Dict[str, Any]) -> Optional[Dict[str, st
         })
         return None
     return account
+
+
+# ---------------------------------------------------------------------------
+# Parcels inside each user's own Graniot account
+# ---------------------------------------------------------------------------
+# The Satélite module embeds the Graniot portal *of the authenticated user*
+# (matched by email against /api/accounts/). Lots must therefore be created in
+# that same account, otherwise the user would never see them in their portal.
+#
+# Graniot documents farm/parcel endpoints as "Provides get_effective_user() for
+# views where a privileged user can act on behalf of another user via
+# `client_id` parameter", and /api/accounts/ exposes `account_access` (the
+# account's own token). Dataris uses the account token when available and the
+# privileged `client_id` otherwise, so parcel upload/removal no longer depends
+# on Graniot's commercial team.
+
+SYNC_MODE_TOKEN = "token"
+SYNC_MODE_CLIENT_ID = "client_id"
+SYNC_MODE_SERVICE = "service"
+
+
+def _raw_account_for_email(payload: Any, email: str) -> Optional[Dict[str, Any]]:
+    """Return the full Graniot account object (including private fields)."""
+    normalized = str(email or "").strip().lower()
+    if not normalized:
+        return None
+    return next(
+        (
+            item
+            for item in _items(payload)
+            if str(item.get("account_email") or "").strip().lower() == normalized
+        ),
+        None,
+    )
+
+
+def _account_id_value(account: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not isinstance(account, dict):
+        return None
+    return _clean_id(account.get("id") or account.get("account_id") or account.get("user_id"))
+
+
+def _account_access_token(account: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not isinstance(account, dict):
+        return None
+    token = str(account.get("account_access") or "").strip()
+    if not token or _embed_token_looks_expired(token):
+        return None
+    return token
+
+
+def _public_sync_target(target: Dict[str, Any]) -> Dict[str, Any]:
+    """Target description safe to return to the browser (never tokens)."""
+    return {
+        "mode": target.get("mode"),
+        "user_email": target.get("user_email"),
+        "account_email": target.get("account_email"),
+        "account_id": target.get("account_id"),
+        "has_account_token": bool(target.get("access_token")),
+        "reason": target.get("reason"),
+    }
+
+
+async def _resolve_sync_target(
+    email: Optional[str],
+    *,
+    refresh: bool = False,
+    operation: str = "resolve-parcel-sync-target",
+) -> Dict[str, Any]:
+    """Resolve which Graniot account owns the parcels of this Dataris email.
+
+    Never raises: when the account cannot be resolved the caller decides whether
+    to fall back to the API key owner's account (manual sync) or to skip the
+    operation entirely (automatic sync).
+    """
+    normalized = str(email or "").strip().lower()
+    target: Dict[str, Any] = {
+        "mode": SYNC_MODE_SERVICE,
+        "user_email": normalized or None,
+        "account_email": None,
+        "account_id": None,
+        "access_token": None,
+        "reason": None,
+    }
+
+    if not settings.GRANIOT_PARCEL_SYNC_PER_USER_ENABLED:
+        target["reason"] = "per_user_disabled"
+        return target
+    if not normalized or "@" not in normalized:
+        target["reason"] = "user_without_email"
+        return target
+
+    try:
+        payload = await _fetch_embed_accounts(refresh=refresh)
+        account = _raw_account_for_email(payload, normalized)
+    except Exception as exc:  # noqa: BLE001 — resolution must never break the caller
+        log_event({
+            "event": "dataris.graniot.parcel_sync.accounts_lookup_failed",
+            "operation": operation,
+            "email": normalized,
+            "exception_type": type(exc).__name__,
+            "message": str(exc),
+        })
+        target["reason"] = "accounts_lookup_failed"
+        return target
+
+    if not account:
+        target["reason"] = "no_graniot_account_for_email"
+        return target
+
+    target["account_email"] = str(account.get("account_email") or normalized)
+    account_id = _account_id_value(account)
+    token = _account_access_token(account)
+    mode = str(settings.GRANIOT_PARCEL_SYNC_MODE or "auto").strip().lower()
+
+    if mode in {"auto", SYNC_MODE_TOKEN} and token:
+        target["mode"] = SYNC_MODE_TOKEN
+        target["access_token"] = token
+        target["account_id"] = account_id
+        return target
+    if mode in {"auto", SYNC_MODE_CLIENT_ID} and account_id:
+        target["mode"] = SYNC_MODE_CLIENT_ID
+        target["account_id"] = account_id
+        return target
+
+    target["account_id"] = account_id
+    target["reason"] = "token_unavailable" if mode == SYNC_MODE_TOKEN else "account_without_id"
+    return target
+
+
+async def _sync_target_for_row(
+    user: Dict[str, Any],
+    local: Optional[Dict[str, Any]] = None,
+    *,
+    refresh: bool = False,
+    operation: str = "resolve-parcel-sync-target",
+) -> Dict[str, Any]:
+    """Resolve the target account for a local lot.
+
+    A lot already synced remembers the Graniot account that owns it
+    (``graniot_account_email``). Reusing it keeps updates and deletions pointing
+    at the same account even if the Dataris user later changes their email.
+    """
+    stored_email = str((local or {}).get("graniot_account_email") or "").strip().lower()
+    user_email = str((user or {}).get("email") or "").strip().lower()
+    if stored_email and stored_email != user_email:
+        target = await _resolve_sync_target(stored_email, refresh=refresh, operation=operation)
+        if target.get("mode") != SYNC_MODE_SERVICE:
+            return target
+    return await _resolve_sync_target(user_email, refresh=refresh, operation=operation)
+
+
+def _client_for_target(target: Dict[str, Any]) -> GraniotClient:
+    mode = target.get("mode")
+    if mode == SYNC_MODE_TOKEN:
+        return GraniotClient(access_token=target.get("access_token"))
+    if mode == SYNC_MODE_CLIENT_ID:
+        return GraniotClient(client_id=target.get("account_id"))
+    return GraniotClient()
 
 
 @router.get("/embed")
@@ -2964,20 +3146,41 @@ async def list_graniot_parcels(authorization: Optional[str] = Header(default=Non
         _raise_graniot_error(exc)
 
 
-@router.post("/parcels/sync-local/{parcel_id}")
-async def sync_local_parcel(
+async def sync_local_parcel_to_graniot(
+    user: Dict[str, Any],
     parcel_id: str,
-    payload: Dict[str, Any] = Body(default_factory=dict),
-    authorization: Optional[str] = Header(default=None),
-):
-    user = _require_user(authorization)
-    client = GraniotClient()
+    payload: Optional[Dict[str, Any]] = None,
+    *,
+    require_account: bool = False,
+) -> Dict[str, Any]:
+    """Create/update the Graniot parcels of a local Dataris lot.
+
+    The parcel is created inside the Graniot account that belongs to the same
+    user (matched by email in ``/api/accounts/``), so it shows up in the portal
+    embedded in the Satélite module. Users without a Graniot account keep the
+    legacy behaviour (the API key owner's account) unless
+    ``GRANIOT_PARCEL_SYNC_REQUIRE_ACCOUNT`` is enabled.
+    """
+    payload = dict(payload or {})
 
     with LOCK:
         db = read_db()
         local = next((p for p in table(db, "parcels") if p.get("id") == parcel_id and p.get("user_id") == user["id"]), None)
     if not local:
         raise HTTPException(status_code=404, detail="Lote local no encontrado")
+
+    target = await _sync_target_for_row(user, local, operation="sync-local-parcel")
+    if target.get("mode") == SYNC_MODE_SERVICE and (require_account or settings.GRANIOT_PARCEL_SYNC_REQUIRE_ACCOUNT):
+        # Automatic syncs must not push lots into the API key owner's account:
+        # the user would never see them in their own embedded portal.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Este usuario no tiene una cuenta de Graniot con su mismo correo, "
+                f"así que el lote no se puede subir a su portal ({target.get('reason')})."
+            ),
+        )
+    client = _client_for_target(target)
 
     metadata = {
         "source": "dataris",
@@ -2996,6 +3199,7 @@ async def sync_local_parcel(
         "local_parcel_id": parcel_id,
         "local_parcel_name": name,
         "incoming_payload": safe_payload(payload),
+        "target": _public_sync_target(target),
         "local_existing_graniot": {
             "graniot_farm_id": local.get("graniot_farm_id"),
             "graniot_parcel_id": local.get("graniot_parcel_id"),
@@ -3006,8 +3210,9 @@ async def sync_local_parcel(
         "main_geometry_type": main_geometry.get("type"),
     })
 
+    acts_on_behalf = target.get("mode") != SYNC_MODE_SERVICE
     try:
-        farm_id = await _resolve_farm_id(client, local, payload)
+        farm_id = await _resolve_farm_id(client, local, payload, allow_global_default=not acts_on_behalf)
 
         farm_ref = _as_int_if_numeric(farm_id)
 
@@ -3098,11 +3303,21 @@ async def sync_local_parcel(
                 "graniot_synced_at": t,
                 "graniot_sync_error": None,
                 "graniot_raw": raw,
+                # Remember which Graniot account owns these parcels so updates
+                # and deletions always target the same account.
+                "graniot_account_email": target.get("account_email"),
+                "graniot_account_id": target.get("account_id"),
+                "graniot_sync_mode": target.get("mode"),
                 "updated_at": t,
             })
             write_db(db)
             result = _public_parcel(row)
-        return {"data": {"parcel": result, "graniot": raw, "farm_id": farm_id}, "error": None}
+        return {
+            "parcel": result,
+            "graniot": raw,
+            "farm_id": farm_id,
+            "target": _public_sync_target(target),
+        }
     except Exception as exc:
         error_message = str(exc)
         log_event({
@@ -3121,6 +3336,209 @@ async def sync_local_parcel(
                 row["updated_at"] = now()
                 write_db(db)
         _raise_graniot_error(exc)
+
+
+@router.post("/parcels/sync-local/{parcel_id}")
+async def sync_local_parcel(
+    parcel_id: str,
+    payload: Dict[str, Any] = Body(default_factory=dict),
+    authorization: Optional[str] = Header(default=None),
+):
+    user = _require_user(authorization)
+    data = await sync_local_parcel_to_graniot(user, parcel_id, payload)
+    return {"data": data, "error": None}
+
+
+# Local fields that only make sense while the lot exists in Graniot.
+GRANIOT_LOCAL_SYNC_FIELDS = (
+    "graniot_parcel_id",
+    "graniot_parcel_key",
+    "graniot_access_key",
+    "graniot_wms_access_key",
+    "graniot_wms_url",
+    "graniot_image_url",
+    "graniot_bbox",
+    "graniot_geometry",
+    "graniot_parcels",
+    "graniot_raw",
+    "graniot_farm_id",
+    "graniot_synced_at",
+    "graniot_sync_error",
+    "graniot_account_email",
+    "graniot_account_id",
+    "graniot_sync_mode",
+)
+
+
+def _remote_parcel_ids(local: Dict[str, Any]) -> List[str]:
+    """Graniot parcel ids created for one local Dataris lot.
+
+    A single lot can become several Graniot parcels (one per polygon), so the
+    subparcels stored in ``graniot_parcels`` must be deleted too.
+    """
+    ids: List[str] = []
+
+    def push(value: Any) -> None:
+        clean = _clean_id(value)
+        if clean and clean not in ids:
+            ids.append(clean)
+
+    push((local or {}).get("graniot_parcel_id"))
+    subparcels = (local or {}).get("graniot_parcels")
+    if isinstance(subparcels, list):
+        for item in subparcels:
+            if isinstance(item, dict):
+                push(item.get("graniot_parcel_id"))
+    if not ids:
+        # Older rows only kept the raw Graniot response.
+        for data in _all_wms_data_from_payload((local or {}).get("graniot_raw")):
+            push(data.get("graniot_parcel_id"))
+    return ids
+
+
+def _clear_local_graniot_fields(parcel_id: str, user_id: Any) -> Optional[Dict[str, Any]]:
+    with LOCK:
+        db = read_db()
+        row = next(
+            (p for p in table(db, "parcels") if p.get("id") == parcel_id and p.get("user_id") == user_id),
+            None,
+        )
+        if not row:
+            return None
+        for field in GRANIOT_LOCAL_SYNC_FIELDS:
+            row.pop(field, None)
+        row["updated_at"] = now()
+        write_db(db)
+        return _public_parcel(row)
+
+
+async def delete_parcel_from_graniot(
+    user: Dict[str, Any],
+    local: Dict[str, Any],
+    *,
+    clear_local: bool = True,
+) -> Dict[str, Any]:
+    """Delete from Graniot every parcel created for a local Dataris lot.
+
+    ``local`` may be a row that no longer exists in Dataris (the automatic
+    cleanup runs right after the lot is deleted), so the Graniot ids are read
+    from the snapshot passed in. Parcels already gone in Graniot count as
+    deleted: the desired end state is the same.
+    """
+    remote_ids = _remote_parcel_ids(local or {})
+    result: Dict[str, Any] = {
+        "local_parcel_id": (local or {}).get("id"),
+        "remote_ids": remote_ids,
+        "deleted": [],
+        "missing": [],
+        "failed": [],
+        "target": None,
+        "local_cleared": False,
+    }
+    if not remote_ids:
+        return result
+
+    target = await _sync_target_for_row(user, local, operation="delete-local-parcel")
+    result["target"] = _public_sync_target(target)
+    client = _client_for_target(target)
+
+    for remote_id in remote_ids:
+        try:
+            await client.delete(
+                f"/api/parcels/{remote_id}/",
+                debug_context={
+                    "operation": "delete-local-parcel",
+                    "local_parcel_id": (local or {}).get("id"),
+                    "graniot_parcel_id": remote_id,
+                    "mode": target.get("mode"),
+                },
+            )
+            result["deleted"].append(remote_id)
+        except GraniotAPIError as exc:
+            if exc.status_code in {404, 410}:
+                result["missing"].append(remote_id)
+                continue
+            result["failed"].append({
+                "graniot_parcel_id": remote_id,
+                "status_code": exc.status_code,
+                "message": str(exc),
+            })
+        except Exception as exc:  # noqa: BLE001 — keep deleting the other parcels
+            result["failed"].append({"graniot_parcel_id": remote_id, "message": str(exc)})
+
+    if clear_local and not result["failed"]:
+        cleared = _clear_local_graniot_fields(str((local or {}).get("id") or ""), (user or {}).get("id"))
+        result["local_cleared"] = cleared is not None
+        if cleared is not None:
+            result["parcel"] = cleared
+
+    log_event({
+        "event": "dataris.delete_local_parcel.finished",
+        "operation": "delete-local-parcel",
+        "local_parcel_id": (local or {}).get("id"),
+        "target": _public_sync_target(target),
+        "remote_ids": remote_ids,
+        "deleted": result["deleted"],
+        "missing": result["missing"],
+        "failed": safe_payload(result["failed"]),
+    })
+    return result
+
+
+@router.delete("/parcels/sync-local/{parcel_id}")
+async def unsync_local_parcel(
+    parcel_id: str,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Remove the lot from Graniot without deleting it in Dataris."""
+    user = _require_user(authorization)
+    with LOCK:
+        db = read_db()
+        local = next(
+            (p for p in table(db, "parcels") if p.get("id") == parcel_id and p.get("user_id") == user["id"]),
+            None,
+        )
+        snapshot = dict(local) if local else None
+    if not snapshot:
+        raise HTTPException(status_code=404, detail="Lote local no encontrado")
+
+    result = await delete_parcel_from_graniot(user, snapshot)
+    if result.get("failed"):
+        first = result["failed"][0]
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": f"Graniot no pudo eliminar el lote: {first.get('message')}",
+                "result": result,
+            },
+        )
+    if not result.get("remote_ids"):
+        return {"data": {**result, "message": "El lote no estaba sincronizado con Graniot"}, "error": None}
+    return {"data": result, "error": None}
+
+
+@router.get("/parcels/sync-target")
+async def get_parcel_sync_target(
+    refresh: bool = Query(default=False),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Diagnostics: which Graniot account receives this user's lots."""
+    user = _require_user(authorization)
+    target = await _resolve_sync_target(
+        (user or {}).get("email"),
+        refresh=refresh,
+        operation="resolve-parcel-sync-target",
+    )
+    return {
+        "data": {
+            **_public_sync_target(target),
+            "per_user_enabled": bool(settings.GRANIOT_PARCEL_SYNC_PER_USER_ENABLED),
+            "autosync_enabled": bool(settings.GRANIOT_PARCEL_AUTOSYNC_ENABLED),
+            "autodelete_enabled": bool(settings.GRANIOT_PARCEL_AUTODELETE_ENABLED),
+            "requires_account": bool(settings.GRANIOT_PARCEL_SYNC_REQUIRE_ACCOUNT),
+        },
+        "error": None,
+    }
 
 
 # ---- Dataris Graniot NDVI map-layer orchestration -------------------------

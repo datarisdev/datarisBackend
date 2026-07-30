@@ -1,0 +1,424 @@
+"""Lotes de Dataris subidos/eliminados en la cuenta de Graniot del usuario.
+
+Cubre las dos mitades de la integración por API (sin comercial de Graniot):
+
+* la resolución de la cuenta destino (por coincidencia de email en
+  ``/api/accounts/``) y el modo de actuación en su nombre, y
+* el flujo real por HTTP: crear un lote lo publica en Graniot y borrarlo lo
+  elimina de allí, con un cliente Graniot falso que registra cada llamada.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import os
+import tempfile
+import time
+
+import pytest
+from fastapi import HTTPException
+
+os.environ.setdefault("DISABLE_AZURE_BLOB_STORAGE", "true")
+os.environ["DATARIS_COMPAT_PERSISTENCE"] = "file"
+os.environ["DATARIS_COMPAT_STORAGE_DIR"] = tempfile.mkdtemp(prefix="dataris-compat-graniot-")
+
+from fastapi.testclient import TestClient  # noqa: E402
+
+from app.main import app  # noqa: E402
+from app.api.routers import compat, graniot  # noqa: E402
+
+SUPERADMIN = {"email": "admin@dataris.local", "password": "admin123456"}
+POLYGON = {
+    "type": "Polygon",
+    "coordinates": [[
+        [-90.5, 14.5],
+        [-90.5, 14.51],
+        [-90.49, 14.51],
+        [-90.49, 14.5],
+        [-90.5, 14.5],
+    ]],
+}
+
+
+def _live_jwt(minutes: int = 60) -> str:
+    def b64(data: dict) -> str:
+        return base64.urlsafe_b64encode(json.dumps(data).encode()).rstrip(b"=").decode()
+
+    payload = {"token_type": "access", "exp": int(time.time()) + minutes * 60}
+    return f"{b64({'typ': 'JWT', 'alg': 'HS256'})}.{b64(payload)}.sig"
+
+
+def _expired_jwt() -> str:
+    def b64(data: dict) -> str:
+        return base64.urlsafe_b64encode(json.dumps(data).encode()).rstrip(b"=").decode()
+
+    payload = {"token_type": "access", "exp": int(time.time()) - 60}
+    return f"{b64({'typ': 'JWT', 'alg': 'HS256'})}.{b64(payload)}.sig"
+
+
+def _account(email: str, *, account_id: str = "1528", token: str | None = None) -> dict:
+    return {
+        "id": account_id,
+        "account_email": email,
+        "embedded_url": f"https://embed.graniot.com/?auth_id={_live_jwt()}",
+        "account_access": token if token is not None else _live_jwt(),
+    }
+
+
+class FakeGraniotClient:
+    """Cliente Graniot en memoria que registra cómo se le llamó.
+
+    Todas las instancias comparten ``calls`` para poder afirmar sobre el modo de
+    autenticación usado en cada petición (token de la cuenta o client_id).
+    """
+
+    calls: list[dict] = []
+    accounts: list[dict] = []
+    created_parcel_id = 90001
+    farms: list[dict] = [{"id": 777, "name": "Dataris", "is_active": True}]
+    delete_status: dict[str, int] = {}
+
+    def __init__(self, *, access_token=None, client_id=None):
+        self.access_token = access_token
+        self.client_id = client_id
+
+    @classmethod
+    def reset(cls):
+        cls.calls = []
+        cls.delete_status = {}
+
+    def _record(self, method, path, **extra):
+        FakeGraniotClient.calls.append({
+            "method": method,
+            "path": path,
+            "access_token": self.access_token,
+            "client_id": self.client_id,
+            **extra,
+        })
+
+    async def get(self, path, params=None, **kwargs):
+        self._record("GET", path, params=params)
+        if path == "/api/accounts/":
+            return FakeGraniotClient.accounts
+        if path == "/api/farms/":
+            return FakeGraniotClient.farms
+        return []
+
+    async def post(self, path, json_body=None, params=None, **kwargs):
+        self._record("POST", path, json_body=json_body)
+        parcels = (json_body or {}).get("parcels") or []
+        features = []
+        for index, parcel in enumerate(parcels):
+            features.append({
+                "type": "Feature",
+                "id": FakeGraniotClient.created_parcel_id + index,
+                "geometry": (parcel.get("geom") or {}).get("geometry"),
+                "properties": {
+                    "name": parcel.get("name"),
+                    "key": f"key-{index}",
+                    "wms_url": "https://app.graniot.com/api/wms/?access_key=signed-token&layers=",
+                    "image_url": "https://app.graniot.com/api/wms/?BBOX=14.5,-90.5,14.51,-90.49&layers=",
+                },
+            })
+        return {"type": "FeatureCollection", "features": features}
+
+    async def patch(self, path, json_body=None, params=None, **kwargs):
+        self._record("PATCH", path, json_body=json_body)
+        return {"id": 90001, "properties": {"key": "key-0"}}
+
+    async def delete(self, path, params=None, **kwargs):
+        self._record("DELETE", path, params=params)
+        status = FakeGraniotClient.delete_status.get(path)
+        if status:
+            raise graniot.GraniotAPIError(status, f"HTTP {status}")
+        return None
+
+    async def post_form(self, path, data=None, params=None, **kwargs):
+        self._record("POST_FORM", path, data=data)
+        return FakeGraniotClient.farms[0]
+
+
+@pytest.fixture(autouse=True)
+def _graniot_defaults(monkeypatch):
+    monkeypatch.setattr(graniot, "GraniotClient", FakeGraniotClient)
+    monkeypatch.setattr(graniot.settings, "GRANIOT_PARCEL_SYNC_PER_USER_ENABLED", True)
+    monkeypatch.setattr(graniot.settings, "GRANIOT_PARCEL_SYNC_MODE", "auto")
+    monkeypatch.setattr(graniot.settings, "GRANIOT_PARCEL_SYNC_REQUIRE_ACCOUNT", False)
+    monkeypatch.setattr(graniot.settings, "GRANIOT_PARCEL_AUTOSYNC_ENABLED", True)
+    monkeypatch.setattr(graniot.settings, "GRANIOT_PARCEL_AUTODELETE_ENABLED", True)
+    monkeypatch.setattr(graniot.settings, "GRANIOT_DEFAULT_FARM_ID", "3615")
+    monkeypatch.setattr(graniot.settings, "GRANIOT_EMBED_ACCOUNT_EMAIL", "servicio@graniot.test")
+    monkeypatch.setattr(graniot.settings, "GRANIOT_EMBED_USERNAME", None)
+    FakeGraniotClient.accounts = [_account(SUPERADMIN["email"])]
+    FakeGraniotClient.reset()
+    graniot._cache_delete_prefix(graniot._EMBED_ACCOUNTS_CACHE_KEY)
+    yield
+    graniot._cache_delete_prefix(graniot._EMBED_ACCOUNTS_CACHE_KEY)
+
+
+# --- Resolución de la cuenta destino ---------------------------------------
+
+
+def test_target_usa_el_token_de_la_cuenta_del_usuario():
+    target = asyncio.run(graniot._resolve_sync_target(SUPERADMIN["email"]))
+
+    assert target["mode"] == graniot.SYNC_MODE_TOKEN
+    assert target["account_email"] == SUPERADMIN["email"]
+    assert target["account_id"] == "1528"
+    assert target["access_token"]
+    # Los datos que llegan al navegador nunca incluyen el token.
+    assert "access_token" not in graniot._public_sync_target(target)
+    assert graniot._public_sync_target(target)["has_account_token"] is True
+
+
+def test_target_cae_a_client_id_si_graniot_no_expone_token_vivo():
+    FakeGraniotClient.accounts = [_account(SUPERADMIN["email"], token=_expired_jwt())]
+
+    target = asyncio.run(graniot._resolve_sync_target(SUPERADMIN["email"]))
+
+    assert target["mode"] == graniot.SYNC_MODE_CLIENT_ID
+    assert target["account_id"] == "1528"
+    assert target["access_token"] is None
+
+
+def test_target_sin_cuenta_en_graniot_no_actua_en_nombre_de_nadie():
+    FakeGraniotClient.accounts = [_account("otro@example.com")]
+
+    target = asyncio.run(graniot._resolve_sync_target(SUPERADMIN["email"]))
+
+    assert target["mode"] == graniot.SYNC_MODE_SERVICE
+    assert target["reason"] == "no_graniot_account_for_email"
+
+
+def test_target_respeta_el_kill_switch(monkeypatch):
+    monkeypatch.setattr(graniot.settings, "GRANIOT_PARCEL_SYNC_PER_USER_ENABLED", False)
+
+    target = asyncio.run(graniot._resolve_sync_target(SUPERADMIN["email"]))
+
+    assert target["mode"] == graniot.SYNC_MODE_SERVICE
+    assert target["reason"] == "per_user_disabled"
+
+
+def test_target_sobrevive_a_graniot_caido(monkeypatch):
+    class _Broken(FakeGraniotClient):
+        async def get(self, path, params=None, **kwargs):
+            raise RuntimeError("Graniot no responde")
+
+    monkeypatch.setattr(graniot, "GraniotClient", _Broken)
+
+    target = asyncio.run(graniot._resolve_sync_target(SUPERADMIN["email"]))
+
+    assert target["mode"] == graniot.SYNC_MODE_SERVICE
+    assert target["reason"] == "accounts_lookup_failed"
+
+
+def test_target_reutiliza_la_cuenta_guardada_en_el_lote():
+    FakeGraniotClient.accounts = [_account("dueño@example.com", account_id="1529"), _account(SUPERADMIN["email"])]
+
+    target = asyncio.run(
+        graniot._sync_target_for_row(
+            {"id": "u1", "email": SUPERADMIN["email"]},
+            {"id": "p1", "graniot_account_email": "dueño@example.com"},
+        )
+    )
+
+    # El lote se creó en otra cuenta: las actualizaciones y el borrado deben
+    # seguir apuntando a ella.
+    assert target["account_email"] == "dueño@example.com"
+    assert target["account_id"] == "1529"
+
+
+# --- Cliente impersonado ---------------------------------------------------
+
+
+def test_cliente_con_token_de_cuenta_no_cae_a_la_api_key(monkeypatch):
+    from app.services.graniot_client import GraniotClient
+
+    monkeypatch.setattr("app.services.graniot_client.settings.GRANIOT_API_KEY", "partner-key")
+    monkeypatch.setattr("app.services.graniot_client.settings.GRANIOT_CLIENT_ID", "global-client")
+
+    client = GraniotClient(access_token="account-token")
+    candidates = client._auth_candidates("application/json")
+
+    assert candidates == [{"Accept": "application/json", "Authorization": "Bearer account-token"}]
+    # Con token de cuenta no se envía client_id: la petición ya *es* ese usuario.
+    assert client._params({}) == {}
+    assert client.acts_on_behalf is True
+
+
+def test_cliente_con_client_id_lo_envia_como_parametro(monkeypatch):
+    from app.services.graniot_client import GraniotClient
+
+    monkeypatch.setattr("app.services.graniot_client.settings.GRANIOT_API_KEY", "partner-key")
+
+    client = GraniotClient(client_id="1528")
+
+    assert client._params({}) == {"client_id": "1528"}
+
+
+# --- Alta y baja de parcelas ----------------------------------------------
+
+
+def test_ids_remotos_incluyen_subparcelas_sin_duplicados():
+    ids = graniot._remote_parcel_ids({
+        "graniot_parcel_id": 900,
+        "graniot_parcels": [
+            {"graniot_parcel_id": 900},
+            {"graniot_parcel_id": 901},
+            {"graniot_parcel_id": None},
+        ],
+    })
+
+    assert ids == ["900", "901"]
+
+
+def test_borrado_tolera_parcelas_ya_inexistentes():
+    FakeGraniotClient.delete_status = {"/api/parcels/901/": 404}
+
+    result = asyncio.run(
+        graniot.delete_parcel_from_graniot(
+            {"id": "u1", "email": SUPERADMIN["email"]},
+            {"id": "p1", "graniot_parcel_id": 900, "graniot_parcels": [{"graniot_parcel_id": 901}]},
+            clear_local=False,
+        )
+    )
+
+    assert result["deleted"] == ["900"]
+    assert result["missing"] == ["901"]
+    assert result["failed"] == []
+
+
+def test_borrado_informa_los_fallos_reales():
+    FakeGraniotClient.delete_status = {"/api/parcels/900/": 500}
+
+    result = asyncio.run(
+        graniot.delete_parcel_from_graniot(
+            {"id": "u1", "email": SUPERADMIN["email"]},
+            {"id": "p1", "graniot_parcel_id": 900},
+            clear_local=False,
+        )
+    )
+
+    assert result["deleted"] == []
+    assert result["failed"] and result["failed"][0]["status_code"] == 500
+
+
+def test_sync_automatico_exige_cuenta_propia():
+    FakeGraniotClient.accounts = []
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            graniot.sync_local_parcel_to_graniot(
+                {"id": "no-existe", "email": "sin-cuenta@example.com"},
+                "parcel-inexistente",
+                require_account=True,
+            )
+        )
+
+    # Falla antes de tocar Graniot y sin lote local: lo que importa es que nunca
+    # se sube nada a la cuenta de la API key.
+    assert exc_info.value.status_code in {404, 409}
+    assert not [call for call in FakeGraniotClient.calls if call["method"] == "POST"]
+
+
+# --- Flujo completo por HTTP ---------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def client() -> TestClient:
+    # Sin gestor de contexto: el arranque de la app abre Postgres y el sistema
+    # de compatibilidad que se prueba aquí no lo necesita.
+    return TestClient(app)
+
+
+@pytest.fixture(scope="module")
+def token(client: TestClient) -> str:
+    response = client.post("/api/compat/auth/sign-in", json=SUPERADMIN)
+    assert response.status_code == 200, response.text
+    return response.json()["data"]["session"]["access_token"]
+
+
+def _auth(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def test_crear_y_borrar_lote_se_refleja_en_graniot(client: TestClient, token: str):
+    created = client.post(
+        "/api/compat/parcels/create-manual",
+        headers=_auth(token),
+        json={"name": "Lote Graniot API", "geometry": POLYGON},
+    )
+    assert created.status_code == 200, created.text
+    parcel_id = created.json()["data"]["parcel"]["id"]
+
+    # El alta dispara la subida en background (TestClient las ejecuta al
+    # terminar la respuesta).
+    posts = [call for call in FakeGraniotClient.calls if call["method"] == "POST" and call["path"] == "/api/parcels/"]
+    assert len(posts) == 1
+    assert posts[0]["access_token"], "el lote debe crearse con el token de la cuenta del usuario"
+    assert posts[0]["json_body"]["parcels"][0]["name"] == "Lote Graniot API"
+    # La finca global de la API key no se usa cuando se actúa por otra cuenta.
+    assert posts[0]["json_body"]["farm"]["id"] != 3615
+
+    stored = client.post(
+        "/api/compat/tables/parcels/query",
+        headers=_auth(token),
+        json={"filters": [{"type": "eq", "column": "id", "value": parcel_id}], "single": True},
+    )
+    assert stored.status_code == 200, stored.text
+    row = stored.json()["data"]
+    assert str(row["graniot_parcel_id"]) == "90001"
+    assert row["graniot_account_email"] == SUPERADMIN["email"]
+    assert row["graniot_sync_mode"] == graniot.SYNC_MODE_TOKEN
+    assert row["graniot_synced_at"]
+
+    FakeGraniotClient.reset()
+    removed = client.post(
+        "/api/compat/tables/parcels/delete",
+        headers=_auth(token),
+        json={"filters": [{"type": "eq", "column": "id", "value": parcel_id}]},
+    )
+    assert removed.status_code == 200, removed.text
+
+    deletes = [call for call in FakeGraniotClient.calls if call["method"] == "DELETE"]
+    assert [call["path"] for call in deletes] == ["/api/parcels/90001/"]
+    assert deletes[0]["access_token"], "el borrado debe ir a la cuenta que tiene el lote"
+
+
+def test_endpoint_de_diagnostico_expone_la_cuenta_destino(client: TestClient, token: str):
+    response = client.get("/api/graniot/parcels/sync-target", headers=_auth(token))
+
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["mode"] == graniot.SYNC_MODE_TOKEN
+    assert data["account_email"] == SUPERADMIN["email"]
+    assert data["autosync_enabled"] is True
+    assert "access_token" not in data
+
+
+def test_quitar_de_graniot_mantiene_el_lote_en_dataris(client: TestClient, token: str):
+    created = client.post(
+        "/api/compat/parcels/create-manual",
+        headers=_auth(token),
+        json={"name": "Lote solo Dataris", "geometry": POLYGON},
+    )
+    assert created.status_code == 200, created.text
+    parcel_id = created.json()["data"]["parcel"]["id"]
+
+    response = client.delete(f"/api/graniot/parcels/sync-local/{parcel_id}", headers=_auth(token))
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["deleted"] == ["90001"]
+    assert data["local_cleared"] is True
+
+    stored = client.post(
+        "/api/compat/tables/parcels/query",
+        headers=_auth(token),
+        json={"filters": [{"type": "eq", "column": "id", "value": parcel_id}], "single": True},
+    )
+    row = stored.json()["data"]
+    assert row["name"] == "Lote solo Dataris"
+    assert not row.get("graniot_parcel_id")
+    assert not row.get("graniot_synced_at")
