@@ -3719,13 +3719,35 @@ async def _fetch_farm_managers(client: GraniotClient, limit: int = 40) -> Dict[s
         except Exception:
             continue
         for manager in managers:
-            key = str(manager.get("key") or manager.get("id") or manager.get("name"))
+            # Graniot no documenta con exactitud esta respuesta: se recogen los
+            # campos habituales para poder identificar a la persona.
+            email = next(
+                (
+                    str(manager.get(field)).strip()
+                    for field in ("email", "user_email", "username", "account_email")
+                    if manager.get(field)
+                ),
+                None,
+            )
+            name = next(
+                (
+                    str(manager.get(field)).strip()
+                    for field in ("name", "full_name", "first_name", "user", "manager")
+                    if manager.get(field)
+                ),
+                None,
+            )
+            key = str(email or manager.get("key") or manager.get("id") or name or json.dumps(manager, sort_keys=True, default=str))
             entry = seen.setdefault(key, {
                 "id": manager.get("id"),
-                "name": manager.get("name"),
+                "name": name,
+                "email": email,
+                "fields": sorted(manager.keys()),
                 "farms": [],
             })
             entry["farms"].append(farm.get("name") or farm_id)
+        if managers and not result.get("sample"):
+            result["sample"] = safe_payload(managers[0])
     result["managers"] = list(seen.values())
     return result
 
