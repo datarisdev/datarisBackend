@@ -663,3 +663,48 @@ def test_listado_de_cuentas_es_solo_para_admin_y_no_filtra_tokens(client: TestCl
 
     anonymous = client.get("/api/graniot/accounts")
     assert anonymous.status_code == 401
+
+
+def test_alta_de_cuenta_reutiliza_la_existente_y_no_filtra_tokens(client: TestClient, token: str):
+    creaciones = []
+
+    class _ConAlta(FakeGraniotClient):
+        async def post(self, path, json_body=None, params=None, **kwargs):
+            if path == "/api/accounts/":
+                self._record("POST", path, json_body=json_body)
+                creaciones.append(json_body)
+                nueva = _account(str((json_body or {}).get("account_email")), account_id="acc-nueva", user_id=1600)
+                FakeGraniotClient.accounts = FakeGraniotClient.accounts + [nueva]
+                return nueva
+            return await super().post(path, json_body=json_body, params=params, **kwargs)
+
+    import app.api.routers.graniot as g
+    original = g.GraniotClient
+    g.GraniotClient = _ConAlta
+    try:
+        nueva = client.post("/api/graniot/accounts", headers=_auth(token), json={"account_email": "nuevo@cliente.com"})
+        assert nueva.status_code == 200, nueva.text
+        data = nueva.json()["data"]
+        assert data["already_existed"] is False
+        assert data["account_email"] == "nuevo@cliente.com"
+        assert data["client_id"] == "1600"
+        assert "account_access" not in data and "access_token" not in data
+        assert len(creaciones) == 1
+
+        # Pedirla otra vez no crea una cuenta duplicada.
+        repetida = client.post("/api/graniot/accounts", headers=_auth(token), json={"account_email": "nuevo@cliente.com"})
+        assert repetida.status_code == 200, repetida.text
+        assert repetida.json()["data"]["already_existed"] is True
+        assert len(creaciones) == 1
+    finally:
+        g.GraniotClient = original
+        FakeGraniotClient.accounts = [_account(SUPERADMIN["email"])]
+        graniot._cache_delete_prefix(graniot._EMBED_ACCOUNTS_CACHE_KEY)
+
+
+def test_alta_de_cuenta_requiere_admin_y_correo_valido(client: TestClient, token: str):
+    sin_correo = client.post("/api/graniot/accounts", headers=_auth(token), json={})
+    assert sin_correo.status_code == 400
+
+    anonimo = client.post("/api/graniot/accounts", json={"account_email": "x@y.com"})
+    assert anonimo.status_code == 401

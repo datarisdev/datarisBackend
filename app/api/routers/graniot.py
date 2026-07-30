@@ -3843,6 +3843,74 @@ async def list_graniot_accounts(
     return {"data": data, "error": None}
 
 
+@router.post("/accounts")
+async def create_graniot_account(
+    payload: Dict[str, Any] = Body(default_factory=dict),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Da de alta en Graniot la cuenta de un email (solo admin).
+
+    Es lo que permite que un usuario de Dataris reciba sus lotes en su propio
+    portal sin pedírselo al comercial de Graniot: hasta que su cuenta aparece en
+    ``/api/accounts/`` no hay forma de actuar en su nombre.
+
+    La respuesta indica si la cuenta recién listada **ve las fincas que ya tenía
+    esa persona**; si viniera vacía sería una cuenta nueva distinta, y conviene
+    saberlo antes de mandarle lotes.
+    """
+    db = read_db()
+    require_admin_context(authorization, db)
+
+    email = str(payload.get("account_email") or payload.get("email") or "").strip()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Indica el correo de la cuenta de Graniot")
+
+    client = GraniotClient()
+    try:
+        existing = _raw_account_for_email(await _fetch_all_accounts(client, operation="create-graniot-account"), email)
+        created = existing
+        if not existing:
+            created = await client.post(
+                "/api/accounts/",
+                json_body={"account_email": email},
+                params=None,
+                debug_context={"operation": "create-graniot-account", "email": email},
+            )
+            error = _payload_error_message(created)
+            if error:
+                raise GraniotAPIError(400, error, created)
+            if isinstance(created, list):
+                created = _raw_account_for_email(created, email) or (created[0] if created else None)
+    except Exception as exc:
+        _raise_graniot_error(exc)
+
+    if not isinstance(created, dict) or not created.get("account_email"):
+        raise HTTPException(status_code=502, detail="Graniot no devolvió la cuenta creada")
+
+    _cache_delete_prefix(_EMBED_ACCOUNTS_CACHE_KEY)
+    target = {
+        "mode": SYNC_MODE_TOKEN if _account_access_token(created) else SYNC_MODE_CLIENT_ID,
+        "access_token": _account_access_token(created),
+        "client_id": _account_client_id(created),
+        "account_id": _account_id_value(created),
+    }
+    probe = await _probe_target_account(target) if (target["access_token"] or target["client_id"]) else None
+
+    return {
+        "data": {
+            "already_existed": bool(existing),
+            "account_email": created.get("account_email"),
+            "account_id": _account_id_value(created),
+            "client_id": _account_client_id(created),
+            "has_account_token": bool(_account_access_token(created)),
+            # Fincas/parcelas que ve la cuenta: si están vacías cuando la
+            # persona ya tenía fincas, Graniot creó una cuenta distinta.
+            "sees": probe,
+        },
+        "error": None,
+    }
+
+
 @router.get("/parcels/sync-target")
 async def get_parcel_sync_target(
     refresh: bool = Query(default=False),
