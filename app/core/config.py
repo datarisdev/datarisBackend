@@ -59,6 +59,31 @@ class Settings(BaseSettings):
     # still valid). Users without a match keep the dedicated service-account
     # portal above. Kill-switch: set to false to force the service account.
     GRANIOT_EMBED_PER_USER_ENABLED: bool = True
+    # Per-user parcels: lots created in Dataris are pushed to Graniot inside the
+    # account that owns the embedded portal of that same user (matched by email
+    # in /api/accounts/), and removed from it when the lot is deleted. This is
+    # what makes Dataris independent from Graniot's commercial team for parcel
+    # uploads. Kill-switch: false keeps everything in the API key's own account.
+    GRANIOT_PARCEL_SYNC_PER_USER_ENABLED: bool = True
+    # How to act on behalf of that account:
+    # - "auto": use the account token (account_access) when Graniot exposes it,
+    #   otherwise fall back to the privileged `client_id` query parameter.
+    # - "token" / "client_id": force one of them.
+    # Verified against the live API: `account_access` works, and `client_id` is
+    # only usable with a numeric Graniot user id (the account ids returned by
+    # /api/accounts/, "acc-<uuid>", make Graniot answer HTTP 500).
+    GRANIOT_PARCEL_SYNC_MODE: str = "auto"
+    # Push new lots to Graniot automatically (upload + manual drawing).
+    GRANIOT_PARCEL_AUTOSYNC_ENABLED: bool = True
+    # Delete the Graniot parcels when the Dataris lot is deleted.
+    GRANIOT_PARCEL_AUTODELETE_ENABLED: bool = True
+    # When true, a manual sync also refuses to run for users without a matching
+    # Graniot account instead of falling back to the API key owner's account.
+    GRANIOT_PARCEL_SYNC_REQUIRE_ACCOUNT: bool = False
+    # Farm used inside each user's own Graniot account when the lot does not
+    # carry one yet. GRANIOT_DEFAULT_FARM_ID below belongs to the API key owner,
+    # so it is intentionally ignored while acting on behalf of another account.
+    GRANIOT_PARCEL_SYNC_FARM_NAME: str = "Dataris"
     # The public ReDoc spec does not declare a security scheme; make it configurable.
     # Common valid values are: X-API-Key, Api-Key, Authorization.
     GRANIOT_AUTH_HEADER: str = "X-API-Key"

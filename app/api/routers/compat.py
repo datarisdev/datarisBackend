@@ -20,7 +20,7 @@ from time import monotonic
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
-from fastapi import APIRouter, Body, File, Form, Header, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Body, File, Form, Header, HTTPException, UploadFile
 from starlette.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, Response
 from jose import ExpiredSignatureError, JWTError, jwt
@@ -762,8 +762,18 @@ def upsert_user_parcel(db: Dict[str, Any], user_id: str, row: Dict[str, Any]) ->
     existing = find_existing_user_parcel(parcel_rows, row, user_id)
     if existing is not None:
         preserved_id = existing.get("id") or row.get("id")
+        # El lote sigue siendo el mismo, así que conserva su vínculo con Graniot:
+        # sin esto, volver a subir el archivo perdería el id remoto y la
+        # sincronización crearía una parcela duplicada en el portal del usuario,
+        # dejando la anterior huérfana.
+        preserved_graniot = {
+            key: value
+            for key, value in existing.items()
+            if key.startswith("graniot_") and key not in row
+        }
         existing.clear()
         existing.update(row)
+        existing.update(preserved_graniot)
         existing["id"] = preserved_id
         existing["user_id"] = user_id
         return existing
@@ -1362,7 +1372,12 @@ def update(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict)
 
 
 @router.post("/tables/{table_name}/delete")
-def delete(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
+def delete(
+    table_name: str,
+    background_tasks: BackgroundTasks,
+    payload: Dict[str, Any] = Body(default_factory=dict),
+    authorization: Optional[str] = Header(default=None),
+):
     user = bearer_user(authorization)
     with LOCK:
         db = read_db()
@@ -1372,6 +1387,10 @@ def delete(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict)
         ids = {id(r) for r in targets}
         db["tables"][table_name] = [r for r in rows if id(r) not in ids]
         write_db(db)
+    if table_name == "parcels":
+        # The lot is gone locally; remove its parcels from the user's Graniot
+        # account too so both sides stay in sync.
+        schedule_graniot_parcel_delete(background_tasks, user, targets)
     return {"data": targets, "error": None, "count": len(targets)}
 
 
@@ -1454,8 +1473,128 @@ async def helicopter_copilot(
         raise HTTPException(status_code=500, detail=f"Error generando copiloto de aplicación aérea: {exc}")
 
 
+# ---------------------------------------------------------------------------
+# Graniot mirror for lots
+# ---------------------------------------------------------------------------
+# The Satélite module embeds each user's own Graniot portal, so a lot created in
+# Dataris must also exist in that user's Graniot account (and disappear from it
+# when the lot is deleted). Both operations go through Graniot's API, which is
+# what removes the dependency on Graniot's commercial team.
+#
+# Everything here is best-effort: Graniot being slow or unreachable must never
+# break creating or deleting a lot in Dataris. Failures are recorded in the
+# lot's `graniot_sync_error` field (see the graniot router) and in the logs.
+
+
+def _graniot_log(event: str, **fields: Any) -> None:
+    try:
+        from app.services.graniot_debug import log_event
+
+        log_event({"event": event, **fields})
+    except Exception:
+        pass
+
+
+async def _graniot_sync_parcels_task(user: Dict[str, Any], parcel_ids: List[str]) -> None:
+    from app.api.routers.graniot import sync_local_parcel_to_graniot
+
+    for parcel_id in parcel_ids:
+        try:
+            await sync_local_parcel_to_graniot(
+                user,
+                parcel_id,
+                {"metadata": {"origin": "dataris-autosync"}},
+                require_account=True,
+                # Re-subir el mismo archivo actualiza la fila local en su sitio:
+                # si ya tiene parcelas en Graniot hay que actualizarlas, no
+                # crear un duplicado en el portal del usuario.
+                prefer_update=True,
+            )
+            _graniot_log(
+                "dataris.compat.parcel_autosync.ok",
+                operation="parcel-autosync",
+                local_parcel_id=parcel_id,
+            )
+        except HTTPException as exc:
+            # 409 = the user has no Graniot account with that email. Expected for
+            # Dataris-only users; nothing is pushed anywhere.
+            _graniot_log(
+                "dataris.compat.parcel_autosync.skipped" if exc.status_code == 409 else "dataris.compat.parcel_autosync.failed",
+                operation="parcel-autosync",
+                local_parcel_id=parcel_id,
+                status_code=exc.status_code,
+                message=str(exc.detail),
+            )
+        except Exception as exc:  # noqa: BLE001 — a background task must never bubble up
+            _graniot_log(
+                "dataris.compat.parcel_autosync.failed",
+                operation="parcel-autosync",
+                local_parcel_id=parcel_id,
+                exception_type=type(exc).__name__,
+                message=str(exc),
+            )
+
+
+async def _graniot_delete_parcels_task(user: Dict[str, Any], snapshots: List[Dict[str, Any]]) -> None:
+    from app.api.routers.graniot import delete_parcel_from_graniot
+
+    for snapshot in snapshots:
+        try:
+            # The local row is already gone, so there is nothing left to clear.
+            result = await delete_parcel_from_graniot(user, snapshot, clear_local=False)
+            _graniot_log(
+                "dataris.compat.parcel_autodelete.failed" if result.get("failed") else "dataris.compat.parcel_autodelete.ok",
+                operation="parcel-autodelete",
+                local_parcel_id=snapshot.get("id"),
+                deleted=result.get("deleted"),
+                missing=result.get("missing"),
+                failed=result.get("failed"),
+            )
+        except Exception as exc:  # noqa: BLE001 — a background task must never bubble up
+            _graniot_log(
+                "dataris.compat.parcel_autodelete.failed",
+                operation="parcel-autodelete",
+                local_parcel_id=snapshot.get("id"),
+                exception_type=type(exc).__name__,
+                message=str(exc),
+            )
+
+
+def schedule_graniot_parcel_sync(
+    background: Optional[BackgroundTasks],
+    user: Optional[Dict[str, Any]],
+    parcels: Iterable[Dict[str, Any]],
+) -> None:
+    if background is None or not user or not settings.GRANIOT_PARCEL_AUTOSYNC_ENABLED:
+        return
+    if not settings.GRANIOT_PARCEL_SYNC_PER_USER_ENABLED:
+        return
+    parcel_ids = [str(row.get("id")) for row in parcels if isinstance(row, dict) and row.get("id")]
+    if not parcel_ids:
+        return
+    background.add_task(_graniot_sync_parcels_task, dict(user), parcel_ids)
+
+
+def schedule_graniot_parcel_delete(
+    background: Optional[BackgroundTasks],
+    user: Optional[Dict[str, Any]],
+    parcels: Iterable[Dict[str, Any]],
+) -> None:
+    if background is None or not user or not settings.GRANIOT_PARCEL_AUTODELETE_ENABLED:
+        return
+    snapshots = [
+        dict(row)
+        for row in parcels
+        if isinstance(row, dict) and (row.get("graniot_parcel_id") or row.get("graniot_parcels") or row.get("graniot_raw"))
+    ]
+    if not snapshots:
+        return
+    background.add_task(_graniot_delete_parcels_task, dict(user), snapshots)
+
+
 @router.post("/parcels/upload")
 async def upload_parcel_from_satellite(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     name: str = Form(...),
     authorization: Optional[str] = Header(default=None),
@@ -1515,6 +1654,7 @@ async def upload_parcel_from_satellite(
                 })
                 created_rows.append(upsert_user_parcel(db, user["id"], row))
             write_db(db)
+        schedule_graniot_parcel_sync(background_tasks, user, created_rows)
         return {"data": {"parcel": created_rows[0], "parcels": created_rows}, "error": None}
     except ValueError as exc:
         try:
@@ -1628,6 +1768,7 @@ async def resolve_google_maps_link(
 
 @router.post("/parcels/create-manual")
 def create_manual_parcel(
+    background_tasks: BackgroundTasks,
     payload: Dict[str, Any] = Body(default_factory=dict),
     authorization: Optional[str] = Header(default=None),
 ):
@@ -1658,6 +1799,7 @@ def create_manual_parcel(
         db = read_db()
         row = upsert_user_parcel(db, user["id"], row)
         write_db(db)
+    schedule_graniot_parcel_sync(background_tasks, user, [row])
     return {"data": {"parcel": row}, "error": None}
 
 
