@@ -27,7 +27,17 @@ except Exception:  # pragma: no cover - fallback for older Shapely builds
     shapely_make_valid = None
 from PIL import Image, ImageDraw
 
-from app.api.routers.compat import LOCK, bearer_user, now, read_db, require_admin_context, table, write_db
+from app.api.routers.compat import (
+    LOCK,
+    bearer_user,
+    now,
+    parcel_manager_covers_user,
+    parcel_manager_permission,
+    read_db,
+    require_admin_context,
+    table,
+    write_db,
+)
 from app.core.config import settings
 from app.services.graniot_client import GraniotAPIError, GraniotClient, GraniotNotConfigured
 from app.services.graniot_debug import clear_logs, get_log_file_path, log_event, read_logs, safe_payload
@@ -353,6 +363,28 @@ def _require_user(authorization: Optional[str]) -> Dict[str, Any]:
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return user
+
+
+def _acting_user(authorization: Optional[str], on_behalf_of: Optional[str] = None) -> Dict[str, Any]:
+    """Usuario cuyos lotes se manipulan.
+
+    Normalmente es el autenticado. El equipo de Dataris (permiso
+    `can_manage_parcels`) administra los lotes de sus clientes desde el panel de
+    administración, así que puede indicar el dueño con `user_id`.
+    """
+    user = _require_user(authorization)
+    target_id = str(on_behalf_of or "").strip()
+    if not target_id or target_id == str(user.get("id") or ""):
+        return user
+
+    db = read_db()
+    permission = parcel_manager_permission(db, str(user.get("id") or ""))
+    if not parcel_manager_covers_user(db, permission, target_id):
+        raise HTTPException(status_code=403, detail="No tienes permiso para administrar los lotes de ese usuario")
+    owner = next((u for u in db.get("users", []) if str(u.get("id")) == target_id), None)
+    if not owner:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    return owner
 
 
 def _raise_graniot_error(exc: Exception) -> None:
@@ -3468,10 +3500,11 @@ async def sync_local_parcel_to_graniot(
 @router.post("/parcels/sync-local/{parcel_id}")
 async def sync_local_parcel(
     parcel_id: str,
+    user_id: Optional[str] = Query(default=None, description="Dueño del lote (solo para gestores de lotes)"),
     payload: Dict[str, Any] = Body(default_factory=dict),
     authorization: Optional[str] = Header(default=None),
 ):
-    user = _require_user(authorization)
+    user = _acting_user(authorization, user_id or (payload or {}).get("user_id"))
     data = await sync_local_parcel_to_graniot(user, parcel_id, payload)
     return {"data": data, "error": None}
 
@@ -3635,10 +3668,11 @@ async def delete_parcel_from_graniot(
 @router.delete("/parcels/sync-local/{parcel_id}")
 async def unsync_local_parcel(
     parcel_id: str,
+    user_id: Optional[str] = Query(default=None, description="Dueño del lote (solo para gestores de lotes)"),
     authorization: Optional[str] = Header(default=None),
 ):
     """Remove the lot from Graniot without deleting it in Dataris."""
-    user = _require_user(authorization)
+    user = _acting_user(authorization, user_id)
     with LOCK:
         db = read_db()
         local = next(
@@ -3945,10 +3979,11 @@ async def get_parcel_sync_target(
     refresh: bool = Query(default=False),
     probe: bool = Query(default=False),
     probe_mode: Optional[str] = Query(default=None, description="token|client_id|service: fuerza el modo solo en la sonda"),
+    user_id: Optional[str] = Query(default=None, description="Consultar la cuenta de otro usuario (solo gestores de lotes)"),
     authorization: Optional[str] = Header(default=None),
 ):
     """Diagnostics: which Graniot account receives this user's lots."""
-    user = _require_user(authorization)
+    user = _acting_user(authorization, user_id)
     target = await _resolve_sync_target(
         (user or {}).get("email"),
         refresh=refresh,
