@@ -678,6 +678,81 @@ def _is_platform_superadmin(db: Dict[str, Any], user_id: str) -> bool:
     )
 
 
+# Los lotes ya no los carga el cliente desde su perfil: los da de alta el equipo
+# de Dataris (desarrollo/comercial) desde el panel de administración. El permiso
+# vive en la fila de `admin_users`, de modo que un comercial (admin_role
+# "company_user") puede recibirlo sin convertirse en administrador de nada más.
+PARCEL_MANAGER_FIELD = "can_manage_parcels"
+PARCEL_MANAGER_ALL_FIELD = "can_manage_all_parcels"
+
+
+def active_admin_row(db: Dict[str, Any], user_id: str) -> Optional[Dict[str, Any]]:
+    return next(
+        (
+            row
+            for row in table(db, "admin_users")
+            if str(row.get("user_id") or "") == str(user_id or "") and row.get("is_active", True) is not False
+        ),
+        None,
+    )
+
+
+def parcel_manager_permission(db: Dict[str, Any], user_id: Optional[str]) -> Dict[str, Any]:
+    """Alcance con el que un usuario puede administrar lotes ajenos.
+
+    - `superadmin`: todos los usuarios de la plataforma.
+    - `company_admin`: los usuarios de su empresa (o todos si se le marcó el
+      permiso global).
+    - cualquier otra fila de admin con `can_manage_parcels`: comerciales a los
+      que el administrador dio el permiso.
+    """
+    result: Dict[str, Any] = {
+        "allowed": False,
+        "scope": None,
+        "company_id": None,
+        "admin_role": None,
+        "admin_user_id": None,
+    }
+    if not user_id:
+        return result
+    admin = active_admin_row(db, str(user_id))
+    if not admin:
+        return result
+
+    role = admin.get("admin_role")
+    company_id = admin.get("company_id")
+    global_scope = bool(admin.get(PARCEL_MANAGER_ALL_FIELD))
+    result.update({"admin_role": role, "company_id": company_id, "admin_user_id": admin.get("id")})
+
+    if role == "superadmin":
+        result.update({"allowed": True, "scope": "all"})
+        return result
+    if role == "company_admin" or admin.get(PARCEL_MANAGER_FIELD):
+        result.update({"allowed": True, "scope": "all" if global_scope else "company"})
+        return result
+    return result
+
+
+def can_manage_parcels(db: Dict[str, Any], user_id: Optional[str]) -> bool:
+    return bool(parcel_manager_permission(db, user_id).get("allowed"))
+
+
+def parcel_manager_covers_user(
+    db: Dict[str, Any],
+    permission: Dict[str, Any],
+    target_user_id: str,
+) -> bool:
+    """¿El alcance del gestor incluye al usuario dueño de los lotes?"""
+    if not permission.get("allowed"):
+        return False
+    if permission.get("scope") == "all":
+        return True
+    company_id = permission.get("company_id")
+    if not company_id:
+        return False
+    return str(_company_for_user(db, str(target_user_id)) or "") == str(company_id)
+
+
 def scoped_table_rows(db: Dict[str, Any], table_name: str, user: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     rows = table(db, table_name)
     if not user or table_name not in USER_SCOPED_TABLES:
@@ -1149,6 +1224,11 @@ def create_manual_admin_user(payload: Dict[str, Any] = Body(default_factory=dict
         app_role = "admin" if admin_role in {"superadmin", "company_admin"} else "user"
         table(db, "user_roles").append({"id": str(uuid.uuid4()), "user_id": user_id, "role": app_role, "created_at": t})
 
+        # Permiso para cargar lotes en nombre de otros usuarios (equipo comercial
+        # y de desarrollo). El alcance global solo lo concede un superadmin.
+        can_manage_parcels_flag = bool(payload.get(PARCEL_MANAGER_FIELD))
+        can_manage_all_parcels_flag = bool(payload.get(PARCEL_MANAGER_ALL_FIELD)) and is_super_admin
+
         admin_user_id = str(uuid.uuid4())
         admin_row = {
             "id": admin_user_id,
@@ -1158,6 +1238,8 @@ def create_manual_admin_user(payload: Dict[str, Any] = Body(default_factory=dict
             "assigned_hectares": assigned_hectares,
             "created_by": current_admin.get("id"),
             "is_active": is_active,
+            PARCEL_MANAGER_FIELD: can_manage_parcels_flag,
+            PARCEL_MANAGER_ALL_FIELD: can_manage_all_parcels_flag,
             "created_at": t,
             "updated_at": t,
         }
@@ -1274,6 +1356,62 @@ def query(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict),
     return {"data": rows, "error": None, "count": count}
 
 
+def guard_admin_users_write(
+    db: Dict[str, Any],
+    table_name: str,
+    user: Optional[Dict[str, Any]],
+    data: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Solo un administrador toca la tabla de administradores.
+
+    Importa porque ahí vive `can_manage_parcels`: sin esta comprobación,
+    cualquier usuario podría concederse a sí mismo el permiso de cargar lotes
+    que este módulo acaba de restringir. Un `company_admin` no puede repartir
+    roles de superadmin ni el alcance global de lotes.
+    """
+    if table_name != "admin_users":
+        return None
+    actor = active_admin_row(db, str((user or {}).get("id") or "")) if user else None
+    if not actor or actor.get("admin_role") not in {"superadmin", "company_admin"}:
+        raise HTTPException(status_code=403, detail="No autorizado para administrar usuarios")
+    if actor.get("admin_role") != "superadmin" and isinstance(data, dict):
+        for field in ("admin_role", PARCEL_MANAGER_ALL_FIELD):
+            data.pop(field, None)
+    return actor
+
+
+def admin_users_rows_in_scope(
+    db: Dict[str, Any],
+    table_name: str,
+    actor: Optional[Dict[str, Any]],
+    rows: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Un `company_admin` solo modifica administradores de su propia empresa."""
+    if table_name != "admin_users" or not actor or actor.get("admin_role") == "superadmin":
+        return rows
+    company_id = actor.get("company_id")
+    return [row for row in rows if str(row.get("company_id") or "") == str(company_id or "")]
+
+
+def guard_parcel_table_write(db: Dict[str, Any], table_name: str, user: Optional[Dict[str, Any]]) -> None:
+    """Escribir en `parcels` desde el API genérico exige permiso de gestión.
+
+    El cliente ya no da de alta ni borra sus lotes: lo hace el equipo de Dataris
+    desde el panel de administración.
+    """
+    if table_name != "parcels":
+        return
+    if user and can_manage_parcels(db, str(user.get("id") or "")):
+        return
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            "La gestión de lotes la realiza el equipo de Dataris. "
+            "Solicita los cambios a tu contacto comercial o de soporte."
+        ),
+    )
+
+
 @router.post("/tables/{table_name}/insert")
 def insert(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
     user = bearer_user(authorization)
@@ -1281,6 +1419,9 @@ def insert(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict)
     items = incoming if isinstance(incoming, list) else [incoming]
     with LOCK:
         db = read_db()
+        guard_parcel_table_write(db, table_name, user)
+        for item in items:
+            guard_admin_users_write(db, table_name, user, item if isinstance(item, dict) else None)
         rows = table(db, table_name)
         inserted = []
         for item in items:
@@ -1314,6 +1455,9 @@ def upsert(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict)
     changed = []
     with LOCK:
         db = read_db()
+        guard_parcel_table_write(db, table_name, user)
+        for item in items:
+            guard_admin_users_write(db, table_name, user, item if isinstance(item, dict) else None)
         rows = table(db, table_name)
         for item in items:
             row = add_defaults(table_name, item, user.get("id") if user else None)
@@ -1358,8 +1502,11 @@ def update(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict)
     user = bearer_user(authorization)
     with LOCK:
         db = read_db()
+        guard_parcel_table_write(db, table_name, user)
+        actor = guard_admin_users_write(db, table_name, user, payload.get("data") if isinstance(payload.get("data"), dict) else None)
         rows = scoped_table_rows(db, table_name, user)
         targets = apply_filters(rows, payload.get("filters") or [])
+        targets = admin_users_rows_in_scope(db, table_name, actor, targets)
         for row in targets:
             row.update(normalize_record_geometries(table_name, payload.get("data") or {}))
             if table_name in USER_SCOPED_TABLES and user and "user_id" in row:
@@ -1381,9 +1528,12 @@ def delete(
     user = bearer_user(authorization)
     with LOCK:
         db = read_db()
+        guard_parcel_table_write(db, table_name, user)
+        actor = guard_admin_users_write(db, table_name, user)
         rows = table(db, table_name)
         scoped_rows = scoped_table_rows(db, table_name, user)
         targets = apply_filters(scoped_rows, payload.get("filters") or [])
+        targets = admin_users_rows_in_scope(db, table_name, actor, targets)
         ids = {id(r) for r in targets}
         db["tables"][table_name] = [r for r in rows if id(r) not in ids]
         write_db(db)
@@ -1592,16 +1742,30 @@ def schedule_graniot_parcel_delete(
     background.add_task(_graniot_delete_parcels_task, dict(user), snapshots)
 
 
-@router.post("/parcels/upload")
-async def upload_parcel_from_satellite(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-    name: str = Form(...),
-    authorization: Optional[str] = Header(default=None),
-):
-    user = bearer_user(authorization)
-    if not user:
-        raise HTTPException(status_code=401, detail="Not authenticated")
+def require_parcel_write_access(user: Dict[str, Any]) -> None:
+    """Los lotes solo los cargan las cuentas con permiso de gestión.
+
+    La carga desde el perfil del cliente quedó desactivada: la hace el equipo de
+    Dataris desde el panel de administración (`/compat/admin/parcels`).
+    """
+    db = read_db()
+    if can_manage_parcels(db, str(user.get("id") or "")):
+        return
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            "La carga de lotes la realiza el equipo de Dataris. "
+            "Solicita el alta de tus lotes a tu contacto comercial o de soporte."
+        ),
+    )
+
+
+async def store_parcel_file_for_user(
+    owner: Dict[str, Any],
+    file: UploadFile,
+    name: str,
+) -> List[Dict[str, Any]]:
+    """Guarda el archivo geográfico y registra sus lotes a nombre de `owner`."""
     if not name.strip():
         raise HTTPException(status_code=400, detail="Nombre de parcela requerido")
     if not file.filename:
@@ -1609,7 +1773,7 @@ async def upload_parcel_from_satellite(
 
     ensure_storage()
     clean_original = Path(file.filename.replace("..", "_")).name
-    storage_path = Path(user["id"]) / f"{int(datetime.now(timezone.utc).timestamp())}-{clean_original}"
+    storage_path = Path(owner["id"]) / f"{int(datetime.now(timezone.utc).timestamp())}-{clean_original}"
     dest = FILES / "parcels" / storage_path
     dest.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1633,7 +1797,7 @@ async def upload_parcel_from_satellite(
             for item in parcels_data:
                 row = normalize_record_geometries("parcels", {
                     "id": str(uuid.uuid4()),
-                    "user_id": user["id"],
+                    "user_id": owner["id"],
                     # Un solo polígono conserva el nombre que escribió el usuario;
                     # varios polígonos usan el nombre de cada parcela detectada en
                     # el shapefile/KML (o un correlativo si no trae atributos).
@@ -1652,16 +1816,21 @@ async def upload_parcel_from_satellite(
                     "created_at": t,
                     "updated_at": t,
                 })
-                created_rows.append(upsert_user_parcel(db, user["id"], row))
+                created_rows.append(upsert_user_parcel(db, owner["id"], row))
             write_db(db)
-        schedule_graniot_parcel_sync(background_tasks, user, created_rows)
-        return {"data": {"parcel": created_rows[0], "parcels": created_rows}, "error": None}
+        return created_rows
     except ValueError as exc:
         try:
             dest.unlink(missing_ok=True)
         except Exception:
             pass
         raise HTTPException(status_code=400, detail=str(exc))
+    except HTTPException:
+        try:
+            dest.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
     except Exception as exc:
         try:
             dest.unlink(missing_ok=True)
@@ -1678,6 +1847,51 @@ async def upload_parcel_from_satellite(
                 ),
             )
         raise HTTPException(status_code=500, detail=f"Error subiendo parcela: {raw_message}")
+
+
+def create_manual_parcel_for_user(owner: Dict[str, Any], name: str, geometry: Any) -> Dict[str, Any]:
+    """Registra a nombre de `owner` un lote dibujado sobre el mapa."""
+    clean_name = str(name or "").strip()
+    if not clean_name:
+        raise HTTPException(status_code=400, detail="Nombre de lote requerido")
+    if not geometry:
+        raise HTTPException(status_code=400, detail="Dibuja al menos tres puntos para crear el lote")
+
+    t = now()
+    row = normalize_record_geometries("parcels", {
+        "id": str(uuid.uuid4()),
+        "user_id": owner["id"],
+        "name": clean_name,
+        "geometry": geometry,
+        "geometry_geojson": geometry,
+        "source": "manual_map",
+        "created_at": t,
+        "updated_at": t,
+    })
+    if not row.get("geometry_geojson") or not row.get("area"):
+        raise HTTPException(status_code=400, detail="El polígono dibujado no es válido. Revisa los puntos e intenta nuevamente.")
+    with LOCK:
+        db = read_db()
+        row = upsert_user_parcel(db, owner["id"], row)
+        write_db(db)
+    return row
+
+
+@router.post("/parcels/upload")
+async def upload_parcel_from_satellite(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    name: str = Form(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    user = bearer_user(authorization)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    require_parcel_write_access(user)
+
+    created_rows = await store_parcel_file_for_user(user, file, name)
+    schedule_graniot_parcel_sync(background_tasks, user, created_rows)
+    return {"data": {"parcel": created_rows[0], "parcels": created_rows}, "error": None}
 
 
 _GOOGLE_MAPS_ALLOWED_HOSTS = {
@@ -1775,30 +1989,9 @@ def create_manual_parcel(
     user = bearer_user(authorization)
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    name = str(payload.get("name") or "").strip()
-    geometry = payload.get("geometry")
-    if not name:
-        raise HTTPException(status_code=400, detail="Nombre de lote requerido")
-    if not geometry:
-        raise HTTPException(status_code=400, detail="Dibuja al menos tres puntos para crear el lote")
+    require_parcel_write_access(user)
 
-    t = now()
-    row = normalize_record_geometries("parcels", {
-        "id": str(uuid.uuid4()),
-        "user_id": user["id"],
-        "name": name,
-        "geometry": geometry,
-        "geometry_geojson": geometry,
-        "source": "manual_map",
-        "created_at": t,
-        "updated_at": t,
-    })
-    if not row.get("geometry_geojson") or not row.get("area"):
-        raise HTTPException(status_code=400, detail="El polígono dibujado no es válido. Revisa los puntos e intenta nuevamente.")
-    with LOCK:
-        db = read_db()
-        row = upsert_user_parcel(db, user["id"], row)
-        write_db(db)
+    row = create_manual_parcel_for_user(user, payload.get("name"), payload.get("geometry"))
     schedule_graniot_parcel_sync(background_tasks, user, [row])
     return {"data": {"parcel": row}, "error": None}
 

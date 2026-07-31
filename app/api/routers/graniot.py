@@ -27,7 +27,17 @@ except Exception:  # pragma: no cover - fallback for older Shapely builds
     shapely_make_valid = None
 from PIL import Image, ImageDraw
 
-from app.api.routers.compat import LOCK, bearer_user, now, read_db, table, write_db
+from app.api.routers.compat import (
+    LOCK,
+    bearer_user,
+    now,
+    parcel_manager_covers_user,
+    parcel_manager_permission,
+    read_db,
+    require_admin_context,
+    table,
+    write_db,
+)
 from app.core.config import settings
 from app.services.graniot_client import GraniotAPIError, GraniotClient, GraniotNotConfigured
 from app.services.graniot_debug import clear_logs, get_log_file_path, log_event, read_logs, safe_payload
@@ -353,6 +363,28 @@ def _require_user(authorization: Optional[str]) -> Dict[str, Any]:
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return user
+
+
+def _acting_user(authorization: Optional[str], on_behalf_of: Optional[str] = None) -> Dict[str, Any]:
+    """Usuario cuyos lotes se manipulan.
+
+    Normalmente es el autenticado. El equipo de Dataris (permiso
+    `can_manage_parcels`) administra los lotes de sus clientes desde el panel de
+    administración, así que puede indicar el dueño con `user_id`.
+    """
+    user = _require_user(authorization)
+    target_id = str(on_behalf_of or "").strip()
+    if not target_id or target_id == str(user.get("id") or ""):
+        return user
+
+    db = read_db()
+    permission = parcel_manager_permission(db, str(user.get("id") or ""))
+    if not parcel_manager_covers_user(db, permission, target_id):
+        raise HTTPException(status_code=403, detail="No tienes permiso para administrar los lotes de ese usuario")
+    owner = next((u for u in db.get("users", []) if str(u.get("id")) == target_id), None)
+    if not owner:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    return owner
 
 
 def _raise_graniot_error(exc: Exception) -> None:
@@ -2678,18 +2710,50 @@ def _embed_service_account_emails() -> set[str]:
     }
 
 
+GRANIOT_ACCOUNTS_MAX_PAGES = int(os.getenv("GRANIOT_ACCOUNTS_MAX_PAGES", "20"))
+
+
+async def _fetch_all_accounts(client: GraniotClient, *, operation: str) -> List[Dict[str, Any]]:
+    """Read every Graniot account, following pagination when present.
+
+    ``/api/accounts/`` may answer with a plain list or with a DRF paginated
+    object (``{"count", "next", "results"}``). Reading only the first page would
+    silently hide accounts, and a user whose account is not seen here is treated
+    as "has no Graniot account" (their lots would never be uploaded).
+    """
+    accounts: List[Dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    path: Optional[str] = "/api/accounts/"
+
+    for _ in range(max(1, GRANIOT_ACCOUNTS_MAX_PAGES)):
+        if not path or path in seen_urls:
+            break
+        seen_urls.add(path)
+        payload = await client.get(
+            path,
+            include_client_id=False,
+            debug_context={"operation": operation, "page": len(seen_urls)},
+        )
+        accounts.extend(_items(payload))
+        next_url = payload.get("next") if isinstance(payload, dict) else None
+        path = str(next_url) if next_url else None
+
+    # La misma cuenta puede repetirse entre páginas si Graniot reordena.
+    deduped: Dict[str, Dict[str, Any]] = {}
+    for account in accounts:
+        key = str(account.get("id") or account.get("account_email") or len(deduped))
+        deduped.setdefault(key, account)
+    return list(deduped.values())
+
+
 async def _fetch_embed_accounts(*, refresh: bool = False) -> Any:
     """Fetch (with a short cache) the Graniot accounts listing for embed matching."""
     cached = None if refresh else _cache_get(_EMBED_ACCOUNTS_CACHE_KEY)
     if cached is not None:
         return cached
     client = GraniotClient()
-    payload = await client.get(
-        "/api/accounts/",
-        include_client_id=False,
-        debug_context={"operation": "resolve-embed-url-per-user"},
-    )
-    return _cache_set(_EMBED_ACCOUNTS_CACHE_KEY, payload, GRANIOT_EMBED_ACCOUNTS_CACHE_TTL_SECONDS)
+    accounts = await _fetch_all_accounts(client, operation="resolve-embed-url-per-user")
+    return _cache_set(_EMBED_ACCOUNTS_CACHE_KEY, accounts, GRANIOT_EMBED_ACCOUNTS_CACHE_TTL_SECONDS)
 
 
 async def _embed_account_for_user(user: Dict[str, Any]) -> Optional[Dict[str, str]]:
@@ -2802,13 +2866,14 @@ def _jwt_payload(token: Any) -> Dict[str, Any]:
 def _account_client_id(account: Optional[Dict[str, Any]]) -> Optional[str]:
     """Value for Graniot's privileged ``client_id`` parameter.
 
-    ``client_id`` identifies the *user* Graniot must act as, which is the numeric
-    ``user_id`` carried by the account/embed SimpleJWT.
+    ``client_id`` identifies the *user* Graniot must act as by its numeric id,
+    which travels in the account/embed SimpleJWT under the ``id`` claim.
 
-    The account ids in ``/api/accounts/`` look like ``acc-82910c84-…`` and are
-    NOT valid here: sending one makes Graniot answer HTTP 500 (verified against
-    the live API). So when no numeric user id is available there is no usable
-    client_id, and the caller keeps the account token as the only way in.
+    Verified against the live API: numeric ids work (1528 → that account's own
+    farm, 1471 → its 5 farms), while the ``acc-<uuid>`` ids from
+    ``/api/accounts/``, an account email or an unknown id all answer HTTP 500.
+    So without a numeric id there is no usable client_id and the account token
+    stays as the only way in.
     """
     if not isinstance(account, dict):
         return None
@@ -2818,7 +2883,7 @@ def _account_client_id(account: Optional[Dict[str, Any]]) -> Optional[str]:
     ]
     for token in tokens:
         payload = _jwt_payload(token)
-        user_id = _clean_id(payload.get("user_id") or payload.get("uid"))
+        user_id = _clean_id(payload.get("id") or payload.get("user_id") or payload.get("uid"))
         if user_id and user_id.isdigit():
             return user_id
     return None
@@ -3435,10 +3500,11 @@ async def sync_local_parcel_to_graniot(
 @router.post("/parcels/sync-local/{parcel_id}")
 async def sync_local_parcel(
     parcel_id: str,
+    user_id: Optional[str] = Query(default=None, description="Dueño del lote (solo para gestores de lotes)"),
     payload: Dict[str, Any] = Body(default_factory=dict),
     authorization: Optional[str] = Header(default=None),
 ):
-    user = _require_user(authorization)
+    user = _acting_user(authorization, user_id or (payload or {}).get("user_id"))
     data = await sync_local_parcel_to_graniot(user, parcel_id, payload)
     return {"data": data, "error": None}
 
@@ -3602,10 +3668,11 @@ async def delete_parcel_from_graniot(
 @router.delete("/parcels/sync-local/{parcel_id}")
 async def unsync_local_parcel(
     parcel_id: str,
+    user_id: Optional[str] = Query(default=None, description="Dueño del lote (solo para gestores de lotes)"),
     authorization: Optional[str] = Header(default=None),
 ):
     """Remove the lot from Graniot without deleting it in Dataris."""
-    user = _require_user(authorization)
+    user = _acting_user(authorization, user_id)
     with LOCK:
         db = read_db()
         local = next(
@@ -3658,15 +3725,265 @@ async def _probe_target_account(target: Dict[str, Any]) -> Dict[str, Any]:
     return probe
 
 
+async def _fetch_farm_managers(client: GraniotClient, limit: int = 40) -> Dict[str, Any]:
+    """Gestores dados de alta dentro de las fincas de la cuenta.
+
+    Son personas creadas *dentro* de una cuenta de Graniot y NO aparecen en
+    ``/api/accounts/``: no tienen portal propio, así que sus emails no sirven
+    para repartir los lotes por usuario. Se listan solo como diagnóstico, para
+    distinguirlos de las cuentas reales.
+    """
+    result: Dict[str, Any] = {"farms": 0, "managers": [], "error": None}
+    try:
+        farms = _items(await client.get("/api/farms/", debug_context={"operation": "list-farm-managers"}))
+    except Exception as exc:  # noqa: BLE001 — diagnóstico, nunca rompe la respuesta
+        result["error"] = str(exc)[:300]
+        return result
+
+    result["farms"] = len(farms)
+    seen: Dict[str, Dict[str, Any]] = {}
+    for farm in farms[:limit]:
+        farm_id = _clean_id(farm.get("id"))
+        if not farm_id:
+            continue
+        try:
+            managers = _items(await client.get(
+                f"/api/farms/{farm_id}/managers/",
+                debug_context={"operation": "list-farm-managers", "farm_id": farm_id},
+            ))
+        except Exception:
+            continue
+        for manager in managers:
+            # Graniot no documenta con exactitud esta respuesta: se recogen los
+            # campos habituales para poder identificar a la persona.
+            email = next(
+                (
+                    str(manager.get(field)).strip()
+                    for field in ("email", "user_email", "username", "account_email")
+                    if manager.get(field)
+                ),
+                None,
+            )
+            name = next(
+                (
+                    str(manager.get(field)).strip()
+                    for field in ("name", "full_name", "first_name", "user", "manager")
+                    if manager.get(field)
+                ),
+                None,
+            )
+            # Cada "manager" es en realidad un vínculo cuenta↔finca: agruparlos
+            # por account_id dice cuántas cuentas de Graniot tienen fincas, que
+            # puede ser más que las que /api/accounts/ deja ver.
+            account_id = _clean_id(manager.get("account_id"))
+            key = str(account_id or email or manager.get("key") or name or json.dumps(manager, sort_keys=True, default=str))
+            entry = seen.setdefault(key, {
+                "account_id": account_id,
+                "id": manager.get("id"),
+                "name": name,
+                "email": email,
+                "fields": sorted(manager.keys()),
+                "farms": [],
+            })
+            entry["farms"].append(farm.get("name") or farm_id)
+        if managers and not result.get("sample"):
+            result["sample"] = safe_payload(managers[0])
+    result["managers"] = list(seen.values())
+    return result
+
+
+@router.get("/accounts")
+async def list_graniot_accounts(
+    refresh: bool = Query(default=True),
+    include_managers: bool = Query(default=False),
+    probe_client_id: Optional[str] = Query(default=None, description="Comprueba qué ve la API key actuando como este client_id"),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Cuentas de Graniot y qué usuario de Dataris recibe cada una (solo admin).
+
+    Sirve para ver de un vistazo qué usuarios pueden recibir sus lotes en su
+    propio portal y cuáles no tienen cuenta en Graniot todavía. Nunca devuelve
+    ``account_access`` ni el ``auth_id`` del portal.
+    """
+    db = read_db()
+    require_admin_context(authorization, db)
+
+    client = GraniotClient()
+    try:
+        accounts = await _fetch_all_accounts(client, operation="list-graniot-accounts")
+    except Exception as exc:
+        _raise_graniot_error(exc)
+
+    dataris_users = {
+        str(user.get("email") or "").strip().lower(): user
+        for user in (db.get("users") or [])
+        if user.get("email")
+    }
+    matched_emails = set()
+    items: List[Dict[str, Any]] = []
+    for account in accounts:
+        email = str(account.get("account_email") or "").strip().lower()
+        if email:
+            matched_emails.add(email)
+        claims = _jwt_payload(account.get("account_access")) or _jwt_payload(
+            _embed_url_auth_token(account.get("embedded_url") or "")
+        )
+        items.append({
+            "id": account.get("id"),
+            "account_email": account.get("account_email"),
+            "client_id": _account_client_id(account),
+            "has_account_token": bool(_account_access_token(account)),
+            "dataris_user": bool(email and email in dataris_users),
+            # Qué identificadores trae el token: Graniot solo acepta como
+            # client_id el id numérico del usuario.
+            "token_claims": sorted(claims.keys()),
+            "token_ids": {
+                key: claims.get(key)
+                for key in ("user_id", "uid", "sub", "account_id", "id")
+                if claims.get(key) is not None
+            },
+        })
+    items.sort(key=lambda item: str(item.get("account_email") or "").lower())
+
+    users_without_account = sorted(email for email in dataris_users if email not in matched_emails)
+    data: Dict[str, Any] = {
+        "count": len(items),
+        "accounts": items,
+        "dataris_users_total": len(dataris_users),
+        "dataris_users_with_account": sum(1 for item in items if item["dataris_user"]),
+        "dataris_users_without_account": users_without_account,
+    }
+    if include_managers:
+        managers = await _fetch_farm_managers(client)
+        known_ids = {str(item.get("id")) for item in items if item.get("id")}
+        managers["accounts_with_farms"] = len({
+            entry.get("account_id") for entry in managers.get("managers") or [] if entry.get("account_id")
+        })
+        managers["accounts_not_listed"] = sorted({
+            str(entry.get("account_id"))
+            for entry in managers.get("managers") or []
+            if entry.get("account_id") and str(entry.get("account_id")) not in known_ids
+        })
+        data["farm_managers"] = managers
+    if probe_client_id:
+        # Los vínculos de finca identifican a la cuenta por email, no por el
+        # "acc-<uuid>" de /api/accounts/. Esto comprueba con qué identificador
+        # acepta Graniot actuar en nombre de otra cuenta.
+        data["client_id_probe"] = await _probe_target_account({
+            "mode": SYNC_MODE_CLIENT_ID,
+            "client_id": str(probe_client_id).strip(),
+        })
+        data["client_id_probe"]["client_id"] = str(probe_client_id).strip()
+    return {"data": data, "error": None}
+
+
+@router.post("/accounts")
+async def create_graniot_account(
+    payload: Dict[str, Any] = Body(default_factory=dict),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Da de alta en Graniot la cuenta de un email (solo admin).
+
+    Es lo que permite que un usuario de Dataris reciba sus lotes en su propio
+    portal sin pedírselo al comercial de Graniot: hasta que su cuenta aparece en
+    ``/api/accounts/`` no hay forma de actuar en su nombre.
+
+    La respuesta indica si la cuenta recién listada **ve las fincas que ya tenía
+    esa persona**; si viniera vacía sería una cuenta nueva distinta, y conviene
+    saberlo antes de mandarle lotes.
+    """
+    db = read_db()
+    require_admin_context(authorization, db)
+
+    email = str(payload.get("account_email") or payload.get("email") or "").strip()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Indica el correo de la cuenta de Graniot")
+
+    client = GraniotClient()
+    try:
+        existing = _raw_account_for_email(await _fetch_all_accounts(client, operation="create-graniot-account"), email)
+        created = existing
+        if not existing:
+            created = await client.post(
+                "/api/accounts/",
+                json_body={"account_email": email},
+                params=None,
+                debug_context={"operation": "create-graniot-account", "email": email},
+            )
+            error = _payload_error_message(created)
+            if error:
+                raise GraniotAPIError(400, error, created)
+            if isinstance(created, list):
+                created = _raw_account_for_email(created, email) or (created[0] if created else None)
+    except Exception as exc:
+        _raise_graniot_error(exc)
+
+    if not isinstance(created, dict) or not created.get("account_email"):
+        raise HTTPException(status_code=502, detail="Graniot no devolvió la cuenta creada")
+
+    _cache_delete_prefix(_EMBED_ACCOUNTS_CACHE_KEY)
+    target = {
+        "mode": SYNC_MODE_TOKEN if _account_access_token(created) else SYNC_MODE_CLIENT_ID,
+        "access_token": _account_access_token(created),
+        "client_id": _account_client_id(created),
+        "account_id": _account_id_value(created),
+    }
+    probe = await _probe_target_account(target) if (target["access_token"] or target["client_id"]) else None
+
+    return {
+        "data": {
+            "already_existed": bool(existing),
+            "account_email": created.get("account_email"),
+            "account_id": _account_id_value(created),
+            "client_id": _account_client_id(created),
+            "has_account_token": bool(_account_access_token(created)),
+            # Fincas/parcelas que ve la cuenta: si están vacías cuando la
+            # persona ya tenía fincas, Graniot creó una cuenta distinta.
+            "sees": probe,
+        },
+        "error": None,
+    }
+
+
+@router.delete("/accounts/{account_id}")
+async def delete_graniot_account(
+    account_id: str,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Da de baja una cuenta de Graniot creada desde Dataris (solo admin).
+
+    Permite deshacer un alta equivocada. No toca las fincas ni las parcelas de
+    la cuenta: solo retira el acceso que Dataris había dado de alta.
+    """
+    db = read_db()
+    require_admin_context(authorization, db)
+
+    client = GraniotClient()
+    try:
+        await client.delete(
+            f"/api/accounts/{account_id}/",
+            debug_context={"operation": "delete-graniot-account", "account_id": account_id},
+        )
+    except GraniotAPIError as exc:
+        if exc.status_code not in {404, 410}:
+            _raise_graniot_error(exc)
+    except Exception as exc:
+        _raise_graniot_error(exc)
+
+    _cache_delete_prefix(_EMBED_ACCOUNTS_CACHE_KEY)
+    return {"data": {"account_id": account_id, "deleted": True}, "error": None}
+
+
 @router.get("/parcels/sync-target")
 async def get_parcel_sync_target(
     refresh: bool = Query(default=False),
     probe: bool = Query(default=False),
     probe_mode: Optional[str] = Query(default=None, description="token|client_id|service: fuerza el modo solo en la sonda"),
+    user_id: Optional[str] = Query(default=None, description="Consultar la cuenta de otro usuario (solo gestores de lotes)"),
     authorization: Optional[str] = Header(default=None),
 ):
     """Diagnostics: which Graniot account receives this user's lots."""
-    user = _require_user(authorization)
+    user = _acting_user(authorization, user_id)
     target = await _resolve_sync_target(
         (user or {}).get("email"),
         refresh=refresh,

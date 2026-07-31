@@ -58,7 +58,8 @@ def _live_jwt(minutes: int = 60, user_id: int | None = 1528) -> str:
 
     payload = {"token_type": "access", "exp": int(time.time()) + minutes * 60}
     if user_id is not None:
-        payload["user_id"] = user_id
+        # Graniot emite el id numérico del usuario en la clave "id".
+        payload["id"] = user_id
     return f"{b64({'typ': 'JWT', 'alg': 'HS256'})}.{b64(payload)}.sig"
 
 
@@ -606,3 +607,104 @@ def test_cambiar_el_numero_de_poligonos_rehace_las_parcelas(client: TestClient, 
     assert "DELETE" in methods, "la parcela anterior debe eliminarse"
     assert "POST" in methods, "y volver a crearse con los polígonos nuevos"
     assert "PATCH" not in methods
+
+
+def test_las_cuentas_se_leen_siguiendo_la_paginacion(monkeypatch):
+    """Una respuesta paginada no debe dejar cuentas fuera.
+
+    Un usuario cuya cuenta viva en la segunda página se trataría como "sin
+    cuenta en Graniot" y sus lotes no se subirían a ninguna parte.
+    """
+    pages = {
+        "/api/accounts/": {
+            "count": 4,
+            "next": "https://app.graniot.com/api/accounts/?page=2",
+            "results": [_account("uno@example.com", account_id="acc-1"), _account("dos@example.com", account_id="acc-2")],
+        },
+        "https://app.graniot.com/api/accounts/?page=2": {
+            "count": 4,
+            "next": None,
+            "results": [_account("tres@example.com", account_id="acc-3"), _account(SUPERADMIN["email"], account_id="acc-4")],
+        },
+    }
+
+    class _Paginated(FakeGraniotClient):
+        async def get(self, path, params=None, **kwargs):
+            self._record("GET", path, params=params)
+            if path in pages:
+                return pages[path]
+            return await super().get(path, params=params, **kwargs)
+
+    monkeypatch.setattr(graniot, "GraniotClient", _Paginated)
+
+    accounts = asyncio.run(graniot._fetch_all_accounts(_Paginated(), operation="test"))
+    assert [a["account_email"] for a in accounts] == [
+        "uno@example.com", "dos@example.com", "tres@example.com", SUPERADMIN["email"],
+    ]
+
+    # Y la resolución encuentra al usuario aunque esté en la última página.
+    graniot._cache_delete_prefix(graniot._EMBED_ACCOUNTS_CACHE_KEY)
+    target = asyncio.run(graniot._resolve_sync_target(SUPERADMIN["email"]))
+    assert target["mode"] == graniot.SYNC_MODE_TOKEN
+    assert target["account_id"] == "acc-4"
+
+
+def test_listado_de_cuentas_es_solo_para_admin_y_no_filtra_tokens(client: TestClient, token: str):
+    response = client.get("/api/graniot/accounts", headers=_auth(token))
+
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["count"] == 1
+    account = data["accounts"][0]
+    assert account["account_email"] == SUPERADMIN["email"]
+    assert account["dataris_user"] is True
+    assert "account_access" not in account and "embedded_url" not in account
+    assert isinstance(data["dataris_users_without_account"], list)
+
+    anonymous = client.get("/api/graniot/accounts")
+    assert anonymous.status_code == 401
+
+
+def test_alta_de_cuenta_reutiliza_la_existente_y_no_filtra_tokens(client: TestClient, token: str):
+    creaciones = []
+
+    class _ConAlta(FakeGraniotClient):
+        async def post(self, path, json_body=None, params=None, **kwargs):
+            if path == "/api/accounts/":
+                self._record("POST", path, json_body=json_body)
+                creaciones.append(json_body)
+                nueva = _account(str((json_body or {}).get("account_email")), account_id="acc-nueva", user_id=1600)
+                FakeGraniotClient.accounts = FakeGraniotClient.accounts + [nueva]
+                return nueva
+            return await super().post(path, json_body=json_body, params=params, **kwargs)
+
+    import app.api.routers.graniot as g
+    original = g.GraniotClient
+    g.GraniotClient = _ConAlta
+    try:
+        nueva = client.post("/api/graniot/accounts", headers=_auth(token), json={"account_email": "nuevo@cliente.com"})
+        assert nueva.status_code == 200, nueva.text
+        data = nueva.json()["data"]
+        assert data["already_existed"] is False
+        assert data["account_email"] == "nuevo@cliente.com"
+        assert data["client_id"] == "1600"
+        assert "account_access" not in data and "access_token" not in data
+        assert len(creaciones) == 1
+
+        # Pedirla otra vez no crea una cuenta duplicada.
+        repetida = client.post("/api/graniot/accounts", headers=_auth(token), json={"account_email": "nuevo@cliente.com"})
+        assert repetida.status_code == 200, repetida.text
+        assert repetida.json()["data"]["already_existed"] is True
+        assert len(creaciones) == 1
+    finally:
+        g.GraniotClient = original
+        FakeGraniotClient.accounts = [_account(SUPERADMIN["email"])]
+        graniot._cache_delete_prefix(graniot._EMBED_ACCOUNTS_CACHE_KEY)
+
+
+def test_alta_de_cuenta_requiere_admin_y_correo_valido(client: TestClient, token: str):
+    sin_correo = client.post("/api/graniot/accounts", headers=_auth(token), json={})
+    assert sin_correo.status_code == 400
+
+    anonimo = client.post("/api/graniot/accounts", json={"account_email": "x@y.com"})
+    assert anonimo.status_code == 401
