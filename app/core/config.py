@@ -59,6 +59,31 @@ class Settings(BaseSettings):
     # still valid). Users without a match keep the dedicated service-account
     # portal above. Kill-switch: set to false to force the service account.
     GRANIOT_EMBED_PER_USER_ENABLED: bool = True
+    # Graniot keeps platform users (app.graniot.com, the ones that own the farms)
+    # and embedded-map users (/api/accounts/, the only ones the iframe accepts)
+    # in separate registries, and there is no endpoint listing the former. So a
+    # client who owns farms as a platform user cannot see them in the embedded
+    # map until an embedded account exists carrying those same farms. Dataris
+    # provisions it on demand: it reads the farm owners from /api/company/farms/,
+    # creates the embedded account and assigns that person's farms to it.
+    GRANIOT_EMBED_AUTOPROVISION_ENABLED: bool = True
+    # Graniot refuses to create an embedded account with the email of an existing
+    # platform user, so the embedded account gets its own address. The numeric
+    # platform user id travels inside it, which keeps the link rebuildable from
+    # /api/accounts/ alone if the local record is ever lost.
+    GRANIOT_EMBED_ALIAS_TEMPLATE: str = "dataris-embed+{uid}@dataris.es"
+    # Time budget for provisioning a portal while the user waits for the map.
+    # A user with many farms needs several calls to Graniot; past this budget the
+    # work continues in the background and this load serves the usual fallback,
+    # so the satellite view never hangs waiting for Graniot.
+    GRANIOT_EMBED_PROVISION_TIMEOUT_SECONDS: float = 12.0
+    # How long a provisioned link may go without re-checking that the platform
+    # user's farms are all present in their embedded account (farms added in
+    # Graniot afterwards would otherwise never show up).
+    GRANIOT_EMBED_FARM_SYNC_TTL_SECONDS: int = 6 * 60 * 60
+    # Cache for /api/company/farms/ (the farm-owner census). It is one request,
+    # but a big one: every embed resolution would otherwise pay for it.
+    GRANIOT_COMPANY_FARMS_CACHE_TTL_SECONDS: int = 15 * 60
     # Per-user parcels: lots created in Dataris are pushed to Graniot inside the
     # account that owns the embedded portal of that same user (matched by email
     # in /api/accounts/), and removed from it when the lot is deleted. This is

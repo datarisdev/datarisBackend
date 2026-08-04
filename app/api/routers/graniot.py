@@ -41,6 +41,17 @@ from app.api.routers.compat import (
 from app.core.config import settings
 from app.services.graniot_client import GraniotAPIError, GraniotClient, GraniotNotConfigured
 from app.services.graniot_debug import clear_logs, get_log_file_path, log_event, read_logs, safe_payload
+from app.services.graniot_embed_accounts import (
+    account_is_manager,
+    alias_already_taken,
+    create_embed_account,
+    embed_alias,
+    fetch_company_farms,
+    index_platform_users,
+    link_farm_to_account,
+    platform_user_id_from_alias,
+    unlink_farm_from_account,
+)
 
 router = APIRouter(prefix="/graniot", tags=["Graniot"])
 
@@ -66,6 +77,11 @@ GRANIOT_WMS_PREFETCH_CONCURRENCY = int(os.getenv("GRANIOT_WMS_PREFETCH_CONCURREN
 # evita golpear a Graniot en cada carga del módulo Satélite; la expiración del
 # auth_id de cada cuenta se valida por petición, así que cachear es seguro.
 GRANIOT_EMBED_ACCOUNTS_CACHE_TTL_SECONDS = int(os.getenv("GRANIOT_EMBED_ACCOUNTS_CACHE_TTL_SECONDS", str(60 * 5)))
+# Censo de dueños de finca (/api/company/farms/): una sola petición, pero pesada
+# (cientos de fincas). Cambia solo cuando Graniot da de alta fincas o gestores.
+GRANIOT_COMPANY_FARMS_CACHE_TTL_SECONDS = int(
+    os.getenv("GRANIOT_COMPANY_FARMS_CACHE_TTL_SECONDS", str(settings.GRANIOT_COMPANY_FARMS_CACHE_TTL_SECONDS))
+)
 GRANIOT_WMS_BACKEND_MASK_ENABLED = str(os.getenv("GRANIOT_WMS_BACKEND_MASK_ENABLED", "false")).strip().lower() in {"1", "true", "yes", "on"}
 
 _RUNTIME_CACHE: Dict[str, Tuple[float, Any]] = {}
@@ -411,12 +427,26 @@ def _items(payload: Any) -> List[Dict[str, Any]]:
     return []
 
 
-def _select_embed_account(payload: Any, target_email: str) -> Dict[str, str]:
-    """Select and validate the dedicated Graniot embed account.
+def _public_embed_account(account: Optional[Dict[str, Any]], fallback_email: str = "") -> Dict[str, str]:
+    """Validate one Graniot account and keep only what the browser may see.
 
-    Only the minimum fields needed by the browser are returned. In particular,
     ``account_access`` and the backend API key never leave the backend.
     """
+    embedded_url = str((account or {}).get("embedded_url") or "").strip()
+    parsed = urlparse(embedded_url)
+    auth_id = parse_qs(parsed.query).get("auth_id", [])
+    expected_host = (settings.GRANIOT_EMBED_HOST or "embed.graniot.com").strip().lower()
+    if parsed.scheme != "https" or (parsed.hostname or "").lower() != expected_host or not auth_id or not auth_id[0]:
+        raise HTTPException(status_code=502, detail="Graniot devolvió un enlace embebido inválido")
+
+    return {
+        "account_email": str((account or {}).get("account_email") or fallback_email),
+        "embedded_url": embedded_url,
+    }
+
+
+def _select_embed_account(payload: Any, target_email: str) -> Dict[str, str]:
+    """Select and validate the dedicated Graniot embed account by its email."""
     normalized_target = str(target_email or "").strip().lower()
     account = next(
         (
@@ -432,17 +462,7 @@ def _select_embed_account(payload: Any, target_email: str) -> Dict[str, str]:
             detail=f"No se encontró la cuenta Graniot configurada ({target_email})",
         )
 
-    embedded_url = str(account.get("embedded_url") or "").strip()
-    parsed = urlparse(embedded_url)
-    auth_id = parse_qs(parsed.query).get("auth_id", [])
-    expected_host = (settings.GRANIOT_EMBED_HOST or "embed.graniot.com").strip().lower()
-    if parsed.scheme != "https" or (parsed.hostname or "").lower() != expected_host or not auth_id or not auth_id[0]:
-        raise HTTPException(status_code=502, detail="Graniot devolvió un enlace embebido inválido")
-
-    return {
-        "account_email": str(account.get("account_email") or target_email),
-        "embedded_url": embedded_url,
-    }
+    return _public_embed_account(account, normalized_target)
 
 
 def _looks_like_layer(item: Dict[str, Any]) -> bool:
@@ -2756,16 +2776,453 @@ async def _fetch_embed_accounts(*, refresh: bool = False) -> Any:
     return _cache_set(_EMBED_ACCOUNTS_CACHE_KEY, accounts, GRANIOT_EMBED_ACCOUNTS_CACHE_TTL_SECONDS)
 
 
+# ---------------------------------------------------------------------------
+# Cuentas de mapa embebido por usuario
+# ---------------------------------------------------------------------------
+# Graniot separa a los **usuarios de plataforma** (los que entran en
+# app.graniot.com y son dueños de las fincas) de los **usuarios de mapa
+# embebido** (los únicos que devuelve /api/accounts/ y los únicos que
+# embed.graniot.com acepta). No hay endpoint que liste a los primeros, así que
+# emparejar por correo contra /api/accounts/ solo encontraba a las 3 cuentas de
+# la sección API: cualquier otro cliente terminaba viendo el portal de la cuenta
+# de servicio, con fincas que no son suyas.
+#
+# La vía que Graniot confirma es crear una cuenta embebida y asignarle las
+# fincas del usuario de plataforma. Dataris lo hace solo:
+#   1. /api/company/farms/ da el censo de dueños de finca (correo + id numérico).
+#   2. Se da de alta la cuenta embebida (con un alias, porque Graniot rechaza
+#      repetir el correo de un usuario de plataforma).
+#   3. Se le asignan las fincas de esa persona y se guarda el vínculo.
+_COMPANY_FARMS_CACHE_KEY = "graniot:company:farms"
+EMBED_LINKS_TABLE = "graniot_embed_links"
+
+
+async def _fetch_company_farms_index(*, refresh: bool = False) -> Dict[str, Dict[str, Any]]:
+    """Censo ``correo -> {user_id numérico, nombre, fincas}`` de Graniot."""
+    cached = None if refresh else _cache_get(_COMPANY_FARMS_CACHE_KEY)
+    if cached is not None:
+        return cached
+    farms = await fetch_company_farms(GraniotClient(), operation="graniot-company-farms")
+    index = index_platform_users(farms)
+    return _cache_set(_COMPANY_FARMS_CACHE_KEY, index, GRANIOT_COMPANY_FARMS_CACHE_TTL_SECONDS)
+
+
+async def _platform_user_for_email(email: str, *, refresh: bool = False) -> Optional[Dict[str, Any]]:
+    """Usuario de plataforma de Graniot con ese correo (o None si no tiene fincas)."""
+    normalized = str(email or "").strip().lower()
+    if not normalized or "@" not in normalized:
+        return None
+    index = await _fetch_company_farms_index(refresh=refresh)
+    return index.get(normalized)
+
+
+def _embed_links(db: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return table(db, EMBED_LINKS_TABLE)
+
+
+def _find_embed_link(db: Dict[str, Any], email: str) -> Optional[Dict[str, Any]]:
+    normalized = str(email or "").strip().lower()
+    if not normalized:
+        return None
+    return next(
+        (
+            link
+            for link in _embed_links(db)
+            if str(link.get("user_email") or "").strip().lower() == normalized
+        ),
+        None,
+    )
+
+
+def _save_embed_link(user_email: str, updates: Dict[str, Any]) -> Dict[str, Any]:
+    """Crea o actualiza el vínculo usuario Dataris ↔ cuenta embebida de Graniot."""
+    normalized = str(user_email or "").strip().lower()
+    with LOCK:
+        db = read_db()
+        link = _find_embed_link(db, normalized)
+        if not link:
+            link = {
+                "id": str(uuid.uuid4()),
+                "user_email": normalized,
+                "created_at": now(),
+            }
+            _embed_links(db).append(link)
+        link.update(updates)
+        link["updated_at"] = now()
+        write_db(db)
+        return dict(link)
+
+
+def _delete_embed_link(user_email: str) -> Optional[Dict[str, Any]]:
+    normalized = str(user_email or "").strip().lower()
+    with LOCK:
+        db = read_db()
+        link = _find_embed_link(db, normalized)
+        if not link:
+            return None
+        _embed_links(db).remove(link)
+        write_db(db)
+        return dict(link)
+
+
+def _public_embed_link(link: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(link, dict):
+        return None
+    return {
+        "id": link.get("id"),
+        "user_email": link.get("user_email"),
+        "account_id": link.get("account_id"),
+        "account_email": link.get("account_email"),
+        "platform_email": link.get("platform_email"),
+        "platform_user_id": link.get("platform_user_id"),
+        "farm_ids": link.get("farm_ids") or [],
+        "farms_synced_at": link.get("farms_synced_at"),
+        "provisioned_by": link.get("provisioned_by"),
+        "created_at": link.get("created_at"),
+        "updated_at": link.get("updated_at"),
+        "last_error": link.get("last_error"),
+    }
+
+
+def _account_by_id(payload: Any, account_id: Any) -> Optional[Dict[str, Any]]:
+    wanted = str(account_id or "").strip()
+    if not wanted:
+        return None
+    return next((item for item in _items(payload) if str(item.get("id") or "").strip() == wanted), None)
+
+
+# Cuántos alias se prueban antes de rendirse. Hace falta más de uno porque dar
+# de baja una cuenta embebida en Graniot la deja desactivada y su correo
+# inutilizable por API (solo se reactiva desde la aplicación de Graniot).
+GRANIOT_EMBED_ALIAS_MAX_ATTEMPTS = int(os.getenv("GRANIOT_EMBED_ALIAS_MAX_ATTEMPTS", "4"))
+
+
+def _embed_alias_for(platform_user: Dict[str, Any], email: str, *, attempt: int = 0) -> str:
+    return embed_alias(
+        email,
+        (platform_user or {}).get("user_id"),
+        settings.GRANIOT_EMBED_ALIAS_TEMPLATE or "dataris-embed+{uid}@dataris.es",
+        attempt=attempt,
+    )
+
+
+async def _create_embed_account_for_user(
+    email: str,
+    platform_user: Dict[str, Any],
+    *,
+    operation: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Exception]]:
+    """Da de alta la cuenta embebida, esquivando los alias ya ocupados.
+
+    Un alias puede estar cogido por una cuenta viva (que entonces es la suya y se
+    reutiliza) o por una desactivada, que Graniot no lista ni deja recrear. En
+    ese segundo caso se prueba con el alias siguiente en vez de dejar al usuario
+    sin portal.
+    """
+    client = GraniotClient()
+    last_error: Optional[Exception] = None
+    for attempt in range(max(1, GRANIOT_EMBED_ALIAS_MAX_ATTEMPTS)):
+        alias = _embed_alias_for(platform_user, email, attempt=attempt)
+        try:
+            return await create_embed_account(client, alias, operation=operation), None
+        except Exception as exc:  # noqa: BLE001 — se decide según el motivo
+            last_error = exc
+            if not alias_already_taken(exc):
+                return None, exc
+            existing = _raw_account_for_email(await _fetch_embed_accounts(refresh=True), alias)
+            if existing:
+                return existing, None
+            log_event({
+                "event": "dataris.graniot.embed_provision.alias_unavailable",
+                "operation": operation,
+                "email": email,
+                "alias": alias,
+                "message": str(exc)[:300],
+            })
+    return None, last_error
+
+
+async def _find_embed_account(
+    email: str,
+    *,
+    link: Optional[Dict[str, Any]] = None,
+    platform_user: Optional[Dict[str, Any]] = None,
+    refresh: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Cuenta embebida de Graniot que corresponde a este usuario de Dataris.
+
+    Se busca en tres pasos, del más fiable al más tolerante: el vínculo guardado,
+    el correo tal cual (las cuentas que ya existían antes de todo esto) y el
+    alias esperado, que lleva dentro el id del usuario de plataforma y permite
+    reconstruir el vínculo aunque el registro local se haya perdido.
+    """
+    accounts = await _fetch_embed_accounts(refresh=refresh)
+    normalized = str(email or "").strip().lower()
+
+    candidates: List[Optional[Dict[str, Any]]] = [
+        _account_by_id(accounts, (link or {}).get("account_id")),
+        _raw_account_for_email(accounts, normalized),
+        _raw_account_for_email(accounts, (link or {}).get("account_email")),
+    ]
+    if platform_user:
+        candidates.extend(
+            _raw_account_for_email(accounts, _embed_alias_for(platform_user, normalized, attempt=attempt))
+            for attempt in range(max(1, GRANIOT_EMBED_ALIAS_MAX_ATTEMPTS))
+        )
+    return next((account for account in candidates if account), None)
+
+
+async def _sync_embed_account_farms(
+    account: Dict[str, Any],
+    platform_user: Dict[str, Any],
+    *,
+    operation: str = "graniot-embed-farm-sync",
+) -> Dict[str, Any]:
+    """Asigna a la cuenta embebida las fincas del usuario de plataforma.
+
+    Solo añade lo que falta: nunca retira vínculos que Graniot (o su equipo)
+    hayan creado por su cuenta. Los fallos por finca se acumulan en ``errors`` en
+    vez de abortar, para que una finca problemática no deje al usuario sin las
+    demás.
+    """
+    account_id = str(account.get("id") or "").strip()
+    client = GraniotClient()
+    owner_client_id = _clean_id((platform_user or {}).get("user_id"))
+    linked: List[Any] = []
+    errors: List[Dict[str, Any]] = []
+
+    for farm in (platform_user or {}).get("farms") or []:
+        farm_id = farm.get("id")
+        if farm_id is None:
+            continue
+        try:
+            # El alta es idempotente y devuelve los gestores de la finca: se
+            # comprueba en la respuesta que la cuenta quedó dentro, en vez de
+            # dar por hecho que un 2xx significa que se asignó.
+            managers = await link_farm_to_account(
+                client,
+                farm_id,
+                account_id,
+                owner_client_id=owner_client_id,
+                operation=operation,
+            )
+            if not account_is_manager(managers, account_id):
+                raise GraniotAPIError(502, "Graniot no incluyó la cuenta entre los gestores", managers)
+            linked.append(farm_id)
+        except Exception as exc:  # noqa: BLE001 — una finca no puede tumbar el resto
+            errors.append({"farm_id": farm_id, "error": str(exc)[:300]})
+            log_event({
+                "event": "dataris.graniot.embed_provision.farm_link_failed",
+                "operation": operation,
+                "farm_id": farm_id,
+                "account_id": account_id,
+                "exception_type": type(exc).__name__,
+                "message": str(exc)[:300],
+            })
+
+    return {"linked": linked, "errors": errors}
+
+
+async def _provision_embed_account(
+    email: str,
+    *,
+    platform_user: Optional[Dict[str, Any]] = None,
+    provisioned_by: Optional[str] = None,
+    operation: str = "graniot-embed-provision",
+) -> Dict[str, Any]:
+    """Da de alta el portal embebido de un usuario y le asigna sus fincas.
+
+    Devuelve siempre un diagnóstico (``reason`` explica por qué no se hizo nada).
+    Nunca crea una cuenta para quien no tiene fincas en Graniot: sería un portal
+    vacío, y el usuario está mejor servido por el fallback existente.
+    """
+    normalized = str(email or "").strip().lower()
+    result: Dict[str, Any] = {
+        "email": normalized,
+        "provisioned": False,
+        "account": None,
+        "link": None,
+        "farms": None,
+        "reason": None,
+    }
+    if not normalized or "@" not in normalized:
+        result["reason"] = "user_without_email"
+        return result
+
+    if platform_user is None:
+        platform_user = await _platform_user_for_email(normalized)
+    if not platform_user:
+        result["reason"] = "no_platform_farms_for_email"
+        return result
+
+    db = read_db()
+    link = _find_embed_link(db, normalized)
+    account = await _find_embed_account(normalized, link=link, platform_user=platform_user)
+
+    if account is None:
+        account, create_error = await _create_embed_account_for_user(
+            normalized, platform_user, operation=operation
+        )
+        if account is None:
+            result["reason"] = "create_account_failed"
+            result["error"] = str(create_error or "")[:300]
+            _save_embed_link(normalized, {"last_error": result["error"]})
+            return result
+        _cache_delete_prefix(_EMBED_ACCOUNTS_CACHE_KEY)
+
+    farms = await _sync_embed_account_farms(account, platform_user, operation=operation)
+    result["farms"] = farms
+    result["account"] = {
+        "id": account.get("id"),
+        "account_email": account.get("account_email"),
+    }
+    result["provisioned"] = True
+    result["link"] = _public_embed_link(_save_embed_link(normalized, {
+        "account_id": account.get("id"),
+        "account_email": account.get("account_email"),
+        "platform_email": platform_user.get("email"),
+        "platform_user_id": platform_user.get("user_id"),
+        "farm_ids": sorted(
+            {str(farm.get("id")) for farm in platform_user.get("farms") or [] if farm.get("id") is not None}
+        ),
+        "farms_synced_at": now() if not farms.get("errors") else None,
+        "provisioned_by": provisioned_by or "auto",
+        "last_error": (farms.get("errors") or [{}])[0].get("error") if farms.get("errors") else None,
+    }))
+    # La cuenta acaba de nacer o de cambiar de fincas: el listado cacheado ya no
+    # la refleja y el portal debe servirse con datos frescos.
+    _cache_delete_prefix(_EMBED_ACCOUNTS_CACHE_KEY)
+    log_event({
+        "event": "dataris.graniot.embed_provision.done",
+        "operation": operation,
+        "email": normalized,
+        "account_id": account.get("id"),
+        "farms_linked": len(farms.get("linked") or []),
+        "farms_failed": len(farms.get("errors") or []),
+    })
+    return result
+
+
+def _ensure_embed_link(
+    email: str,
+    account: Dict[str, Any],
+    platform_user: Optional[Dict[str, Any]],
+    link: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Deja registrado qué cuenta embebida sirve a este usuario.
+
+    Cubre las cuentas que ya existían antes de todo esto (dadas de alta a mano
+    por Graniot): a partir de ahora se resuelven por vínculo, sin depender de que
+    el correo siga coincidiendo. Solo escribe cuando algo cambia.
+    """
+    account_id = str(account.get("id") or "").strip()
+    if not account_id or (link and str(link.get("account_id") or "") == account_id):
+        return link
+    return _save_embed_link(email, {
+        "account_id": account_id,
+        "account_email": account.get("account_email"),
+        "platform_email": (platform_user or {}).get("email"),
+        "platform_user_id": (platform_user or {}).get("user_id"),
+        # Sus fincas se revisan en la primera reconciliación en segundo plano.
+        "farms_synced_at": None,
+        "provisioned_by": (link or {}).get("provisioned_by") or "discovered",
+    })
+
+
+def _mark_embed_farms_pending(email: str, farm_id: Any) -> None:
+    """Marca el portal de un usuario para reconciliar cuando aparece una finca.
+
+    Subir un lote puede crear una finca nueva en la cuenta de Graniot de esa
+    persona. Su portal embebido solo la mostrará cuando esa finca se le asigne,
+    así que se invalida el censo y se deja el vínculo pendiente: la próxima
+    apertura del mapa la reconcilia en segundo plano.
+    """
+    normalized = str(email or "").strip().lower()
+    clean_farm = _clean_id(farm_id)
+    if not normalized or not clean_farm:
+        return
+    with LOCK:
+        db = read_db()
+        link = _find_embed_link(db, normalized)
+        if not link or clean_farm in {str(value) for value in link.get("farm_ids") or []}:
+            return
+    _cache_delete_prefix(_COMPANY_FARMS_CACHE_KEY)
+    _save_embed_link(normalized, {"farms_synced_at": None})
+
+
+def _embed_farm_sync_is_stale(link: Optional[Dict[str, Any]]) -> bool:
+    """¿Toca revisar si al usuario le han añadido fincas en Graniot?"""
+    ttl = int(settings.GRANIOT_EMBED_FARM_SYNC_TTL_SECONDS or 0)
+    if ttl <= 0 or not isinstance(link, dict):
+        return False
+    synced_at = link.get("farms_synced_at")
+    if not synced_at:
+        return True
+    try:
+        parsed = datetime.fromisoformat(str(synced_at).replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - parsed).total_seconds() >= ttl
+
+
+# Dos pestañas abiertas a la vez no deben dar de alta dos cuentas para la misma
+# persona. La clave incluye el bucle de eventos porque cada worker tiene el suyo.
+_EMBED_PROVISION_LOCKS: Dict[Tuple[int, str], asyncio.Lock] = {}
+
+
+def _embed_provision_lock(email: str) -> asyncio.Lock:
+    key = (id(asyncio.get_running_loop()), str(email or "").strip().lower())
+    lock = _EMBED_PROVISION_LOCKS.get(key)
+    if lock is None:
+        if len(_EMBED_PROVISION_LOCKS) > 500:
+            _EMBED_PROVISION_LOCKS.clear()
+        lock = _EMBED_PROVISION_LOCKS[key] = asyncio.Lock()
+    return lock
+
+
+async def _provision_embed_account_guarded(
+    email: str,
+    *,
+    platform_user: Optional[Dict[str, Any]] = None,
+    provisioned_by: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Aprovisiona sin que dos peticiones simultáneas dupliquen la cuenta."""
+    async with _embed_provision_lock(email):
+        # Otra petición pudo terminar el alta mientras se esperaba el turno.
+        link = _find_embed_link(read_db(), email)
+        if link and link.get("account_id") and not _embed_farm_sync_is_stale(link):
+            return {"email": email, "provisioned": True, "reason": "already_provisioned", "link": _public_embed_link(link)}
+        return await _provision_embed_account(
+            email, platform_user=platform_user, provisioned_by=provisioned_by
+        )
+
+
+async def _refresh_embed_farms_in_background(email: str) -> None:
+    """Reconcilia las fincas del portal sin hacer esperar a quien abre el mapa."""
+    try:
+        async with _embed_provision_lock(email):
+            await _provision_embed_account(email, provisioned_by="auto-refresh")
+    except Exception as exc:  # noqa: BLE001 — es mantenimiento, nunca rompe nada
+        log_event({
+            "event": "dataris.graniot.embed_provision.refresh_failed",
+            "operation": "graniot-embed-provision",
+            "email": email,
+            "exception_type": type(exc).__name__,
+            "message": str(exc)[:300],
+        })
+
+
 async def _embed_account_for_user(user: Dict[str, Any]) -> Optional[Dict[str, str]]:
     """Return the personal Graniot portal for the authenticated Dataris user.
 
-    Graniot's ``/api/accounts/`` exposes one ``embedded_url`` per account. When
-    the Dataris user's email matches a Graniot account, their own portal is
-    served. In every other case (no match, the account's ``auth_id`` already
-    expired — Graniot never regenerates it in ``/api/accounts/`` —, or Graniot
-    being unreachable) the caller falls back to the dedicated service account,
-    whose token IS minted fresh on demand. This function never raises: the
-    per-user match must never break the fallback.
+    Order of preference: the account linked to this user (or matching their
+    email, or the expected alias), and if there is none, an account provisioned
+    on the spot with the farms of their Graniot platform user. Returning ``None``
+    hands the request back to the dedicated service account, whose token IS
+    minted fresh on demand. This function never raises: neither the per-user
+    match nor the provisioning may break the fallback.
     """
     if not settings.GRANIOT_EMBED_PER_USER_ENABLED:
         return None
@@ -2777,8 +3234,43 @@ async def _embed_account_for_user(user: Dict[str, Any]) -> Optional[Dict[str, st
         return None
 
     try:
-        payload = await _fetch_embed_accounts()
-        account = _select_embed_account(payload, email)
+        db = read_db()
+        link = _find_embed_link(db, email)
+        platform_user = await _platform_user_for_email(email)
+        account = await _find_embed_account(email, link=link, platform_user=platform_user)
+
+        if account is None and platform_user and settings.GRANIOT_EMBED_AUTOPROVISION_ENABLED:
+            # El alta puede necesitar varias llamadas a Graniot (una por finca).
+            # Se le da un presupuesto de tiempo: si se agota, el trabajo sigue en
+            # segundo plano y esta carga usa el portal de siempre, para que el
+            # mapa no se quede esperando.
+            task = asyncio.create_task(
+                _provision_embed_account_guarded(email, platform_user=platform_user)
+            )
+            try:
+                provisioned = await asyncio.wait_for(
+                    asyncio.shield(task),
+                    timeout=float(settings.GRANIOT_EMBED_PROVISION_TIMEOUT_SECONDS or 12),
+                )
+            except asyncio.TimeoutError:
+                log_event({
+                    "event": "dataris.graniot.embed_provision.still_running",
+                    "operation": "resolve-embed-url-per-user",
+                    "email": email,
+                })
+                return None
+            if provisioned.get("provisioned"):
+                account = await _find_embed_account(
+                    email,
+                    link=_find_embed_link(read_db(), email),
+                    platform_user=platform_user,
+                    refresh=True,
+                )
+        if account is None:
+            return None
+
+        link = _ensure_embed_link(email, account, platform_user, link)
+        public = _public_embed_account(account, email)
     except HTTPException as exc:
         if exc.status_code != 404:
             # 404 = the user simply has no Graniot account (expected, no noise).
@@ -2799,17 +3291,37 @@ async def _embed_account_for_user(user: Dict[str, Any]) -> Optional[Dict[str, st
         })
         return None
 
-    token = _embed_url_auth_token(account.get("embedded_url") or "")
+    token = _embed_url_auth_token(public.get("embedded_url") or "")
     if not token or _embed_token_looks_expired(token):
-        # Serving an expired auth_id would leave the iframe stuck on "loading".
-        # Fall back to the service account instead (honest, working portal).
-        log_event({
-            "event": "dataris.graniot.embed_per_user.token_expired",
-            "operation": "resolve-embed-url-per-user",
-            "email": email,
-        })
-        return None
-    return account
+        # Graniot renueva el auth_id en cada lectura de /api/accounts/, así que
+        # un token vencido casi siempre viene de nuestra caché: se relee antes de
+        # rendirse, porque servirlo dejaría el iframe girando para siempre.
+        try:
+            account = await _find_embed_account(
+                email, link=_find_embed_link(read_db(), email), platform_user=platform_user, refresh=True
+            )
+            public = _public_embed_account(account, email) if account else None
+            token = _embed_url_auth_token((public or {}).get("embedded_url") or "")
+        except Exception:  # noqa: BLE001 — cae al portal de servicio
+            public, token = None, ""
+        if not public or not token or _embed_token_looks_expired(token):
+            log_event({
+                "event": "dataris.graniot.embed_per_user.token_expired",
+                "operation": "resolve-embed-url-per-user",
+                "email": email,
+            })
+            return None
+
+    # Si a esta persona le han añadido fincas en Graniot después del alta, su
+    # portal no las vería. Se reconcilia en segundo plano: el mapa se abre ya.
+    if (
+        platform_user
+        and _embed_farm_sync_is_stale(link)
+        and settings.GRANIOT_EMBED_AUTOPROVISION_ENABLED
+    ):
+        asyncio.create_task(_refresh_embed_farms_in_background(email))
+
+    return public
 
 
 # ---------------------------------------------------------------------------
@@ -2906,6 +3418,7 @@ def _public_sync_target(target: Dict[str, Any]) -> Dict[str, Any]:
         "account_email": target.get("account_email"),
         "account_id": target.get("account_id"),
         "client_id": target.get("client_id"),
+        "platform_user_id": target.get("platform_user_id"),
         "has_account_token": bool(target.get("access_token")),
         "reason": target.get("reason"),
     }
@@ -2930,6 +3443,7 @@ async def _resolve_sync_target(
         "account_email": None,
         "account_id": None,
         "client_id": None,
+        "platform_user_id": None,
         "access_token": None,
         "reason": None,
     }
@@ -2941,9 +3455,26 @@ async def _resolve_sync_target(
         target["reason"] = "user_without_email"
         return target
 
+    # El censo de dueños de finca es un extra: si Graniot no responde, todavía se
+    # puede resolver la cuenta embebida por vínculo o por correo.
+    platform_user: Optional[Dict[str, Any]] = None
     try:
-        payload = await _fetch_embed_accounts(refresh=refresh)
-        account = _raw_account_for_email(payload, normalized)
+        platform_user = await _platform_user_for_email(normalized, refresh=refresh)
+    except Exception as exc:  # noqa: BLE001
+        log_event({
+            "event": "dataris.graniot.parcel_sync.platform_census_failed",
+            "operation": operation,
+            "email": normalized,
+            "exception_type": type(exc).__name__,
+            "message": str(exc),
+        })
+    target["platform_user_id"] = _clean_id((platform_user or {}).get("user_id"))
+
+    try:
+        link = _find_embed_link(read_db(), normalized)
+        account = await _find_embed_account(
+            normalized, link=link, platform_user=platform_user, refresh=refresh
+        )
     except Exception as exc:  # noqa: BLE001 — resolution must never break the caller
         log_event({
             "event": "dataris.graniot.parcel_sync.accounts_lookup_failed",
@@ -2955,7 +3486,18 @@ async def _resolve_sync_target(
         target["reason"] = "accounts_lookup_failed"
         return target
 
+    mode = str(settings.GRANIOT_PARCEL_SYNC_MODE or "auto").strip().lower()
+
     if not account:
+        # Sin cuenta embebida todavía, pero Graniot sí acepta actuar en nombre
+        # del usuario de plataforma por su id numérico: los lotes se crean en la
+        # cuenta correcta, y el portal embebido los verá en cuanto se aprovisione.
+        if target["platform_user_id"] and mode in {"auto", SYNC_MODE_CLIENT_ID}:
+            target["mode"] = SYNC_MODE_CLIENT_ID
+            target["account_email"] = str((platform_user or {}).get("email") or normalized)
+            target["client_id"] = target["platform_user_id"]
+            target["reason"] = "platform_user"
+            return target
         target["reason"] = "no_graniot_account_for_email"
         return target
 
@@ -2963,7 +3505,6 @@ async def _resolve_sync_target(
     target["account_id"] = _account_id_value(account)
     target["client_id"] = _account_client_id(account)
     token = _account_access_token(account)
-    mode = str(settings.GRANIOT_PARCEL_SYNC_MODE or "auto").strip().lower()
 
     if mode in {"auto", SYNC_MODE_TOKEN} and token:
         target["mode"] = SYNC_MODE_TOKEN
@@ -3019,19 +3560,24 @@ async def get_embed_url(
     one leaves the embedded portal stuck on "loading" (``/api/accounts/`` does
     not refresh it). Order of preference (``Cache-Control: no-store``):
 
-    1. If the authenticated Dataris user's email matches a Graniot account and
-       that account's ``auth_id`` is still valid, serve **their own portal**.
+    1. **The user's own portal**: the embedded account linked to them, matching
+       their email or the expected alias. If they own farms in Graniot as a
+       platform user and have no embedded account yet, one is provisioned with
+       those farms (Graniot keeps both registries apart and offers no other way).
     2. If embed credentials/refresh token are configured, **mint a fresh access
        token** on demand for the service account — always a valid ``auth_id``.
     3. Otherwise, fall back to the URL Graniot exposes via ``/api/accounts/``
        (may already be expired), then to a statically configured URL.
+
+    ``source`` tells the browser whether it is looking at the user's own farms
+    (``personal``) or at the shared demo portal (``service``).
     """
     user = _require_user(authorization)
     response.headers["Cache-Control"] = "no-store"
 
     personal = await _embed_account_for_user(user)
     if personal is not None:
-        return {"data": personal, "error": None}
+        return {"data": {**personal, "source": "personal"}, "error": None}
 
     if _embed_minting_configured():
         access = await _mint_embed_access_token()
@@ -3042,7 +3588,7 @@ async def get_embed_url(
             }],
             settings.GRANIOT_EMBED_ACCOUNT_EMAIL,
         )
-        return {"data": account, "error": None}
+        return {"data": {**account, "source": "service"}, "error": None}
 
     live_error: Optional[Exception] = None
     try:
@@ -3053,13 +3599,13 @@ async def get_embed_url(
             debug_context={"operation": "resolve-embed-url"},
         )
         account = _select_embed_account(raw, settings.GRANIOT_EMBED_ACCOUNT_EMAIL)
-        return {"data": account, "error": None}
+        return {"data": {**account, "source": "service"}, "error": None}
     except Exception as exc:  # noqa: BLE001 — fall back to the configured URL below
         live_error = exc
 
     fallback = _configured_embed_account()
     if fallback is not None:
-        return {"data": fallback, "error": None}
+        return {"data": {**fallback, "source": "service"}, "error": None}
 
     if isinstance(live_error, HTTPException):
         raise live_error
@@ -3471,6 +4017,7 @@ async def sync_local_parcel_to_graniot(
             })
             write_db(db)
             result = _public_parcel(row)
+        _mark_embed_farms_pending(target.get("user_email") or user.get("email"), farm_id)
         return {
             "parcel": result,
             "graniot": raw,
@@ -3972,6 +4519,202 @@ async def delete_graniot_account(
 
     _cache_delete_prefix(_EMBED_ACCOUNTS_CACHE_KEY)
     return {"data": {"account_id": account_id, "deleted": True}, "error": None}
+
+
+@router.get("/embed/links")
+async def list_embed_links(
+    refresh: bool = Query(default=False),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Quién ve su propio portal satelital y quién no (solo admin).
+
+    Cruza tres padrones que Graniot mantiene separados: los usuarios de Dataris,
+    los dueños de finca de Graniot (``/api/company/farms/``) y las cuentas de
+    mapa embebido (``/api/accounts/``). Es la vista que dice, de un vistazo, a
+    qué cliente le falta portal y por qué.
+    """
+    db = read_db()
+    require_admin_context(authorization, db)
+
+    try:
+        census = await _fetch_company_farms_index(refresh=refresh)
+        accounts = await _fetch_embed_accounts(refresh=refresh)
+    except Exception as exc:
+        _raise_graniot_error(exc)
+
+    links = {
+        str(link.get("user_email") or "").strip().lower(): link
+        for link in _embed_links(db)
+    }
+    template = settings.GRANIOT_EMBED_ALIAS_TEMPLATE or "dataris-embed+{uid}@dataris.es"
+    accounts_by_email = {
+        str(account.get("account_email") or "").strip().lower(): account
+        for account in _items(accounts)
+    }
+
+    items: List[Dict[str, Any]] = []
+    for user in db.get("users") or []:
+        email = str(user.get("email") or "").strip().lower()
+        if not email:
+            continue
+        platform_user = census.get(email)
+        link = links.get(email)
+        account = (
+            _account_by_id(accounts, (link or {}).get("account_id"))
+            or accounts_by_email.get(email)
+            or (accounts_by_email.get(_embed_alias_for(platform_user, email)) if platform_user else None)
+        )
+        if account:
+            portal = "own_account" if not platform_user or account.get("account_email") == email else "provisioned"
+        elif platform_user:
+            portal = "pending_provision"
+        else:
+            portal = "service_fallback"
+        items.append({
+            "user_id": user.get("id"),
+            "user_email": email,
+            "portal": portal,
+            "account_id": (account or {}).get("id"),
+            "account_email": (account or {}).get("account_email"),
+            "platform_user_id": (platform_user or {}).get("user_id"),
+            "platform_farms": len((platform_user or {}).get("farms") or []),
+            "expected_alias": _embed_alias_for(platform_user, email) if platform_user else None,
+            "link": _public_embed_link(link),
+        })
+    items.sort(key=lambda item: (item["portal"], item["user_email"]))
+
+    dataris_emails = {item["user_email"] for item in items}
+    return {
+        "data": {
+            "count": len(items),
+            "users": items,
+            # Dueños de finca en Graniot que aún no son usuarios de Dataris: son
+            # los clientes a los que todavía no se les ha dado acceso aquí.
+            "platform_users_without_dataris_user": [
+                {
+                    "email": email,
+                    "platform_user_id": entry.get("user_id"),
+                    "platform_farms": len(entry.get("farms") or []),
+                }
+                for email, entry in sorted(census.items())
+                if email not in dataris_emails
+            ],
+            "embed_accounts": sorted(accounts_by_email),
+            "alias_template": template,
+            "autoprovision_enabled": bool(settings.GRANIOT_EMBED_AUTOPROVISION_ENABLED),
+        },
+        "error": None,
+    }
+
+
+@router.post("/embed/links")
+async def provision_embed_link(
+    payload: Dict[str, Any] = Body(default_factory=dict),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Crea (o repara) el portal satelital propio de un usuario (solo admin).
+
+    Da de alta su cuenta de mapa embebido si no la tiene y le asigna las fincas
+    de su usuario de plataforma de Graniot. Es idempotente: repetirlo solo añade
+    las fincas que falten, así que sirve también como "volver a sincronizar".
+    """
+    db = read_db()
+    require_admin_context(authorization, db)
+
+    email = str(payload.get("user_email") or payload.get("email") or "").strip().lower()
+    user_id = str(payload.get("user_id") or "").strip()
+    if not email and user_id:
+        owner = next((u for u in db.get("users") or [] if str(u.get("id")) == user_id), None)
+        if not owner:
+            raise HTTPException(status_code=404, detail="Usuario no encontrado")
+        email = str(owner.get("email") or "").strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Indica el correo del usuario")
+
+    # El correo del usuario de plataforma puede diferir del de Dataris (otra
+    # cuenta de la misma persona): quien administra puede indicarlo a mano.
+    platform_email = str(payload.get("platform_email") or "").strip().lower() or email
+    try:
+        platform_user = await _platform_user_for_email(platform_email, refresh=bool(payload.get("refresh")))
+        result = await _provision_embed_account(
+            email,
+            platform_user=platform_user,
+            provisioned_by="admin",
+        )
+    except Exception as exc:
+        _raise_graniot_error(exc)
+
+    if not result.get("provisioned") and result.get("reason") == "no_platform_farms_for_email":
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"{platform_email} no aparece como responsable de ninguna finca en Graniot, "
+                "así que no hay fincas que mostrar en su mapa embebido."
+            ),
+        )
+    if not result.get("provisioned"):
+        raise HTTPException(status_code=502, detail=result.get("error") or "Graniot no permitió crear el portal")
+    return {"data": result, "error": None}
+
+
+@router.delete("/embed/links/{user_email}")
+async def delete_embed_link(
+    user_email: str,
+    delete_account: bool = Query(default=False, description="Borrar también la cuenta embebida en Graniot"),
+    unlink_farms: bool = Query(default=False, description="Retirar en Graniot las fincas asignadas a esa cuenta"),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Deshace el vínculo de un usuario con su portal embebido (solo admin)."""
+    db = read_db()
+    require_admin_context(authorization, db)
+
+    link = _find_embed_link(db, user_email)
+    if not link:
+        raise HTTPException(status_code=404, detail="Ese usuario no tiene un portal vinculado")
+
+    account_id = str(link.get("account_id") or "").strip()
+    removed_farms: List[Any] = []
+    if unlink_farms and account_id:
+        client = GraniotClient()
+        for farm_id in link.get("farm_ids") or []:
+            try:
+                if await unlink_farm_from_account(client, farm_id, account_id):
+                    removed_farms.append(farm_id)
+            except Exception as exc:  # noqa: BLE001 — la baja local no depende de esto
+                log_event({
+                    "event": "dataris.graniot.embed_provision.unlink_failed",
+                    "operation": "graniot-embed-unlink",
+                    "farm_id": farm_id,
+                    "account_id": account_id,
+                    "message": str(exc)[:300],
+                })
+
+    deleted_account = False
+    if delete_account and account_id:
+        try:
+            await GraniotClient().delete(
+                f"/api/accounts/{account_id}/",
+                debug_context={"operation": "graniot-embed-unlink", "account_id": account_id},
+            )
+            deleted_account = True
+        except GraniotAPIError as exc:
+            if exc.status_code not in {404, 410}:
+                _raise_graniot_error(exc)
+            deleted_account = True
+        except Exception as exc:
+            _raise_graniot_error(exc)
+
+    _delete_embed_link(user_email)
+    _cache_delete_prefix(_EMBED_ACCOUNTS_CACHE_KEY)
+    return {
+        "data": {
+            "user_email": str(user_email).strip().lower(),
+            "unlinked": True,
+            "account_deleted": deleted_account,
+            "farms_unlinked": removed_farms,
+        },
+        "error": None,
+    }
 
 
 @router.get("/parcels/sync-target")

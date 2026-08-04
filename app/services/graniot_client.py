@@ -273,8 +273,10 @@ class GraniotClient:
     async def patch(self, path: str, json_body: Any = None, params: Optional[Dict[str, Any]] = None, debug_context: Optional[Dict[str, Any]] = None) -> Any:
         return await self.request("PATCH", path, params=params, json_body=json_body, debug_context=debug_context)
 
-    async def delete(self, path: str, params: Optional[Dict[str, Any]] = None, debug_context: Optional[Dict[str, Any]] = None) -> Any:
-        return await self.request("DELETE", path, params=params, debug_context=debug_context)
+    async def delete(self, path: str, params: Optional[Dict[str, Any]] = None, json_body: Any = None, debug_context: Optional[Dict[str, Any]] = None) -> Any:
+        # Algunos endpoints de Graniot esperan cuerpo en el DELETE: retirar un
+        # gestor de una finca se pide con la misma lista con la que se añadió.
+        return await self.request("DELETE", path, params=params, json_body=json_body, debug_context=debug_context)
 
     async def binary_get(self, path: str, params: Optional[Dict[str, Any]] = None, *, use_auth: bool = True, debug_context: Optional[Dict[str, Any]] = None, include_client_id: bool = True) -> httpx.Response:
         return await self.request("GET", path, params=params, accept="*/*", use_auth=use_auth, debug_context=debug_context, include_client_id=include_client_id)
