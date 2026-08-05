@@ -708,3 +708,53 @@ def test_alta_de_cuenta_requiere_admin_y_correo_valido(client: TestClient, token
 
     anonimo = client.post("/api/graniot/accounts", json={"account_email": "x@y.com"})
     assert anonimo.status_code == 401
+
+
+# --- La finca del lote define su sección en el portal -----------------------
+
+DEFAULT_FAKE_FARMS = [{"id": 777, "name": "Dataris", "is_active": True}]
+
+
+def test_la_finca_del_lote_manda_sobre_la_finca_ya_asignada():
+    """Cada finca de Dataris es una finca del portal de Graniot.
+
+    Sin esto todos los lotes del cliente caen en la primera finca de su cuenta y
+    el portal los muestra amontonados bajo un único nombre. Además debe ganar al
+    `graniot_farm_id` guardado, para que reorganizar los lotes en Dataris
+    reordene el portal.
+    """
+    FakeGraniotClient.farms = DEFAULT_FAKE_FARMS + [{"id": 4242, "name": "La Isla", "is_active": True}]
+    try:
+        farm_id = asyncio.run(graniot._resolve_farm_id(
+            FakeGraniotClient(client_id="1635"),
+            {"finca": "La Isla", "graniot_farm_id": "3615"},
+            {},
+            allow_global_default=False,
+        ))
+        assert farm_id == "4242"
+    finally:
+        FakeGraniotClient.farms = DEFAULT_FAKE_FARMS
+
+
+def test_un_farm_id_explicito_gana_a_la_finca():
+    FakeGraniotClient.farms = DEFAULT_FAKE_FARMS + [{"id": 4242, "name": "La Isla", "is_active": True}]
+    try:
+        farm_id = asyncio.run(graniot._resolve_farm_id(
+            FakeGraniotClient(client_id="1635"),
+            {"finca": "La Isla"},
+            {"farm_id": "999"},
+            allow_global_default=False,
+        ))
+        assert farm_id == "999"
+    finally:
+        FakeGraniotClient.farms = DEFAULT_FAKE_FARMS
+
+
+def test_un_lote_sin_finca_conserva_la_que_ya_tenia():
+    farm_id = asyncio.run(graniot._resolve_farm_id(
+        FakeGraniotClient(client_id="1635"),
+        {"graniot_farm_id": "3615"},
+        {},
+        allow_global_default=False,
+    ))
+    assert farm_id == "3615"
