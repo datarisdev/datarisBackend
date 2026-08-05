@@ -2552,6 +2552,44 @@ def _build_graniot_parcel_patch_payload(parcel: Dict[str, Any], remote_id: Any) 
     }
 
 
+async def _farm_id_for_finca(client: GraniotClient, finca: str) -> Optional[str]:
+    """Finca de Graniot que corresponde a la finca del lote, creándola si falta.
+
+    Cada finca de Dataris (la que agrupa los lotes de un mismo KML) debe ser una
+    finca en el portal de Graniot. Sin esto, todos los lotes del cliente caen en
+    la primera finca que exista en su cuenta y el portal los muestra amontonados
+    bajo un único nombre, sin las secciones que el cliente reconoce.
+    """
+    name = str(finca or "").strip()
+    if not name:
+        return None
+    try:
+        farm = await _create_farm_on_graniot(
+            client,
+            name,
+            settings.GRANIOT_DEFAULT_FARM_TYPE or "PRO",
+            True,
+        )
+    except Exception as exc:  # noqa: BLE001 — sin finca propia se sigue con la de siempre
+        log_event({
+            "event": "dataris.graniot.farm_for_finca.failed",
+            "operation": "resolve-farm-id",
+            "finca": name,
+            "exception_type": type(exc).__name__,
+            "message": str(exc),
+        })
+        return None
+    farm_id = _clean_id(farm.get("id"))
+    if farm_id:
+        log_event({
+            "event": "dataris.graniot.farm_for_finca.ok",
+            "operation": "resolve-farm-id",
+            "finca": name,
+            "farm_id": farm_id,
+        })
+    return farm_id
+
+
 async def _resolve_farm_id(
     client: GraniotClient,
     local: Dict[str, Any],
@@ -2561,12 +2599,26 @@ async def _resolve_farm_id(
 ) -> str:
     # Acepta camelCase y snake_case porque el frontend puede enviar farmId,
     # mientras que Graniot y el backend usan farm_id/graniot_farm_id.
-    candidates = [
+    # Una elección explícita de quien llama manda sobre todo lo demás.
+    for value in (
         payload.get("graniot_farm_id"),
         payload.get("farm_id"),
         payload.get("farmId"),
         payload.get("farmID"),
         payload.get("farm"),
+    ):
+        clean = _clean_id(value)
+        if clean:
+            return clean
+
+    # La finca del lote define su sección en el portal. Va por delante del
+    # `graniot_farm_id` ya guardado para que, al reorganizar los lotes en
+    # Dataris, el portal del cliente se reordene con ellos.
+    farm_for_finca = await _farm_id_for_finca(client, local.get("finca"))
+    if farm_for_finca:
+        return farm_for_finca
+
+    candidates = [
         local.get("graniot_farm_id"),
         local.get("farm_id"),
     ]
