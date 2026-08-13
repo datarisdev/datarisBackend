@@ -246,6 +246,58 @@ def _feature_result(feature: Dict[str, Any], label: str, source_crs_label: str) 
     }
 
 
+def _drop_finca_contours(features: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Descarta el contorno de la finca cuando viene como un polígono más.
+
+    Muchos KML/SHP traen, además de los lotes, un polígono que ENVUELVE a casi
+    todos (el contorno de la finca). Si se carga como un lote, se dibuja encima
+    de todos los demás y, peor aún, duplica la superficie facturable. Se detecta
+    de forma conservadora: un polígono es contorno solo si CONTIENE (>=90% de su
+    área) al menos el 70% de los OTROS polígonos del archivo. Así se descarta el
+    envolvente de la finca pero NO un lote que apenas contenga a unos pocos (por
+    ejemplo, un lote con zonas de despoblación dentro, que sí debe conservarse).
+    """
+    n = len(features)
+    if n < 4:
+        return features
+
+    geoms: List[Any] = []
+    for feature in features:
+        try:
+            geoms.append(shapely_shape(feature["geometry"]).buffer(0))
+        except Exception:
+            geoms.append(None)
+
+    dropped: set = set()
+    for i in range(n):
+        gi = geoms[i]
+        if gi is None or gi.is_empty or gi.area <= 0:
+            continue
+        contains = 0
+        for j in range(n):
+            if i == j:
+                continue
+            gj = geoms[j]
+            if gj is None or gj.is_empty or gj.area <= 0:
+                continue
+            # Prefiltro por bbox: si no se solapan, gi no contiene a gj.
+            if gi.bounds[2] < gj.bounds[0] or gj.bounds[2] < gi.bounds[0]:
+                continue
+            if gi.bounds[3] < gj.bounds[1] or gj.bounds[3] < gi.bounds[1]:
+                continue
+            if gi.intersection(gj).area / gj.area >= 0.9:
+                contains += 1
+        if contains >= 0.7 * (n - 1):
+            dropped.add(i)
+
+    if not dropped:
+        return features
+    kept = [f for k, f in enumerate(features) if k not in dropped]
+    # Nunca vaciar el archivo por completo: si todo quedó marcado (caso raro de
+    # polígonos idénticos), se conserva la lista original.
+    return kept or features
+
+
 def _read_shapefile(shp_path: Path, base_name: str) -> Dict[str, Any]:
     src_crs = _read_prj(shp_path) or CRS.from_epsg(4326)
     reader = shapefile.Reader(str(shp_path))
@@ -271,6 +323,7 @@ def _read_shapefile(shp_path: Path, base_name: str) -> Dict[str, Any]:
         })
     if not features:
         raise ValueError("El shapefile no contiene polígonos válidos")
+    features = _drop_finca_contours(features)
     source_crs_label = (
         str(src_crs.to_authority()[0] + ":" + src_crs.to_authority()[1])
         if src_crs and src_crs.to_authority()
@@ -322,6 +375,7 @@ def _parse_kml_text(text: str, base_name: str) -> Dict[str, Any]:
                 })
     if not features:
         raise ValueError("El KML/KMZ no contiene polígonos válidos")
+    features = _drop_finca_contours(features)
     # Cada Placemark/Polygon del KML es su propia parcela, igual que con shapefiles.
     parcels = []
     for index, feature in enumerate(features):

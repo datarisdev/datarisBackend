@@ -851,6 +851,84 @@ def dedupe_user_parcels(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return list(by_key.values())
 
 
+def _parcel_bbox(row: Dict[str, Any]) -> Optional[List[float]]:
+    box = row.get("bbox")
+    if isinstance(box, (list, tuple)) and len(box) >= 4:
+        try:
+            return [float(box[0]), float(box[1]), float(box[2]), float(box[3])]
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _parcel_geometry_shape(row: Dict[str, Any]):
+    """Geometría del lote como polígono de shapely, o None si no se puede."""
+    from shapely.geometry import shape as _shape
+    from shapely.ops import unary_union
+
+    geometry = row.get("geometry_geojson") or row.get("geometry")
+    if not isinstance(geometry, dict):
+        return None
+    try:
+        if geometry.get("type") == "FeatureCollection":
+            parts = [
+                _shape(f["geometry"])
+                for f in (geometry.get("features") or [])
+                if isinstance(f, dict) and isinstance(f.get("geometry"), dict)
+            ]
+            if not parts:
+                return None
+            return unary_union(parts).buffer(0)
+        if geometry.get("type") == "Feature" and isinstance(geometry.get("geometry"), dict):
+            return _shape(geometry["geometry"]).buffer(0)
+        if geometry.get("type") in {"Polygon", "MultiPolygon"}:
+            return _shape(geometry).buffer(0)
+    except Exception:
+        return None
+    return None
+
+
+def _find_geometric_duplicate(
+    rows: List[Dict[str, Any]], row: Dict[str, Any], user_id: str, iou_threshold: float = 0.95
+) -> Optional[Dict[str, Any]]:
+    """Lote del usuario con geometría casi idéntica al entrante (re-subida).
+
+    Deduplica por GEOMETRÍA cuando el nombre no coincide (el mismo lote resubido
+    con otro nombre, p. ej. `1190` y `1190.`), que era la vía por la que se
+    acumulaban polígonos duplicados. El prefiltro por bbox usa el dato ya
+    guardado, así que solo se construye la geometría de los pocos candidatos que
+    se solapan: no penaliza a cuentas con miles de lotes.
+    """
+    incoming_box = _parcel_bbox(row)
+    if incoming_box is None:
+        return None
+    incoming_shape = None
+    for existing in rows:
+        if str(existing.get("user_id") or "") != user_id:
+            continue
+        existing_box = _parcel_bbox(existing)
+        if existing_box is None:
+            continue
+        if incoming_box[2] < existing_box[0] or existing_box[2] < incoming_box[0]:
+            continue
+        if incoming_box[3] < existing_box[1] or existing_box[3] < incoming_box[1]:
+            continue
+        if incoming_shape is None:
+            incoming_shape = _parcel_geometry_shape(row)
+            if incoming_shape is None or incoming_shape.is_empty or incoming_shape.area <= 0:
+                return None
+        existing_shape = _parcel_geometry_shape(existing)
+        if existing_shape is None or existing_shape.is_empty or existing_shape.area <= 0:
+            continue
+        intersection = incoming_shape.intersection(existing_shape).area
+        if intersection <= 0:
+            continue
+        union = incoming_shape.area + existing_shape.area - intersection
+        if union and intersection / union >= iou_threshold:
+            return existing
+    return None
+
+
 def find_existing_user_parcel(rows: List[Dict[str, Any]], row: Dict[str, Any], user_id: str) -> Optional[Dict[str, Any]]:
     row_key = parcel_lot_key(row)
     for existing in rows:
@@ -860,7 +938,11 @@ def find_existing_user_parcel(rows: List[Dict[str, Any]], row: Dict[str, Any], u
             return existing
         if row_key and parcel_lot_key(existing) == row_key:
             return existing
-    return None
+    # Sin coincidencia por nombre/id: buscar un duplicado por geometría (mismo
+    # lote resubido con otro nombre). Al encontrarlo, upsert_user_parcel lo
+    # actualiza en sitio y conserva su vínculo con Graniot, en vez de crear otra
+    # parcela que dejaría la anterior huérfana en el portal.
+    return _find_geometric_duplicate(rows, row, user_id)
 
 
 def upsert_user_parcel(db: Dict[str, Any], user_id: str, row: Dict[str, Any]) -> Dict[str, Any]:
