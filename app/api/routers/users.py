@@ -104,11 +104,13 @@ def list_users(db: Session = Depends(get_db), admin: dict = Depends(get_current_
     return result
 
 @router.delete("/{user_id}")
-def delete_user(user_id: str, db: Session = Depends(get_db)):
+def delete_user(user_id: str, db: Session = Depends(get_db), admin: dict = Depends(get_current_admin)):
+    if admin.get("role") != "superadmin":
+        raise HTTPException(status_code=403, detail="Not authorized")
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    
+
     try:
         delete_user_avatars(user_id)
     except Exception as e:
@@ -136,11 +138,18 @@ def delete_user(user_id: str, db: Session = Depends(get_db)):
     return {"message": "User deleted"}
 
 @router.patch("/{user_id}", response_model=UserOut)
-def update_user(user_id: str, user_update: UserUpdate, db: Session = Depends(get_db)):
+def update_user(
+    user_id: str,
+    user_update: UserUpdate,
+    db: Session = Depends(get_db),
+    admin: dict = Depends(get_current_admin),
+):
+    if admin.get("role") != "superadmin":
+        raise HTTPException(status_code=403, detail="Not authorized")
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    
+
     profile = user.profile
 
     if user_update.email is not None:

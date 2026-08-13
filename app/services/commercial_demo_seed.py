@@ -961,6 +961,23 @@ def _remove_demo_tenant_rows(db: Dict[str, Any]) -> bool:
     tables = db.setdefault("tables", {})
     known_demo_ids = {DEMO_USER_ID, DEMO_COMPANY_ID}
 
+    # Usuarios REALES: cualquier cuenta que no sea la propia de la demostración.
+    # Son intocables. Un reseteo de demo (que se dispara con cada login del
+    # usuario demo) nunca debe borrar a un usuario real ni sus filas de identidad
+    # sólo porque alguna referencia cruzada apunte a un id de la demo: eso
+    # eliminaría la cuenta y, con ella, cerraría la sesión de un cliente real.
+    real_user_ids = {
+        str(row.get("id"))
+        for row in db.setdefault("users", [])
+        if row.get("id") and not _is_direct_demo_row("users", row)
+    }
+
+    def _is_protected(row: Dict[str, Any]) -> bool:
+        return (
+            str(row.get("id") or "") in real_user_ids
+            or str(row.get("user_id") or "") in real_user_ids
+        )
+
     # Fixed-point discovery: children can reference rows discovered in an
     # earlier pass (parcel -> crop, mapping session -> data point, etc.).
     changed = True
@@ -970,6 +987,8 @@ def _remove_demo_tenant_rows(db: Dict[str, Any]) -> bool:
         collections.extend((name, rows) for name, rows in tables.items() if name != "platform_modules")
         for table_name, rows in collections:
             for row in rows:
+                if _is_protected(row):
+                    continue
                 row_id = str(row.get("id") or "")
                 belongs_to_demo = _is_direct_demo_row(table_name, row) or any(
                     reference in known_demo_ids for reference in _row_reference_values(row)
@@ -983,7 +1002,10 @@ def _remove_demo_tenant_rows(db: Dict[str, Any]) -> bool:
     filtered_users = [
         row
         for row in users
-        if not (_is_direct_demo_row("users", row) or str(row.get("id") or "") in known_demo_ids)
+        if not (
+            not _is_protected(row)
+            and (_is_direct_demo_row("users", row) or str(row.get("id") or "") in known_demo_ids)
+        )
     ]
     if len(filtered_users) != len(users):
         db["users"] = filtered_users
@@ -996,9 +1018,12 @@ def _remove_demo_tenant_rows(db: Dict[str, Any]) -> bool:
         for row in rows:
             row_id = str(row.get("id") or "")
             belongs_to_demo = (
-                _is_direct_demo_row(table_name, row)
-                or row_id in known_demo_ids
-                or any(reference in known_demo_ids for reference in _row_reference_values(row))
+                not _is_protected(row)
+                and (
+                    _is_direct_demo_row(table_name, row)
+                    or row_id in known_demo_ids
+                    or any(reference in known_demo_ids for reference in _row_reference_values(row))
+                )
             )
             if belongs_to_demo:
                 removed = True

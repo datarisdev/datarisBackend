@@ -10,13 +10,22 @@ from passlib.context import CryptContext
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 router = APIRouter(prefix="/admin_users", tags=["Admin Users"])
 
-# Create admin user (run once manually)
+# Crear un administrador de plataforma. Sólo un superadministrador ya autenticado
+# puede hacerlo: antes este endpoint estaba abierto y cualquiera podía fabricarse
+# un superadmin desde una petición anónima.
 @router.post("/", response_model=AdminUserOut)
-def create_admin_user(admin: AdminUserCreate, db: Session = Depends(get_db)):
+def create_admin_user(
+    admin: AdminUserCreate,
+    db: Session = Depends(get_db),
+    current_admin: dict = Depends(get_current_admin),
+):
+    if current_admin.get("role") != "superadmin":
+        raise HTTPException(status_code=403, detail="Solo un superadministrador puede crear administradores")
+
     existing = db.query(AdminUser).filter(AdminUser.email == admin.email).first()
     if existing:
         raise HTTPException(status_code=400, detail="Admin already exists")
-    
+
     hashed_password = pwd_context.hash(admin.password)
     new_admin = AdminUser(email=admin.email, password_hash=hashed_password, admin_role="superadmin")
     db.add(new_admin)

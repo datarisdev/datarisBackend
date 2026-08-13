@@ -35,8 +35,11 @@ class UserLogin(BaseModel):
 def register(user_in: UserCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     logging.info(f"current_user payload: {current_user}")
     logging.info(f"current_user role: {current_user.get('role')}")
-    # Only admins can create users
-    creator_roles = current_user["role"]
+    # Solo los administradores pueden crear usuarios. `role` puede venir vacío o
+    # como None (por ejemplo, con un token compat que no lleva claim de rol): en
+    # ese caso NO es admin y se rechaza, en lugar de reventar con un TypeError que
+    # devolvería un 500 en vez de un 403.
+    creator_roles = current_user.get("role") or ""
     if "admin" not in creator_roles:
         raise HTTPException(status_code=403, detail="Not authorized")
 
@@ -64,9 +67,11 @@ def register(user_in: UserCreate, db: Session = Depends(get_db), current_user: U
     if db.query(User).filter(User.email == user_in.email).first():
         raise HTTPException(status_code=400, detail="Email already exists")
 
-    # No admin escalation
-    #if user_in.role == "admin":
-    #    raise HTTPException(status_code=403, detail="Cannot assign admin role")
+    # Sin escalada de privilegios: un administrador de cliente no puede crear
+    # otros administradores. Sólo los superadministradores de plataforma dan de
+    # alta administradores, por la vía dedicada de /api/auth/ (create_user).
+    if str(user_in.role) == "admin":
+        raise HTTPException(status_code=403, detail="Cannot assign admin role")
     logging.info(f"user_in: {user_in}")
     # Create user
     new_user = User(
