@@ -11,6 +11,7 @@ import secrets
 import shutil
 import smtplib
 import string
+import unicodedata
 import uuid
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
@@ -637,6 +638,54 @@ def add_defaults(table_name: str, row: Dict[str, Any], user_id: Optional[str]) -
         row.setdefault("is_active", True)
     row = normalize_record_geometries(table_name, row)
     return row
+
+
+# Países soportados por la plataforma (ISO 3166-1 alfa-2). El país del perfil
+# decide con qué marca comercial ve el cliente la plataforma: México ve
+# Innovagro y el resto ve Dataris. Se guarda normalizado para que el frontend
+# no tenga que interpretar textos libres.
+COUNTRY_CODES = {
+    "MX", "GT", "SV", "HN", "NI", "CR", "PA", "CO", "EC", "PE",
+    "BO", "CL", "AR", "UY", "PY", "BR", "DO", "CU", "ES", "US",
+}
+
+COUNTRY_NAME_TO_CODE = {
+    "mexico": "MX",
+    "guatemala": "GT",
+    "el salvador": "SV",
+    "honduras": "HN",
+    "nicaragua": "NI",
+    "costa rica": "CR",
+    "panama": "PA",
+    "colombia": "CO",
+    "ecuador": "EC",
+    "peru": "PE",
+    "bolivia": "BO",
+    "chile": "CL",
+    "argentina": "AR",
+    "uruguay": "UY",
+    "paraguay": "PY",
+    "brasil": "BR",
+    "brazil": "BR",
+    "republica dominicana": "DO",
+    "cuba": "CU",
+    "espana": "ES",
+    "estados unidos": "US",
+}
+
+
+def normalize_country(value: Any) -> Optional[str]:
+    """Devuelve el código ISO del país, aceptando el código o el nombre."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    upper = text.upper()
+    if upper in COUNTRY_CODES:
+        return upper
+    folded = "".join(
+        char for char in unicodedata.normalize("NFD", text.lower()) if unicodedata.category(char) != "Mn"
+    ).strip()
+    return COUNTRY_NAME_TO_CODE.get(folded)
 
 
 def normalize_lot_key(*values: Any) -> str:
@@ -1350,6 +1399,7 @@ def create_manual_admin_user(payload: Dict[str, Any] = Body(default_factory=dict
             "avatar_url": None,
             "phone": None,
             "location": None,
+            "country": normalize_country(payload.get("country")),
             "hectareas": assigned_hectares,
             "max_users": 0,
             "created_at": t,
@@ -1467,6 +1517,7 @@ def onboard_client(payload: Dict[str, Any] = Body(default_factory=dict), authori
         first_name = str(payload.get("first_name") or "").strip() or None
         last_name = str(payload.get("last_name") or "").strip() or None
         max_hectares = float(payload.get("max_hectares") or 0)
+        country = normalize_country(payload.get("country"))
 
         t = now()
 
@@ -1520,6 +1571,7 @@ def onboard_client(payload: Dict[str, Any] = Body(default_factory=dict), authori
             "last_name": last_name,
             "company_name": company_name,
             "company_id": company_id,
+            "country": country,
             "max_users": 0,
             "created_at": t,
             "updated_at": t,
