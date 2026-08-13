@@ -4171,6 +4171,148 @@ def _clear_local_graniot_fields(parcel_id: str, user_id: Any) -> Optional[Dict[s
         return _public_parcel(row)
 
 
+def _all_dataris_remote_ids(db: Dict[str, Any]) -> set:
+    """Ids de parcela de Graniot ligados a CUALQUIER lote de CUALQUIER usuario.
+
+    Es el conjunto protegido: nada de aquí se borra al limpiar un portal, porque
+    corresponde a un lote real de algún cliente de Dataris (aunque comparta finca
+    con otros).
+    """
+    protected = set()
+    for row in table(db, "parcels"):
+        for rid in _remote_parcel_ids(row):
+            protected.add(str(rid))
+    return protected
+
+
+@router.post("/admin/portal/purge-orphans")
+async def purge_portal_orphans(
+    payload: Dict[str, Any] = Body(default_factory=dict),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Limpia el portal satelital de un cliente de parcelas huérfanas (superadmin).
+
+    El portal de un cliente puede vivir en una finca de Graniot COMPARTIDA con
+    otros gestores (el caso del cajón 3615): con el tiempo se llena de parcelas
+    que no pertenecen a ningún cliente de Dataris. Este endpoint lista lo que el
+    cliente ve en SU portal (finca), marca como huérfana toda parcela que NO
+    esté ligada a NINGÚN lote de NINGÚN usuario de Dataris, y las borra.
+
+    - Por defecto es dry-run (`dry_run=true`): no borra, informa y devuelve el
+      backup con la geometría para poder recrear si hiciera falta.
+    - El LISTADO se hace con la cuenta del propio cliente, así que se limita a su
+      finca; el BORRADO usa la API key del partner, que puede borrar parcelas de
+      cualquier cuenta dentro de esa finca.
+    - NUNCA borra una parcela ligada a un lote de Dataris (de este cliente o de
+      cualquier otro que comparta la finca).
+    """
+    db = read_db()
+    ctx = require_admin_context(authorization, db)
+    if ctx["admin"].get("admin_role") != "superadmin":
+        raise HTTPException(status_code=403, detail="Solo un superadministrador puede limpiar portales")
+
+    email = str(payload.get("user_email") or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="Falta user_email")
+    dry_run = bool(payload.get("dry_run", True))
+
+    user = next((u for u in db.get("users", []) if str(u.get("email") or "").strip().lower() == email), None)
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+    # Cliente escopado a la finca del usuario: solo ve su portal.
+    target = await _resolve_sync_target(email, operation="purge-portal-orphans")
+    scoped_client = _client_for_target(target)
+    try:
+        raw = await scoped_client.get("/api/parcels/")
+    except Exception as exc:  # noqa: BLE001
+        _raise_graniot_error(exc)
+    portal = _items(raw)
+
+    protected = _all_dataris_remote_ids(db)
+
+    def _pid(feature: Dict[str, Any]) -> Optional[str]:
+        return _clean_id(feature.get("id") or (feature.get("properties") or {}).get("id"))
+
+    def _pname(feature: Dict[str, Any]) -> str:
+        return str((feature.get("properties") or {}).get("name") or "")
+
+    orphans: List[Dict[str, Any]] = []
+    linked = 0
+    for feature in portal:
+        pid = _pid(feature)
+        if not pid:
+            continue
+        if str(pid) in protected:
+            linked += 1
+        else:
+            orphans.append(feature)
+
+    backup = [
+        {
+            "graniot_parcel_id": _pid(f),
+            "name": _pname(f),
+            "geometry": f.get("geometry"),
+            "bbox": f.get("bbox"),
+        }
+        for f in orphans
+    ]
+
+    summary = {
+        "user_email": email,
+        "portal_total": len(portal),
+        "linked_to_dataris": linked,
+        "orphans": len(orphans),
+        "dry_run": dry_run,
+        "target_mode": target.get("mode"),
+    }
+
+    if dry_run:
+        return {
+            "data": {
+                **summary,
+                "would_delete": [{"graniot_parcel_id": b["graniot_parcel_id"], "name": b["name"]} for b in backup],
+                "backup": backup,
+            },
+            "error": None,
+        }
+
+    # Borrado real con la API key del partner (puede borrar de cualquier cuenta
+    # dentro de la finca). Las que ya no estén cuentan como borradas.
+    service_client = GraniotClient()
+    deleted: List[str] = []
+    missing: List[str] = []
+    failed: List[Dict[str, Any]] = []
+    for feature in orphans:
+        pid = _pid(feature)
+        try:
+            await service_client.delete(
+                f"/api/parcels/{pid}/",
+                debug_context={"operation": "purge-portal-orphans", "graniot_parcel_id": pid, "user_email": email},
+            )
+            deleted.append(pid)
+        except GraniotAPIError as exc:
+            if exc.status_code in {404, 410}:
+                missing.append(pid)
+            else:
+                failed.append({"graniot_parcel_id": pid, "status_code": exc.status_code, "message": str(exc)})
+        except Exception as exc:  # noqa: BLE001 — seguir borrando el resto
+            failed.append({"graniot_parcel_id": pid, "message": str(exc)})
+
+    log_event({
+        "event": "dataris.graniot.purge_portal_orphans",
+        "user_email": email,
+        "portal_total": len(portal),
+        "deleted": len(deleted),
+        "missing": len(missing),
+        "failed": len(failed),
+    })
+    return {
+        "data": {**summary, "deleted": deleted, "missing": missing, "failed": failed, "backup": backup},
+        "error": None,
+    }
+
+
 async def delete_parcel_from_graniot(
     user: Dict[str, Any],
     local: Dict[str, Any],

@@ -96,7 +96,7 @@ def _split_parcel_row(
         finca = _feature_finca(properties)
         label = _unique_label(_feature_label(properties, index, parent_name), finca, used_keys)
         feature_collection = {"type": "FeatureCollection", "features": [feature]}
-        children.append(normalize_record_geometries("parcels", {
+        child = {
             "id": str(uuid.uuid5(_SPLIT_ID_NAMESPACE, f"{parent_id}:{index}")),
             "user_id": row.get("user_id"),
             "name": label,
@@ -107,7 +107,14 @@ def _split_parcel_row(
             "file_url": row.get("file_url"),
             "created_at": row.get("created_at") or timestamp,
             "updated_at": timestamp,
-        }))
+        }
+        # Conserva la finca de Graniot del lote padre para que, al sincronizar,
+        # las parcelas nuevas se creen en la MISMA finca del portal en vez de caer
+        # en el fallback. (El vínculo por-parcela no se puede repartir 1:1 al
+        # dividir, así que aquí solo se preserva la finca.)
+        if row.get("graniot_farm_id"):
+            child["graniot_farm_id"] = row.get("graniot_farm_id")
+        children.append(normalize_record_geometries("parcels", child))
     return children
 
 
