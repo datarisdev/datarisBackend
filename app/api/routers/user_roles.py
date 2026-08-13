@@ -3,9 +3,14 @@ from sqlalchemy.orm import Session
 from uuid import UUID
 from app.api.deps import get_db
 from app.models.user_roles import UserRole, AppRole
-from app.api.deps import get_current_user
+from app.api.deps import get_current_admin, get_current_user
 
 router = APIRouter(prefix="/roles", tags=["roles"])
+
+
+def _require_superadmin(current_admin: dict) -> None:
+    if current_admin.get("role") != "superadmin":
+        raise HTTPException(status_code=403, detail="Solo un superadministrador puede modificar roles")
 
 # ----------------------
 # Schemas
@@ -20,7 +25,8 @@ class RoleIn(BaseModel):
 # Routes
 # ----------------------
 @router.post("/")
-def add_role(data: RoleIn, db: Session = Depends(get_db)):
+def add_role(data: RoleIn, db: Session = Depends(get_db), current_admin: dict = Depends(get_current_admin)):
+    _require_superadmin(current_admin)
     existing = db.query(UserRole).filter(
         UserRole.user_id == data.user_id, UserRole.role == data.role
     ).first()
@@ -32,7 +38,8 @@ def add_role(data: RoleIn, db: Session = Depends(get_db)):
     return {"message": "Role assigned"}
 
 @router.delete("/")
-def remove_role(data: RoleIn, db: Session = Depends(get_db)):
+def remove_role(data: RoleIn, db: Session = Depends(get_db), current_admin: dict = Depends(get_current_admin)):
+    _require_superadmin(current_admin)
     role = db.query(UserRole).filter(
         UserRole.user_id == data.user_id, UserRole.role == data.role
     ).first()

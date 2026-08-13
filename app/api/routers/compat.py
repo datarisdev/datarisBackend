@@ -622,7 +622,12 @@ def add_defaults(table_name: str, row: Dict[str, Any], user_id: Optional[str]) -
         row.setdefault("is_enabled", True)
         row.setdefault("is_active", True)
     if table_name == "admin_users":
-        row.setdefault("admin_role", "company_admin")
+        # Menor privilegio por defecto: si una fila de administrador llega sin
+        # rol, NUNCA se asume "company_admin". Antes ese default convertía en
+        # administrador de empresa a cualquier fila insertada por la API genérica
+        # (a la que guard_admin_users_write le había quitado el rol), permitiendo
+        # que un no-superadmin fabricara otro admin.
+        row.setdefault("admin_role", "company_user")
         row.setdefault("is_active", True)
     row = normalize_record_geometries(table_name, row)
     return row
@@ -684,6 +689,22 @@ def _is_platform_superadmin(db: Dict[str, Any], user_id: str) -> bool:
 # "company_user") puede recibirlo sin convertirse en administrador de nada más.
 PARCEL_MANAGER_FIELD = "can_manage_parcels"
 PARCEL_MANAGER_ALL_FIELD = "can_manage_all_parcels"
+# Permiso para dar de alta clientes nuevos (empresa + su administrador) sin ser
+# superadministrador. Lo reciben los perfiles comerciales para poder hacer el
+# onboarding de cuentas sin tener control sobre el resto de la plataforma.
+CLIENT_ONBOARDER_FIELD = "can_onboard_clients"
+# Módulos que se activan por defecto para un cliente recién dado de alta. Es un
+# punto de partida razonable; el equipo puede ampliarlo o recortarlo después.
+CLIENT_DEFAULT_MODULE_IDS = [
+    "dashboard",
+    "satelite",
+    "mapeo",
+    "telemetria",
+    "sig-agricola",
+    "ortofoto-analysis",
+    "aplicaciones-aereas",
+    "personal",
+]
 
 
 def active_admin_row(db: Dict[str, Any], user_id: str) -> Optional[Dict[str, Any]]:
@@ -735,6 +756,21 @@ def parcel_manager_permission(db: Dict[str, Any], user_id: Optional[str]) -> Dic
 
 def can_manage_parcels(db: Dict[str, Any], user_id: Optional[str]) -> bool:
     return bool(parcel_manager_permission(db, user_id).get("allowed"))
+
+
+def can_onboard_clients(db: Dict[str, Any], user_id: Optional[str]) -> bool:
+    """¿Puede este usuario dar de alta clientes nuevos (empresa + su admin)?
+
+    Lo pueden hacer los superadministradores y los comerciales a los que se les
+    marcó `can_onboard_clients`. Nunca convierte a nadie en superadmin: sólo crea
+    administradores de la empresa recién creada.
+    """
+    if not user_id:
+        return False
+    admin = active_admin_row(db, str(user_id))
+    if not admin:
+        return False
+    return admin.get("admin_role") == "superadmin" or bool(admin.get(CLIENT_ONBOARDER_FIELD))
 
 
 def parcel_manager_covers_user(
@@ -994,7 +1030,12 @@ def sign_up(payload: Dict[str, Any] = Body(default_factory=dict)):
             "hectareas": metadata.get("hectareas"), "max_users": metadata.get("max_users") or 0,
             "created_at": t, "updated_at": t,
         })
-        table(db, "user_roles").append({"id": str(uuid.uuid4()), "user_id": user_id, "role": metadata.get("role", "admin"), "created_at": t})
+        # El rol NUNCA se toma del cuerpo de la petición: el alta pública crea
+        # siempre un usuario normal. La condición de administrador se concede
+        # aparte, por la vía protegida de administración (admin/users/manual o la
+        # tabla admin_users con guardián). Antes el default era "admin" y bastaba
+        # un registro anónimo para nacer con rol de administrador.
+        table(db, "user_roles").append({"id": str(uuid.uuid4()), "user_id": user_id, "role": "user", "created_at": t})
         write_db(db)
         return {"data": {"user": public_user(user), "session": None}, "error": None}
 
@@ -1053,9 +1094,15 @@ def reset_password(payload: Dict[str, Any] = Body(default_factory=dict)):
 
 
 @router.delete("/auth/admin/users/{user_id}")
-def delete_auth_user(user_id: str):
+def delete_auth_user(user_id: str, authorization: Optional[str] = Header(default=None)):
+    # Borrar un usuario cierra su sesión y arrastra todas sus filas. Antes estaba
+    # abierto sin autenticación: cualquiera podía eliminar a cualquier usuario
+    # (una de las formas de "expulsar" a otro de su sesión). Sólo el superadmin.
     with LOCK:
         db = read_db()
+        ctx = require_admin_context(authorization, db)
+        if ctx["admin"].get("admin_role") != "superadmin":
+            raise HTTPException(status_code=403, detail="Solo un superadministrador puede eliminar usuarios")
         db["users"] = [u for u in db["users"] if u.get("id") != user_id]
         for name, rows in db["tables"].items():
             db["tables"][name] = [r for r in rows if r.get("user_id") != user_id and r.get("id") != user_id]
@@ -1278,6 +1325,159 @@ def create_manual_admin_user(payload: Dict[str, Any] = Body(default_factory=dict
     }
 
 
+@router.get("/admin/clients/context")
+def client_onboarding_context(authorization: Optional[str] = Header(default=None)):
+    """Permiso del usuario actual para dar de alta clientes.
+
+    Lo consume el panel para decidir si muestra la pantalla de alta de clientes.
+    """
+    user = bearer_user(authorization)
+    db = read_db()
+    if not user:
+        return {"data": {"allowed": False, "is_superadmin": False}, "error": None}
+    admin = active_admin_row(db, str(user.get("id") or ""))
+    return {
+        "data": {
+            "allowed": can_onboard_clients(db, str(user.get("id") or "")),
+            "is_superadmin": bool(admin and admin.get("admin_role") == "superadmin"),
+        },
+        "error": None,
+    }
+
+
+@router.post("/admin/clients/onboard")
+def onboard_client(payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
+    """Alta de un cliente nuevo: crea la empresa y su administrador de empresa.
+
+    Pensado para el onboarding comercial: quien tenga el permiso
+    `can_onboard_clients` (o sea superadmin) puede crear una cuenta cliente
+    completa sin necesidad de acceso administrativo general. NUNCA crea
+    superadministradores: el usuario creado es siempre `company_admin` de la
+    empresa recién creada, de modo que no hay forma de escalar privilegios por
+    esta vía.
+    """
+    with LOCK:
+        db = read_db()
+        user = bearer_user(authorization)
+        if not user or not can_onboard_clients(db, str(user.get("id") or "")):
+            raise HTTPException(status_code=403, detail="No autorizado para dar de alta clientes")
+
+        company_name = str(payload.get("company_name") or "").strip()
+        if not company_name:
+            raise HTTPException(status_code=400, detail="El nombre de la empresa es obligatorio")
+
+        email = clean_email(payload.get("email"))
+        if not email:
+            raise HTTPException(status_code=400, detail="El correo del administrador es obligatorio")
+        if any(str(u.get("email", "")).lower() == email for u in db.get("users", [])):
+            raise HTTPException(status_code=400, detail="Ya existe un usuario con ese correo")
+
+        password = clean_password(payload.get("password"))
+        if len(password) < 8:
+            raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 8 caracteres")
+
+        first_name = str(payload.get("first_name") or "").strip() or None
+        last_name = str(payload.get("last_name") or "").strip() or None
+        max_hectares = float(payload.get("max_hectares") or 0)
+
+        t = now()
+
+        # 1) Empresa nueva y aislada.
+        company_id = str(uuid.uuid4())
+        company = {
+            "id": company_id,
+            "name": company_name,
+            "max_hectares": max_hectares,
+            "used_hectares": 0,
+            "is_active": True,
+            "created_at": t,
+            "updated_at": t,
+        }
+        table(db, "companies").append(company)
+
+        # 2) Módulos por defecto de la empresa (los que existan en el catálogo).
+        valid_modules = {m.get("id") for m in table(db, "platform_modules") if m.get("is_active", True)}
+        requested_modules = payload.get("modules")
+        module_ids = [m for m in requested_modules if isinstance(requested_modules, list) and m in valid_modules] if isinstance(requested_modules, list) else []
+        if not module_ids:
+            module_ids = [m for m in CLIENT_DEFAULT_MODULE_IDS if m in valid_modules]
+        for module_id in module_ids:
+            table(db, "company_modules").append({
+                "id": str(uuid.uuid4()),
+                "company_id": company_id,
+                "module_id": module_id,
+                "is_enabled": True,
+                "created_at": t,
+                "updated_at": t,
+            })
+
+        # 3) Usuario administrador de ESA empresa (nunca superadmin).
+        user_id = str(uuid.uuid4())
+        new_user = {
+            "id": user_id,
+            "email": email,
+            "password_hash": password_hash(password),
+            "is_active": True,
+            "created_at": t,
+            "updated_at": t,
+            "user_metadata": {"first_name": first_name, "last_name": last_name, "manual_password": True},
+        }
+        db.setdefault("users", []).append(new_user)
+
+        table(db, "profiles").append({
+            "id": user_id,
+            "user_id": user_id,
+            "email": email,
+            "first_name": first_name,
+            "last_name": last_name,
+            "company_name": company_name,
+            "company_id": company_id,
+            "max_users": 0,
+            "created_at": t,
+            "updated_at": t,
+        })
+        table(db, "user_roles").append({"id": str(uuid.uuid4()), "user_id": user_id, "role": "admin", "created_at": t})
+
+        admin_user_id = str(uuid.uuid4())
+        admin_row = {
+            "id": admin_user_id,
+            "user_id": user_id,
+            "company_id": company_id,
+            "admin_role": "company_admin",
+            "assigned_hectares": 0,
+            "created_by": user.get("id"),
+            "is_active": True,
+            PARCEL_MANAGER_FIELD: False,
+            PARCEL_MANAGER_ALL_FIELD: False,
+            "created_at": t,
+            "updated_at": t,
+        }
+        table(db, "admin_users").append(admin_row)
+
+        for module_id in module_ids:
+            table(db, "user_modules").append({
+                "id": str(uuid.uuid4()),
+                "user_id": user_id,
+                "admin_user_id": admin_user_id,
+                "module_id": module_id,
+                "is_enabled": True,
+                "is_active": True,
+                "created_at": t,
+                "updated_at": t,
+            })
+
+        write_db(db)
+
+    return {
+        "data": {
+            "company": company,
+            "user": public_user(new_user),
+            "modules": module_ids,
+        },
+        "error": None,
+    }
+
+
 @router.post("/reports/templates")
 def save_report_template(payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
     """Crea o actualiza una plantilla de reporte. Solo para admins de empresa.
@@ -1375,8 +1575,14 @@ def guard_admin_users_write(
     if not actor or actor.get("admin_role") not in {"superadmin", "company_admin"}:
         raise HTTPException(status_code=403, detail="No autorizado para administrar usuarios")
     if actor.get("admin_role") != "superadmin" and isinstance(data, dict):
-        for field in ("admin_role", PARCEL_MANAGER_ALL_FIELD):
-            data.pop(field, None)
+        # Un no-superadmin no reparte roles ni alcance global de lotes. No basta
+        # con borrar el campo (add_defaults lo repondría): se fija de forma
+        # explícita al mínimo privilegio y se ancla la fila a la empresa del
+        # actor, para que no pueda crear administradores ni sembrar filas en la
+        # empresa de otro cliente.
+        data["admin_role"] = "company_user"
+        data[PARCEL_MANAGER_ALL_FIELD] = False
+        data["company_id"] = actor.get("company_id")
     return actor
 
 
@@ -1412,6 +1618,43 @@ def guard_parcel_table_write(db: Dict[str, Any], table_name: str, user: Optional
     )
 
 
+# Tablas cuya escritura concede acceso, módulos o define el catálogo de empresas
+# y de la plataforma. Nunca deben escribirse desde una petición anónima ni desde
+# un usuario sin el rol adecuado, porque son la puerta real de escalada (por
+# ejemplo, `user_modules` gobierna qué módulos ve cada usuario).
+# El catálogo de módulos de la plataforma es exclusivo del personal de Dataris.
+SUPERADMIN_WRITE_TABLES = {"platform_modules"}
+# El resto de tablas que conceden acceso, módulos o definen empresas: reservadas
+# a administradores (superadmin o company_admin). Lo importante es que ni un
+# usuario normal ni una petición anónima puedan tocarlas; `company_modules`,
+# `companies` y `user_modules` siguen usándolas los administradores de empresa
+# para gestionar a los suyos.
+ADMIN_WRITE_TABLES = {"user_roles", "user_modules", "companies", "company_modules"}
+
+
+def guard_privileged_table_write(db: Dict[str, Any], table_name: str, user: Optional[Dict[str, Any]]) -> None:
+    """Restringe la escritura de las tablas que gobiernan acceso y roles.
+
+    - `platform_modules`: sólo el superadmin de la plataforma (personal de Dataris).
+    - `user_roles`, `user_modules`, `companies`, `company_modules`: superadmin o
+      `company_admin`.
+
+    La tabla `admin_users` tiene su propio guardián (guard_admin_users_write) y
+    `parcels` el suyo (guard_parcel_table_write); `profiles` se deja para que cada
+    usuario edite el suyo desde su perfil.
+    """
+    if table_name not in SUPERADMIN_WRITE_TABLES and table_name not in ADMIN_WRITE_TABLES:
+        return
+    actor = active_admin_row(db, str((user or {}).get("id") or "")) if user else None
+    role = actor.get("admin_role") if actor else None
+    if table_name in SUPERADMIN_WRITE_TABLES:
+        if role != "superadmin":
+            raise HTTPException(status_code=403, detail="Solo un superadministrador puede modificar esta información")
+        return
+    if role not in {"superadmin", "company_admin"}:
+        raise HTTPException(status_code=403, detail="No autorizado para modificar accesos o roles")
+
+
 @router.post("/tables/{table_name}/insert")
 def insert(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
     user = bearer_user(authorization)
@@ -1420,6 +1663,7 @@ def insert(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict)
     with LOCK:
         db = read_db()
         guard_parcel_table_write(db, table_name, user)
+        guard_privileged_table_write(db, table_name, user)
         for item in items:
             guard_admin_users_write(db, table_name, user, item if isinstance(item, dict) else None)
         rows = table(db, table_name)
@@ -1456,6 +1700,7 @@ def upsert(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict)
     with LOCK:
         db = read_db()
         guard_parcel_table_write(db, table_name, user)
+        guard_privileged_table_write(db, table_name, user)
         for item in items:
             guard_admin_users_write(db, table_name, user, item if isinstance(item, dict) else None)
         rows = table(db, table_name)
@@ -1503,6 +1748,7 @@ def update(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict)
     with LOCK:
         db = read_db()
         guard_parcel_table_write(db, table_name, user)
+        guard_privileged_table_write(db, table_name, user)
         actor = guard_admin_users_write(db, table_name, user, payload.get("data") if isinstance(payload.get("data"), dict) else None)
         rows = scoped_table_rows(db, table_name, user)
         targets = apply_filters(rows, payload.get("filters") or [])
@@ -1529,6 +1775,7 @@ def delete(
     with LOCK:
         db = read_db()
         guard_parcel_table_write(db, table_name, user)
+        guard_privileged_table_write(db, table_name, user)
         actor = guard_admin_users_write(db, table_name, user)
         rows = table(db, table_name)
         scoped_rows = scoped_table_rows(db, table_name, user)
