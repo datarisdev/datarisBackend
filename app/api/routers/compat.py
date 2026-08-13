@@ -151,6 +151,12 @@ EXTENSION_MODULES = [
         "Formularios digitales de campo, captura offline, GPS, fotos y reportes desde DigiformsApp.",
         "FileText",
     ),
+    (
+        "graniot",
+        "Graniot",
+        "Integración para capas satelitales, NDVI, fechas, estadísticas y sincronización de lotes desde Graniot.",
+        "Leaf",
+    ),
 ]
 
 

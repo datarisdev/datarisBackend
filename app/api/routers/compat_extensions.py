@@ -429,7 +429,12 @@ def digiforms_status(authorization: Optional[str] = Header(default=None)):
 @router.post("/requests")
 def create_extension_request(payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
     user = require_user(authorization)
-    extension_id = normalize_extension_id(payload.get("extension_id") or DIGIFORMS_MODULE["id"])
+    # El módulo debe venir explícito: antes, si faltaba `extension_id`, la
+    # solicitud se guardaba silenciosamente como digiforms — así una petición de
+    # Graniot acababa registrada (y activada) como DigiformsApp.
+    extension_id = normalize_extension_id(payload.get("extension_id"))
+    if not extension_id:
+        raise HTTPException(status_code=400, detail="Falta indicar la extensión a solicitar")
 
     with LOCK:
         db = read_db()
