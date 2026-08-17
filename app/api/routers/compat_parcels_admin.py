@@ -18,6 +18,7 @@ from app.api.routers.compat import (
     bearer_user,
     create_manual_parcel_for_user,
     dedupe_user_parcels,
+    panel_email_allowed,
     parcel_manager_covers_user,
     parcel_manager_permission,
     read_db,
@@ -38,7 +39,7 @@ def _require_manager(authorization: Optional[str]) -> Dict[str, Any]:
         raise HTTPException(status_code=401, detail="No autenticado")
     db = read_db()
     permission = parcel_manager_permission(db, str(user.get("id") or ""))
-    if not permission.get("allowed"):
+    if not permission.get("allowed") or not panel_email_allowed(user):
         raise HTTPException(status_code=403, detail="No tienes permiso para administrar lotes de usuarios")
     return {"user": user, "permission": permission, "db": db}
 
@@ -133,7 +134,7 @@ def parcels_admin_context(authorization: Optional[str] = Header(default=None)):
     permission = parcel_manager_permission(db, str(user.get("id") or ""))
     return {
         "data": {
-            "allowed": bool(permission.get("allowed")),
+            "allowed": bool(permission.get("allowed")) and panel_email_allowed(user),
             "scope": permission.get("scope"),
             "admin_role": permission.get("admin_role"),
             "company_id": permission.get("company_id"),

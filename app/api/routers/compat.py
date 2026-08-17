@@ -761,6 +761,30 @@ CLIENT_DEFAULT_MODULE_IDS = [
     "personal",
 ]
 
+# Lista blanca del panel de administración (/admin). Solo estas cuentas pueden
+# entrar al panel y ejecutar acciones administrativas; el resto de filas de
+# `admin_users` conserva su efecto sobre el acceso a módulos de la app, pero ya
+# no abre el panel ni sus endpoints. Se ajusta sin tocar código con la variable
+# de entorno DATARIS_ADMIN_PANEL_EMAILS (emails separados por comas; admite
+# "*" para desactivar la restricción y "*@dominio" como comodín de dominio,
+# pensados para desarrollo y tests).
+DEFAULT_ADMIN_PANEL_EMAILS = "admin@dataris.local,admin@dataris.es,gmateo@dataris.es"
+
+
+def admin_panel_allowed_emails() -> set[str]:
+    raw = os.getenv("DATARIS_ADMIN_PANEL_EMAILS") or DEFAULT_ADMIN_PANEL_EMAILS
+    return {entry.strip().lower() for entry in raw.split(",") if entry.strip()}
+
+
+def panel_email_allowed(user: Optional[Dict[str, Any]]) -> bool:
+    email = str((user or {}).get("email") or "").strip().lower()
+    if not email:
+        return False
+    allowed = admin_panel_allowed_emails()
+    if "*" in allowed or email in allowed:
+        return True
+    return any(entry.startswith("*") and email.endswith(entry[1:]) for entry in allowed)
+
 
 def active_admin_row(db: Dict[str, Any], user_id: str) -> Optional[Dict[str, Any]]:
     return next(
@@ -1251,6 +1275,11 @@ def require_admin_context(authorization: Optional[str], db: Dict[str, Any]) -> D
     user = bearer_user(authorization)
     if not user:
         raise HTTPException(status_code=401, detail="No autenticado")
+    if not panel_email_allowed(user):
+        raise HTTPException(
+            status_code=403,
+            detail="El panel de administración está restringido a las cuentas autorizadas de Dataris",
+        )
     admin_row = next(
         (
             row
@@ -1463,6 +1492,29 @@ def create_manual_admin_user(payload: Dict[str, Any] = Body(default_factory=dict
     }
 
 
+@router.get("/admin/panel-access")
+def admin_panel_access(authorization: Optional[str] = Header(default=None)):
+    """¿Puede la cuenta del bearer entrar al panel /admin?
+
+    Es la fuente de verdad que consulta el frontend en /admin/login y en el
+    layout del panel: exige estar en la lista blanca del panel Y conservar una
+    fila activa de `admin_users` con algún privilegio (rol de administrador,
+    gestión de lotes u onboarding de clientes). No revela nada más.
+    """
+    db = read_db()
+    user = bearer_user(authorization)
+    allowed = False
+    if user and panel_email_allowed(user):
+        admin = active_admin_row(db, str(user.get("id") or ""))
+        role = (admin or {}).get("admin_role")
+        allowed = bool(admin) and (
+            role in {"superadmin", "company_admin"}
+            or bool((admin or {}).get(PARCEL_MANAGER_FIELD))
+            or bool((admin or {}).get(CLIENT_ONBOARDER_FIELD))
+        )
+    return {"data": {"allowed": allowed}, "error": None}
+
+
 @router.get("/admin/clients/context")
 def client_onboarding_context(authorization: Optional[str] = Header(default=None)):
     """Permiso del usuario actual para dar de alta clientes.
@@ -1476,7 +1528,7 @@ def client_onboarding_context(authorization: Optional[str] = Header(default=None
     admin = active_admin_row(db, str(user.get("id") or ""))
     return {
         "data": {
-            "allowed": can_onboard_clients(db, str(user.get("id") or "")),
+            "allowed": panel_email_allowed(user) and can_onboard_clients(db, str(user.get("id") or "")),
             "is_superadmin": bool(admin and admin.get("admin_role") == "superadmin"),
         },
         "error": None,
@@ -1497,7 +1549,7 @@ def onboard_client(payload: Dict[str, Any] = Body(default_factory=dict), authori
     with LOCK:
         db = read_db()
         user = bearer_user(authorization)
-        if not user or not can_onboard_clients(db, str(user.get("id") or "")):
+        if not user or not panel_email_allowed(user) or not can_onboard_clients(db, str(user.get("id") or "")):
             raise HTTPException(status_code=403, detail="No autorizado para dar de alta clientes")
 
         company_name = str(payload.get("company_name") or "").strip()
@@ -1712,7 +1764,7 @@ def guard_admin_users_write(
     if table_name != "admin_users":
         return None
     actor = active_admin_row(db, str((user or {}).get("id") or "")) if user else None
-    if not actor or actor.get("admin_role") not in {"superadmin", "company_admin"}:
+    if not actor or actor.get("admin_role") not in {"superadmin", "company_admin"} or not panel_email_allowed(user):
         raise HTTPException(status_code=403, detail="No autorizado para administrar usuarios")
     if actor.get("admin_role") != "superadmin" and isinstance(data, dict):
         # Un no-superadmin no reparte roles ni alcance global de lotes. No basta
@@ -1788,10 +1840,10 @@ def guard_privileged_table_write(db: Dict[str, Any], table_name: str, user: Opti
     actor = active_admin_row(db, str((user or {}).get("id") or "")) if user else None
     role = actor.get("admin_role") if actor else None
     if table_name in SUPERADMIN_WRITE_TABLES:
-        if role != "superadmin":
+        if role != "superadmin" or not panel_email_allowed(user):
             raise HTTPException(status_code=403, detail="Solo un superadministrador puede modificar esta información")
         return
-    if role not in {"superadmin", "company_admin"}:
+    if role not in {"superadmin", "company_admin"} or not panel_email_allowed(user):
         raise HTTPException(status_code=403, detail="No autorizado para modificar accesos o roles")
 
 

@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Body, Header, HTTPException
 
 from app.core.config import settings
-from app.api.routers.compat import LOCK, bearer_user, ensure_storage, read_db, table, write_db, now
+from app.api.routers.compat import LOCK, bearer_user, ensure_storage, panel_email_allowed, read_db, table, write_db, now
 from app.services.digiforms_user_api import (
     DigiformsAPIError,
     DigiformsUserAPI,
@@ -302,7 +302,7 @@ def create_extension_catalog_item(payload: Dict[str, Any] = Body(default_factory
     with LOCK:
         db = read_db()
         admin = admin_record_for(db, user.get("id"))
-        if not is_admin(admin):
+        if not is_admin(admin) or not panel_email_allowed(user):
             raise HTTPException(status_code=403, detail="No tienes permisos para administrar extensiones")
         extension_id = normalize_extension_id(payload.get("id") or payload.get("name"))
         if not extension_id:
@@ -338,7 +338,7 @@ def update_extension_catalog_item(extension_id: str, payload: Dict[str, Any] = B
     with LOCK:
         db = read_db()
         admin = admin_record_for(db, user.get("id"))
-        if not is_admin(admin):
+        if not is_admin(admin) or not panel_email_allowed(user):
             raise HTTPException(status_code=403, detail="No tienes permisos para administrar extensiones")
         ensure_extension_catalog(db)
         normalized = normalize_extension_id(extension_id)
@@ -515,7 +515,7 @@ def reject_extension_request(request_id: str, payload: Dict[str, Any] = Body(def
     with LOCK:
         db = read_db()
         admin = admin_record_for(db, user.get("id"))
-        if not is_admin(admin):
+        if not is_admin(admin) or not panel_email_allowed(user):
             raise HTTPException(status_code=403, detail="No tienes permisos para revisar solicitudes")
         row = next((r for r in table(db, "extension_requests") if r.get("id") == request_id), None)
         if not row:
@@ -548,7 +548,7 @@ async def approve_extension_request(request_id: str, payload: Dict[str, Any] = B
     with LOCK:
         db = read_db()
         admin = admin_record_for(db, user.get("id"))
-        if not is_admin(admin):
+        if not is_admin(admin) or not panel_email_allowed(user):
             raise HTTPException(status_code=403, detail="No tienes permisos para habilitar extensiones")
         row = next((r for r in table(db, "extension_requests") if r.get("id") == request_id), None)
         if not row:
