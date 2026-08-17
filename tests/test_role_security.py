@@ -37,6 +37,20 @@ def client() -> TestClient:
     return TestClient(app)
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _panel_allowlist_para_pruebas():
+    # Estas pruebas validan la lógica de roles con actores @dataris-test.com;
+    # se amplía la lista blanca del panel para que el candado por email no las
+    # tape. El candado en sí se prueba en test_admin_panel_allowlist.py.
+    previo = os.environ.get("DATARIS_ADMIN_PANEL_EMAILS")
+    os.environ["DATARIS_ADMIN_PANEL_EMAILS"] = "admin@dataris.local,*@dataris-test.com"
+    yield
+    if previo is None:
+        os.environ.pop("DATARIS_ADMIN_PANEL_EMAILS", None)
+    else:
+        os.environ["DATARIS_ADMIN_PANEL_EMAILS"] = previo
+
+
 def _auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
