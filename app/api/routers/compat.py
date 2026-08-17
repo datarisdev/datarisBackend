@@ -140,10 +140,11 @@ DEFAULT_MODULES = [
     ("alertas", "Alertas inteligentes", "Detección proactiva de riesgos operativos", "Bell"),
 ]
 
-# Módulos descontinuados (Analytics, Tareas). Se filtran de las tablas en
+# Módulos descontinuados (Analytics, Tareas y Reportes de campo — José pidió
+# eliminarlo el 17 ago 2026 porque no se usará). Se filtran de las tablas en
 # normalize_db() para que desaparezcan también de cualquier ambiente que ya
 # los tuviera sembrados, sin necesitar una migración de datos aparte.
-RETIRED_MODULE_IDS = {"analytics", "tareas"}
+RETIRED_MODULE_IDS = {"analytics", "tareas", "reportes"}
 
 EXTENSION_MODULES = [
     (
