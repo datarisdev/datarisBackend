@@ -1534,6 +1534,89 @@ def list_report_records(
     return {"data": rows, "error": None, "count": len(rows)}
 
 
+# ── Reglas de alerta sobre los reportes del SIG ─────────────────────────────
+#
+# El cliente decide qué respuestas de sus formularios merecen alerta y con qué
+# prioridad ("si 'plaga detectada' contiene 'sí' → alta"). Las reglas viven por
+# empresa y el frontend las evalúa sobre los report-records ya descargados: aquí
+# sólo se validan y persisten.
+
+ALERT_PRIORITIES = ("alta", "media", "baja")
+ALERT_CONDITIONS = ("not_empty", "equals", "contains", "gt", "lt")
+MAX_ALERT_RULES = 50
+
+
+def _clean_alert_rule(raw: Dict[str, Any], *, user_id: str, company_id: Optional[str], timestamp: str, previous: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """Valida una regla del payload y la devuelve normalizada. Lanza HTTPException 400 si no es usable."""
+    field = _safe_text(raw.get("field"))
+    if not field:
+        raise HTTPException(status_code=400, detail="Cada regla necesita el campo del formulario a vigilar (field).")
+    condition = _safe_text(raw.get("condition")) or "not_empty"
+    if condition not in ALERT_CONDITIONS:
+        raise HTTPException(status_code=400, detail=f"Condición desconocida: {condition}. Usa una de {', '.join(ALERT_CONDITIONS)}.")
+    priority = _safe_text(raw.get("priority"))
+    if priority not in ALERT_PRIORITIES:
+        raise HTTPException(status_code=400, detail=f"Prioridad desconocida: {priority}. Usa una de {', '.join(ALERT_PRIORITIES)}.")
+    value = _safe_text(raw.get("value"))
+    if condition in ("equals", "contains") and not value:
+        raise HTTPException(status_code=400, detail=f"La condición {condition} necesita un valor de comparación.")
+    if condition in ("gt", "lt"):
+        try:
+            float(value)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"La condición {condition} necesita un valor numérico.")
+    rule_id = _safe_text(raw.get("id")) or str(uuid.uuid4())
+    kept = previous.get(rule_id) or {}
+    return {
+        "id": rule_id,
+        "user_id": user_id,
+        "company_id": company_id,
+        "template_key": _safe_text(raw.get("template_key")),  # vacío = todas las plantillas
+        "field": field,
+        "condition": condition,
+        "value": value,
+        "priority": priority,
+        "label": _safe_text(raw.get("label")),
+        "enabled": bool(raw.get("enabled", True)),
+        "created_at": kept.get("created_at") or timestamp,
+        "updated_at": timestamp,
+    }
+
+
+@router.get("/report-alert-rules")
+def list_report_alert_rules(authorization: Optional[str] = Header(default=None)):
+    user = _require_user(authorization); user_id = str(user.get("id") or "")
+    with LOCK:
+        db = read_db(); company_id = _company_id_for_user(db, user_id)
+        rows = [dict(row) for row in table(db, "sig_report_alert_rules") if _same_company_or_legacy_user(row, company_id=company_id, user_id=user_id)]
+    rows.sort(key=lambda row: (ALERT_PRIORITIES.index(row.get("priority")) if row.get("priority") in ALERT_PRIORITIES else len(ALERT_PRIORITIES), str(row.get("created_at") or "")))
+    return {"data": rows, "error": None, "count": len(rows)}
+
+
+@router.put("/report-alert-rules")
+def replace_report_alert_rules(payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
+    """Reemplaza el conjunto de reglas de la empresa por el que llega.
+
+    La configuración completa cabe en una pantalla, así que guardar la lista
+    entera es más simple y más robusto que un CRUD por regla: el frontend nunca
+    puede quedarse a medias entre altas y bajas.
+    """
+    user = _require_user(authorization); user_id = str(user.get("id") or "")
+    incoming = payload.get("rules")
+    if not isinstance(incoming, list):
+        raise HTTPException(status_code=400, detail="El cuerpo debe traer la lista completa en 'rules'.")
+    if len(incoming) > MAX_ALERT_RULES:
+        raise HTTPException(status_code=400, detail=f"Máximo {MAX_ALERT_RULES} reglas de alerta.")
+    timestamp = now()
+    with LOCK:
+        db = read_db(); company_id = _company_id_for_user(db, user_id); rows = table(db, "sig_report_alert_rules")
+        previous = {str(row.get("id")): row for row in rows if _same_company_or_legacy_user(row, company_id=company_id, user_id=user_id)}
+        cleaned = [_clean_alert_rule(raw if isinstance(raw, dict) else {}, user_id=user_id, company_id=company_id, timestamp=timestamp, previous=previous) for raw in incoming]
+        db["tables"]["sig_report_alert_rules"] = [row for row in rows if not _same_company_or_legacy_user(row, company_id=company_id, user_id=user_id)] + cleaned
+        write_db(db)
+    return {"data": cleaned, "error": None, "count": len(cleaned), "message": "Reglas de alerta guardadas."}
+
+
 @router.get("/harvest-overrides")
 def list_harvest_overrides(authorization: Optional[str] = Header(default=None)):
     user = _require_user(authorization); user_id = str(user.get("id") or "")
