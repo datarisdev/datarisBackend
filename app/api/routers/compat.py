@@ -567,6 +567,7 @@ def normalize_db(db: Dict[str, Any]) -> Dict[str, Any]:
 
     sync_module_catalog_metadata(tables.get("platform_modules", []), t)
     backfill_user_module_overrides(db, t)
+    cleanup_redundant_user_module_positives(db, t)
 
     ensure_commercial_demo(db, password_hash=password_hash, reset=False)
     # Lotes subidos antes del split por parcela (PR #89) guardan todas las
@@ -687,6 +688,65 @@ def backfill_user_module_overrides(db: Dict[str, Any], timestamp: str) -> Dict[s
 
     migrations[USER_MODULE_OVERRIDES_MIGRATION] = timestamp
     return {"applied": True, "rows_added": added}
+
+
+REDUNDANT_POSITIVES_MIGRATION = "user_module_redundant_positives_v1"
+
+
+def cleanup_redundant_user_module_positives(db: Dict[str, Any], timestamp: str) -> Dict[str, Any]:
+    """Retira los `true` que solo repetían el paquete de la empresa.
+
+    El alta manual anterior escribía una fila positiva por cada módulo marcado,
+    aunque el usuario ya lo heredara de su empresa. Con el modelo de overrides
+    eso deja el panel diciendo «ajuste propio» en todo y, sobre todo, confunde
+    al operador: parece que el usuario tiene decisiones que nadie tomó.
+
+    Solo se retiran las filas redundantes de módulos del producto que la empresa
+    tiene contratados; ni las negativas (son restricciones deliberadas) ni las de
+    extensiones (DigiformsApp y Graniot se conceden por su propia fila) ni las de
+    usuarios sin empresa (ahí el override es la única fuente de acceso).
+    """
+    migrations = db.setdefault("migrations", {})
+    if migrations.get(REDUNDANT_POSITIVES_MIGRATION):
+        return {"applied": False, "rows_removed": 0}
+
+    company_enabled: Dict[str, set] = {}
+    for row in table(db, "company_modules"):
+        company_id = row.get("company_id")
+        if company_id and module_access.row_is_enabled(row):
+            company_enabled.setdefault(str(company_id), set()).add(
+                module_catalog.canonical_module_id(row.get("module_id"))
+            )
+
+    admin_by_user = {
+        str(row.get("user_id")): row
+        for row in table(db, "admin_users")
+        if row.get("user_id") and row.get("is_active", True) is not False
+    }
+    extension_ids = {spec.id for spec in module_catalog.extension_specs()}
+
+    rows = table(db, "user_modules")
+    kept: List[Dict[str, Any]] = []
+    removed = 0
+    for row in rows:
+        module_id = module_catalog.canonical_module_id(row.get("module_id"))
+        user_id = row.get("user_id") or (admin_by_user_id(db, row.get("admin_user_id")) or {}).get("user_id")
+        if not user_id or module_id in extension_ids or not module_access.row_is_enabled(row):
+            kept.append(row)
+            continue
+        company_id = str(
+            (admin_by_user.get(str(user_id)) or {}).get("company_id")
+            or profile_company_id(db, str(user_id))
+            or ""
+        )
+        if company_id and module_id in company_enabled.get(company_id, set()):
+            removed += 1
+            continue
+        kept.append(row)
+
+    rows[:] = kept
+    migrations[REDUNDANT_POSITIVES_MIGRATION] = timestamp
+    return {"applied": True, "rows_removed": removed}
 
 
 def admin_by_user_id(db: Dict[str, Any], admin_user_id: Optional[str]) -> Optional[Dict[str, Any]]:

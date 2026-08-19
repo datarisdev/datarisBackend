@@ -88,3 +88,76 @@ def test_solo_se_aplica_una_vez():
     segunda = compat.backfill_user_module_overrides(db, "2026-08-19T00:00:00Z")
     assert segunda["applied"] is False
     assert len(compat.table(db, "user_modules")) == filas
+
+
+# --- Limpieza de los positivos que solo repetían el paquete ------------------
+
+
+REDUNDANTE = "usuario-redundante"
+SIN_EMPRESA = "usuario-sin-empresa"
+
+
+def _db_con_redundantes():
+    db = _db()
+    db["tables"]["admin_users"].append(
+        {"id": "a4", "user_id": REDUNDANTE, "company_id": COMPANY, "admin_role": "company_user", "is_active": True}
+    )
+    db["tables"]["user_modules"] += [
+        # Repite el paquete de su empresa: nadie decidió nada.
+        {"user_id": REDUNDANTE, "module_id": "satelite", "is_enabled": True},
+        {"user_id": REDUNDANTE, "module_id": "telemetria", "is_enabled": True},
+        # Restricción deliberada: se conserva.
+        {"user_id": REDUNDANTE, "module_id": "personal", "is_enabled": False},
+        # Extensión: se concede por su propia fila, no por el paquete.
+        {"user_id": REDUNDANTE, "module_id": "digiforms", "is_enabled": True},
+        # Sin empresa: su override es la única fuente de acceso.
+        {"user_id": SIN_EMPRESA, "module_id": "satelite", "is_enabled": True},
+    ]
+    return db
+
+
+def test_se_retiran_los_positivos_que_solo_repiten_el_paquete():
+    db = _db_con_redundantes()
+    resultado = compat.cleanup_redundant_user_module_positives(db, "2026-08-19T00:00:00Z")
+    assert resultado["applied"] is True
+    # Los dos del usuario redundante y el de satélite del restringido: ninguno
+    # decidía nada que su empresa no dijera ya.
+    assert resultado["rows_removed"] == 3
+
+    overrides = _overrides(db, REDUNDANTE)
+    assert "satelite" not in overrides and "telemetria" not in overrides
+    assert overrides["personal"] is False
+    assert overrides["digiforms"] is True
+
+
+def test_no_toca_a_quien_no_tiene_empresa():
+    db = _db_con_redundantes()
+    compat.cleanup_redundant_user_module_positives(db, "2026-08-19T00:00:00Z")
+    assert _overrides(db, SIN_EMPRESA) == {"satelite": True}
+
+
+def test_la_limpieza_solo_se_aplica_una_vez():
+    db = _db_con_redundantes()
+    compat.cleanup_redundant_user_module_positives(db, "2026-08-19T00:00:00Z")
+    filas = len(compat.table(db, "user_modules"))
+    segunda = compat.cleanup_redundant_user_module_positives(db, "2026-08-20T00:00:00Z")
+    assert segunda["applied"] is False
+    assert len(compat.table(db, "user_modules")) == filas
+
+
+def test_la_secuencia_completa_conserva_lo_que_alguien_decidio():
+    """Primero se escriben las negativas y solo después se limpian las positivas.
+
+    Es el orden en el que corren al arrancar: si se limpiara antes, el usuario
+    restringido perdería la señal de que solo tenía Satélite y recuperaría el
+    paquete entero de su empresa.
+    """
+    db = _db_con_redundantes()
+    compat.backfill_user_module_overrides(db, "2026-08-19T00:00:00Z")
+    compat.cleanup_redundant_user_module_positives(db, "2026-08-19T00:00:00Z")
+
+    restringido = _overrides(db, RESTRINGIDO)
+    assert restringido["telemetria"] is False
+    assert restringido["personal"] is False
+    # Satélite lo hereda de su empresa: ya no necesita fila propia.
+    assert "satelite" not in restringido

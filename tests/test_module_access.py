@@ -16,6 +16,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.api.routers import me_access
+from app.services import module_access
 
 COMPANY_ID = "company-1"
 USER_ID = "user-heredero"
@@ -122,3 +123,49 @@ def test_modulo_desactivado_en_la_plataforma_no_llega_a_nadie(client, monkeypatc
             row["is_active"] = False
     ids = _access(client, monkeypatch, USER_ID)["moduleIds"]
     assert "personal" not in ids
+
+
+def test_el_paquete_de_la_empresa_es_el_techo_de_los_overrides_antiguos():
+    """Un `true` heredado del sistema anterior no concede lo que la empresa no tiene.
+
+    Los usuarios dados de alta con el panel viejo llevan una fila positiva por
+    cada módulo marcado en el alta. Sin este tope quedaban inmunes al paquete de
+    su empresa: quitarle Telemetría a la empresa no les hacía nada.
+    """
+    overrides = {"satelite": True, "telemetria": True}
+    company_enabled = {"satelite"}
+
+    assert module_access.module_is_granted(
+        "satelite",
+        overrides=overrides,
+        company_enabled=company_enabled,
+        approved_extensions=set(),
+        has_company=True,
+    ) is True
+    assert module_access.module_is_granted(
+        "telemetria",
+        overrides=overrides,
+        company_enabled=company_enabled,
+        approved_extensions=set(),
+        has_company=True,
+    ) is False
+
+
+def test_sin_empresa_el_override_sigue_siendo_la_unica_fuente():
+    assert module_access.module_is_granted(
+        "telemetria",
+        overrides={"telemetria": True},
+        company_enabled=set(),
+        approved_extensions=set(),
+        has_company=False,
+    ) is True
+
+
+def test_la_extension_aprobada_cuenta_como_paquete():
+    assert module_access.module_is_granted(
+        "graniot",
+        overrides={"graniot": True},
+        company_enabled=set(),
+        approved_extensions={"graniot"},
+        has_company=True,
+    ) is True
