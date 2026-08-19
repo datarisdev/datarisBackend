@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Header, HTTPException
 
 from app.api.routers.compat import LOCK, bearer_user, read_db, table, write_db, now
+from app.services import module_access, module_catalog
 from app.services.commercial_demo_seed import is_commercial_demo_user
 from app.api.routers.compat_extensions import (
     ensure_extension_catalog,
@@ -21,7 +22,7 @@ router = APIRouter(prefix="/me", tags=["Current User Access"])
 
 
 def _is_active(row: Dict[str, Any]) -> bool:
-    return row.get("is_enabled", row.get("is_active", True)) is not False and row.get("is_active", row.get("is_enabled", True)) is not False
+    return module_access.row_is_enabled(row)
 
 
 def _normalize_module_id(value: Any) -> str:
@@ -55,7 +56,8 @@ MODULE_ALIASES: Dict[str, List[str]] = {
 # empresas cliente ni para la cuenta demo, sin importar cómo esté configurado
 # platform_modules/company_modules/user_modules. Se excluye explícitamente
 # de todo cálculo de acceso salvo para el superadmin real de la plataforma.
-INTERNAL_ONLY_MODULE_IDS = {"ml-training"}
+# La lista sale del catálogo del producto (app/services/module_catalog.py).
+INTERNAL_ONLY_MODULE_IDS = set(module_catalog.INTERNAL_ONLY_MODULE_IDS)
 
 
 def _expand_aliases(value: Any) -> List[str]:
@@ -129,6 +131,46 @@ def _access_version(db: Dict[str, Any], user_id: str, company_id: Optional[str],
     return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
 
+def _company_enabled_module_ids(db: Dict[str, Any], company_id: Optional[str]) -> set:
+    return module_access.company_enabled_module_ids(table(db, "company_modules"), company_id)
+
+
+def _user_module_overrides(db: Dict[str, Any], user_id: str, admin_user_id: Optional[str]) -> Dict[str, bool]:
+    return module_access.user_module_overrides(table(db, "user_modules"), user_id, admin_user_id)
+
+
+def _approved_extension_ids(db: Dict[str, Any], user_id: str, company_id: Optional[str]) -> set:
+    return module_access.approved_extension_ids(table(db, "extension_requests"), user_id, company_id)
+
+
+def _effective_module_ids(
+    db: Dict[str, Any],
+    *,
+    active_modules: List[Dict[str, Any]],
+    user_id: str,
+    admin_user_id: Optional[str],
+    company_id: Optional[str],
+) -> List[str]:
+    """Acceso efectivo: la empresa manda y el usuario sobrescribe módulo a módulo."""
+    company_enabled = _company_enabled_module_ids(db, company_id)
+    overrides = _user_module_overrides(db, user_id, admin_user_id)
+    approved_extensions = _approved_extension_ids(db, user_id, company_id)
+
+    granted = ["dashboard"]
+    for row in active_modules:
+        module_id = module_catalog.canonical_module_id(row.get("id") or row.get("name"))
+        if not module_id or module_id == "dashboard":
+            continue
+        if module_access.module_is_granted(
+            module_id,
+            overrides=overrides,
+            company_enabled=company_enabled,
+            approved_extensions=approved_extensions,
+        ):
+            granted.append(module_id)
+    return _unique(granted)
+
+
 @router.get("/access")
 def get_current_access(authorization: Optional[str] = Header(default=None)):
     user = bearer_user(authorization)
@@ -166,20 +208,13 @@ def get_current_access(authorization: Optional[str] = Header(default=None)):
         if is_demo or is_superadmin:
             effective_ids = _unique(["dashboard", *active_platform_ids])
         else:
-            company_module_ids = _unique([
-                row.get("module_id")
-                for row in table(db, "company_modules")
-                if company_id and row.get("company_id") == company_id and _is_active(row)
-            ])
-            user_module_ids = _unique([
-                row.get("module_id")
-                for row in table(db, "user_modules")
-                if (row.get("user_id") == user_id or (admin_user_id and row.get("admin_user_id") == admin_user_id)) and _is_active(row)
-            ])
-            effective_ids = _unique(["dashboard", *(user_module_ids if user_module_ids else company_module_ids)])
-            if active_platform_ids:
-                active_set = set(active_platform_ids)
-                effective_ids = [module_id for module_id in effective_ids if module_id == "dashboard" or module_id in active_set]
+            effective_ids = _effective_module_ids(
+                db,
+                active_modules=active_modules,
+                user_id=user_id,
+                admin_user_id=admin_user_id,
+                company_id=company_id,
+            )
 
         if not is_dataris_admin:
             effective_ids = [module_id for module_id in effective_ids if module_id not in INTERNAL_ONLY_MODULE_IDS]
