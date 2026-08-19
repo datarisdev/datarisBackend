@@ -166,6 +166,7 @@ def _effective_module_ids(
             overrides=overrides,
             company_enabled=company_enabled,
             approved_extensions=approved_extensions,
+            has_company=bool(company_id),
         ):
             granted.append(module_id)
     return _unique(granted)

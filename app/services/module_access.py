@@ -89,6 +89,38 @@ def module_is_granted(
     overrides: Dict[str, bool],
     company_enabled: Set[str],
     approved_extensions: Set[str],
+    has_company: bool = False,
 ) -> bool:
+    """El paquete de la empresa es el techo; el usuario solo puede quedarse corto.
+
+    Un `override` en `true` NO concede un módulo del producto que la empresa no
+    tiene contratado. Sin este tope, los usuarios dados de alta con el sistema
+    anterior (que escribía una fila positiva por cada módulo marcado en el alta)
+    quedaban inmunes al paquete de su empresa: quitarle un módulo a la empresa
+    no les hacía nada, que era justo el síntoma reportado.
+
+    Dos excepciones, ambas del producto y no del cálculo:
+
+    - las extensiones (DigiformsApp, Graniot) se conceden por solicitud
+      aprobada, que deja la fila del usuario sin pasar por `company_modules`; y
+    - un usuario sin empresa no hereda nada, así que sus overrides son su única
+      fuente de acceso.
+    """
     inherited = module_id in company_enabled or module_id in approved_extensions
-    return overrides.get(module_id, inherited)
+    override = overrides.get(module_id)
+    if override is False:
+        return False
+    if has_company and not inherited and is_company_package_module(module_id):
+        return False
+    return True if override is True else inherited
+
+
+def is_company_package_module(module_id: str) -> bool:
+    """¿El módulo forma parte del paquete que contrata una empresa?
+
+    Las extensiones no: tienen su propio circuito de solicitud y aprobación.
+    Un módulo que no esté en el catálogo se trata como parte del paquete, que es
+    la lectura prudente (no concede de más).
+    """
+    spec = module_catalog.SPECS_BY_ID.get(module_id)
+    return spec is None or spec.category != module_catalog.CATEGORY_EXTENSION

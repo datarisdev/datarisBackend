@@ -165,6 +165,7 @@ def _user_summary(db: Dict[str, Any], user: Dict[str, Any], companies: Dict[str,
             overrides=overrides,
             company_enabled=company_enabled,
             approved_extensions=approved,
+            has_company=bool(company_id),
         ):
             effective.add(module_id)
 
@@ -436,10 +437,24 @@ def _user_detail(db: Dict[str, Any], user_id: str) -> Dict[str, Any]:
             effective, source = True, "system"
         elif not card["platform_active"]:
             effective, source = False, "platform_off"
-        elif override is not None:
-            effective, source = override, "user"
         else:
-            effective, source = inherited, ("company" if inherited else "none")
+            effective = module_access.module_is_granted(
+                module_id,
+                overrides=overrides,
+                company_enabled=company_enabled,
+                approved_extensions=approved,
+                has_company=bool(company_id),
+            )
+            if override is False:
+                source = "user"
+            elif not inherited and company_id:
+                # Un override en `true` sobre algo que la empresa no tiene
+                # contratado no concede nada: manda el paquete.
+                source = "company_off"
+            elif override is True:
+                source = "user"
+            else:
+                source = "company" if inherited else "none"
         card.update({
             "company_enabled": module_id in company_enabled,
             "approved_extension": module_id in approved,
