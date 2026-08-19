@@ -37,6 +37,7 @@ from app.core.config import settings
 from app.services.telemetry.helicopter_processor import process_helicopter_zip
 from app.services.telemetry.aerial_copilot import process_aerial_copilot
 from app.utils.geojson_normalizer import normalize_record_geometries
+from app.services import module_access, module_catalog
 from app.services.commercial_demo_seed import ensure_commercial_demo, is_commercial_demo_user
 from app.services.parcel_split_migration import split_multi_feature_parcels
 from app.utils.azure_blob import azure_blob_storage_disabled
@@ -128,17 +129,10 @@ PARCEL_CHILD_TABLES = {
     "analysis_sessions",
 }
 
-DEFAULT_MODULES = [
-    ("dashboard", "Dashboard", "Panel principal", "LayoutDashboard"),
-    ("satelite", "Monitoreo Satelital", "Análisis satelital", "Satellite"),
-    ("mapeo", "Mapeo", "Mapeo y análisis geoespacial", "Map"),
-    ("telemetria", "Telemetría", "Indicadores y métricas", "Activity"),
-    ("ortofoto-analysis", "Análisis de ortofotos", "Procesamiento visual de ortomosaicos", "Image"),
-    ("sig-agricola", "SIG Agrícola", "Análisis agrícola", "Sprout"),
-    ("aplicaciones-aereas", "Aplicaciones Aéreas", "Control de aplicaciones", "Plane"),
-    ("personal", "Personal de Campo", "Control biométrico y georreferenciado", "Users"),
-    ("alertas", "Alertas inteligentes", "Detección proactiva de riesgos operativos", "Bell"),
-]
+# El catálogo de módulos lo define el producto (app/services/module_catalog.py),
+# no una fila que alguien pueda inventar desde el panel: cada módulo es una ruta
+# y un guardián `requiredModuleId` en el frontend.
+DEFAULT_MODULES = module_catalog.default_catalog_rows()
 
 # Módulos descontinuados (Analytics, Tareas y Reportes de campo — José pidió
 # eliminarlo el 17 ago 2026 porque no se usará). Se filtran de las tablas en
@@ -147,18 +141,8 @@ DEFAULT_MODULES = [
 RETIRED_MODULE_IDS = {"analytics", "tareas", "reportes"}
 
 EXTENSION_MODULES = [
-    (
-        "digiforms",
-        "DigiformsApp",
-        "Formularios digitales de campo, captura offline, GPS, fotos y reportes desde DigiformsApp.",
-        "FileText",
-    ),
-    (
-        "graniot",
-        "Graniot",
-        "Integración para capas satelitales, NDVI, fechas, estadísticas y sincronización de lotes desde Graniot.",
-        "Leaf",
-    ),
+    (spec.id, spec.name, spec.description, spec.icon)
+    for spec in module_catalog.extension_specs()
 ]
 
 
@@ -283,10 +267,10 @@ def default_db() -> Dict[str, Any]:
                 {"id": str(uuid.uuid4()), "company_id": company_id, "module_id": m["id"], "is_enabled": True, "created_at": created, "updated_at": created}
                 for m in modules
             ],
-            "user_modules": [
-                {"id": str(uuid.uuid4()), "user_id": admin_id, "admin_user_id": None, "module_id": m["id"], "is_active": True, "created_at": created, "updated_at": created}
-                for m in modules
-            ],
+            # El superadmin ve la plataforma completa por su rol: no necesita
+            # filas en `user_modules` (que ahora son overrides por usuario y
+            # aparecerían en el panel como "ajustes propios" inexistentes).
+            "user_modules": [],
             "parcels": [],
             "satellite_images": [],
             "satellite_comparisons": [],
@@ -581,6 +565,9 @@ def normalize_db(db: Dict[str, Any]) -> Dict[str, Any]:
             m for m in tables.get("user_modules", []) if m.get("module_id") not in RETIRED_MODULE_IDS
         ]
 
+    sync_module_catalog_metadata(tables.get("platform_modules", []), t)
+    backfill_user_module_overrides(db, t)
+
     ensure_commercial_demo(db, password_hash=password_hash, reset=False)
     # Lotes subidos antes del split por parcela (PR #89) guardan todas las
     # parcelas en una sola fila; se dividen aquí para que la vista satelital
@@ -588,6 +575,133 @@ def normalize_db(db: Dict[str, Any]) -> Dict[str, Any]:
     # resultado al detectar el cambio; después es un no-op.
     split_multi_feature_parcels(db, timestamp=t)
     return db
+
+def sync_module_catalog_metadata(modules: List[Dict[str, Any]], timestamp: str) -> None:
+    """Alinea nombre/descripción/icono con el catálogo del producto.
+
+    Lo único que decide el operador es `is_active`; el resto de la ficha vive en
+    el código, así que se refresca aquí para que el panel no muestre etiquetas de
+    una versión anterior del producto.
+    """
+    for row in modules:
+        spec = module_catalog.spec_for(row.get("id") or row.get("name"))
+        if not spec:
+            continue
+        if (row.get("name"), row.get("description"), row.get("icon")) == (spec.name, spec.description, spec.icon):
+            continue
+        row["name"] = spec.name
+        row["description"] = spec.description
+        row["icon"] = spec.icon
+        row["updated_at"] = timestamp
+
+
+USER_MODULE_OVERRIDES_MIGRATION = "user_module_overrides_v1"
+
+
+def backfill_user_module_overrides(db: Dict[str, Any], timestamp: str) -> Dict[str, Any]:
+    """Convierte las filas de `user_modules` en overrides explícitos.
+
+    Hasta ahora `user_modules` funcionaba como lista blanca: si un usuario tenía
+    aunque fuera UNA fila, esa lista sustituía por completo a los módulos de su
+    empresa. Eso producía dos fallos serios:
+
+    - apagar todos los módulos de un usuario borraba todas sus filas y el cálculo
+      caía al fallback de la empresa, devolviéndoselos todos; y
+    - aprobar una extensión (DigiformsApp/Graniot) creaba la primera fila del
+      usuario y, de golpe, le quitaba todo lo que heredaba de su empresa.
+
+    El modelo nuevo es override por módulo: la empresa manda y la fila del
+    usuario decide solo sobre SU módulo (`is_enabled` explícito). Para que nadie
+    gane accesos con el despliegue, este backfill escribe el `false` explícito de
+    los módulos core que el usuario no tenía. Se salta a los usuarios cuyas
+    únicas filas eran de extensión: ahí nunca hubo una restricción deliberada
+    (heredaban de la empresa hasta que la aprobación creó la fila), así que
+    recuperan la herencia — que es justamente el fallo que se está corrigiendo.
+    """
+    migrations = db.setdefault("migrations", {})
+    if migrations.get(USER_MODULE_OVERRIDES_MIGRATION):
+        return {"applied": False, "rows_added": 0}
+
+    rows = table(db, "user_modules")
+    core_ids = [spec.id for spec in module_catalog.core_specs() if spec.assignable]
+
+    company_enabled: Dict[str, set] = {}
+    for row in table(db, "company_modules"):
+        company_id = row.get("company_id")
+        if not company_id:
+            continue
+        if not module_access.row_is_enabled(row):
+            continue
+        company_enabled.setdefault(str(company_id), set()).add(module_catalog.canonical_module_id(row.get("module_id")))
+
+    admin_by_user = {
+        str(row.get("user_id")): row
+        for row in table(db, "admin_users")
+        if row.get("user_id") and row.get("is_active", True) is not False
+    }
+
+    positives_by_user: Dict[str, set] = {}
+    for row in rows:
+        user_id = row.get("user_id") or (admin_by_user_id(db, row.get("admin_user_id")) or {}).get("user_id")
+        if not user_id:
+            continue
+        if not module_access.row_is_enabled(row):
+            continue
+        positives_by_user.setdefault(str(user_id), set()).add(module_catalog.canonical_module_id(row.get("module_id")))
+
+    existing_pairs = {
+        (
+            str(row.get("user_id") or (admin_by_user_id(db, row.get("admin_user_id")) or {}).get("user_id") or ""),
+            module_catalog.canonical_module_id(row.get("module_id")),
+        )
+        for row in rows
+    }
+
+    added = 0
+    for user_id, granted in positives_by_user.items():
+        granted_core = {mid for mid in granted if mid in core_ids}
+        if not granted_core:
+            # Solo tenía extensiones: no había restricción que preservar.
+            continue
+        admin_row = admin_by_user.get(user_id) or {}
+        company_id = str(admin_row.get("company_id") or profile_company_id(db, user_id) or "")
+        inherited = company_enabled.get(company_id, set()) if company_id else set()
+        for module_id in core_ids:
+            if module_id in granted_core or module_id not in inherited:
+                continue
+            if (user_id, module_id) in existing_pairs:
+                continue
+            existing_pairs.add((user_id, module_id))
+            rows.append({
+                "id": str(uuid.uuid4()),
+                "user_id": user_id,
+                "admin_user_id": admin_row.get("id"),
+                "module_id": module_id,
+                "is_enabled": False,
+                "is_active": True,
+                "source": USER_MODULE_OVERRIDES_MIGRATION,
+                "created_at": timestamp,
+                "updated_at": timestamp,
+            })
+            added += 1
+
+    migrations[USER_MODULE_OVERRIDES_MIGRATION] = timestamp
+    return {"applied": True, "rows_added": added}
+
+
+def admin_by_user_id(db: Dict[str, Any], admin_user_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not admin_user_id:
+        return None
+    return next((row for row in table(db, "admin_users") if row.get("id") == admin_user_id), None)
+
+
+def profile_company_id(db: Dict[str, Any], user_id: str) -> Optional[str]:
+    profile = next(
+        (row for row in table(db, "profiles") if str(row.get("user_id") or row.get("id") or "") == str(user_id)),
+        None,
+    )
+    return (profile or {}).get("company_id")
+
 
 def table(db: Dict[str, Any], name: str) -> List[Dict[str, Any]]:
     return db.setdefault("tables", {}).setdefault(name, [])
@@ -1393,13 +1507,19 @@ def create_manual_admin_user(payload: Dict[str, Any] = Body(default_factory=dict
             if assigned_hectares > max(0, max_hectares - used):
                 raise HTTPException(status_code=400, detail="Las hectáreas asignadas superan el disponible de la empresa")
 
-        if not is_super_admin and company_id:
-            enabled_company_modules = {
-                row.get("module_id")
-                for row in table(db, "company_modules")
-                if row.get("company_id") == company_id and row.get("is_enabled", True)
-            }
-            selected_modules = [module_id for module_id in selected_modules if module_id in enabled_company_modules]
+        if company_id:
+            # El paquete de la empresa es el techo, también para el superadmin:
+            # conceder por usuario algo que su empresa no tiene contratado
+            # dejaba accesos imposibles de encontrar después. Si hace falta, se
+            # añade primero a la empresa.
+            enabled_company_modules = module_access.company_enabled_module_ids(
+                table(db, "company_modules"), company_id
+            )
+            selected_modules = [
+                module_id
+                for module_id in selected_modules
+                if module_catalog.canonical_module_id(module_id) in enabled_company_modules
+            ]
 
         t = now()
         user_id = str(uuid.uuid4())
@@ -1461,16 +1581,25 @@ def create_manual_admin_user(payload: Dict[str, Any] = Body(default_factory=dict
         table(db, "admin_users").append(admin_row)
 
         valid_modules = {m.get("id") for m in table(db, "platform_modules") if m.get("is_active", True)}
-        for module_id in selected_modules:
+        chosen = {module_catalog.canonical_module_id(m) for m in selected_modules if m in valid_modules}
+        inherited = module_access.company_enabled_module_ids(table(db, "company_modules"), company_id)
+
+        # Solo se guarda lo que difiere del paquete de la empresa: conceder por
+        # usuario lo que ya hereda lo dejaría anclado a la foto de hoy, y quitar
+        # algo exige la negativa explícita para que el cálculo no lo herede.
+        for module_id in sorted(chosen | inherited):
             if module_id not in valid_modules:
+                continue
+            enabled = module_id in chosen
+            if enabled and module_id in inherited:
                 continue
             table(db, "user_modules").append({
                 "id": str(uuid.uuid4()),
                 "user_id": user_id,
                 "admin_user_id": admin_user_id,
                 "module_id": module_id,
-                "is_enabled": True,
-                "is_active": True,
+                "is_enabled": enabled,
+                "is_active": enabled,
                 "created_at": t,
                 "updated_at": t,
             })
@@ -1647,17 +1776,9 @@ def onboard_client(payload: Dict[str, Any] = Body(default_factory=dict), authori
         }
         table(db, "admin_users").append(admin_row)
 
-        for module_id in module_ids:
-            table(db, "user_modules").append({
-                "id": str(uuid.uuid4()),
-                "user_id": user_id,
-                "admin_user_id": admin_user_id,
-                "module_id": module_id,
-                "is_enabled": True,
-                "is_active": True,
-                "created_at": t,
-                "updated_at": t,
-            })
+        # El administrador del cliente hereda el paquete de su empresa: no se
+        # duplica en `user_modules`. Una fila por usuario es un override y solo
+        # debe existir cuando alguien decide algo distinto para esa persona.
 
         write_db(db)
 
@@ -1848,6 +1969,27 @@ def guard_privileged_table_write(db: Dict[str, Any], table_name: str, user: Opti
         raise HTTPException(status_code=403, detail="No autorizado para modificar accesos o roles")
 
 
+def guard_module_catalog_write(table_name: str, operation: str) -> None:
+    """El catálogo de módulos no se crea ni se borra desde el panel.
+
+    Un módulo es código (una ruta y su guardián en el frontend). Las filas que se
+    creaban a mano nacían con un `id` UUID sin ruta detrás — se activaban y no
+    aparecía nada en la plataforma — y las que se borraban volvían solas en el
+    siguiente arranque porque `normalize_db()` resiembra el catálogo. Lo único
+    que el operador decide es si el módulo está activo (y su ficha la manda
+    app/services/module_catalog.py).
+    """
+    if table_name != "platform_modules" or operation not in {"insert", "upsert", "delete"}:
+        return
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "El catálogo de módulos lo define el producto: se pueden activar o desactivar, "
+            "pero no crear ni eliminar módulos desde el panel."
+        ),
+    )
+
+
 @router.post("/tables/{table_name}/insert")
 def insert(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
     user = bearer_user(authorization)
@@ -1857,6 +1999,7 @@ def insert(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict)
         db = read_db()
         guard_parcel_table_write(db, table_name, user)
         guard_privileged_table_write(db, table_name, user)
+        guard_module_catalog_write(table_name, "insert")
         for item in items:
             guard_admin_users_write(db, table_name, user, item if isinstance(item, dict) else None)
         rows = table(db, table_name)
@@ -1894,6 +2037,7 @@ def upsert(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict)
         db = read_db()
         guard_parcel_table_write(db, table_name, user)
         guard_privileged_table_write(db, table_name, user)
+        guard_module_catalog_write(table_name, "upsert")
         for item in items:
             guard_admin_users_write(db, table_name, user, item if isinstance(item, dict) else None)
         rows = table(db, table_name)
@@ -1969,6 +2113,7 @@ def delete(
         db = read_db()
         guard_parcel_table_write(db, table_name, user)
         guard_privileged_table_write(db, table_name, user)
+        guard_module_catalog_write(table_name, "delete")
         actor = guard_admin_users_write(db, table_name, user)
         rows = table(db, table_name)
         scoped_rows = scoped_table_rows(db, table_name, user)
