@@ -2029,6 +2029,30 @@ def guard_privileged_table_write(db: Dict[str, Any], table_name: str, user: Opti
         raise HTTPException(status_code=403, detail="No autorizado para modificar accesos o roles")
 
 
+def guard_profile_country_write(db: Dict[str, Any], table_name: str, user: Optional[Dict[str, Any]], items: List[Any]) -> None:
+    """El país del perfil lo fija la administración, no quien usa la plataforma.
+
+    El país decide con qué marca se sirve el producto (Innovagro en México,
+    Dataris en el resto), así que no puede quedar en manos del propio usuario:
+    cualquiera podría cambiarse de marca desde su perfil. El campo ya no se
+    ofrece en la pantalla de perfil, pero eso solo lo esconde; la garantía está
+    aquí.
+
+    Se descarta el campo en lugar de rechazar la petición para que el resto del
+    perfil se siga guardando: los navegadores con la versión anterior de la
+    interfaz todavía lo envían, y no deben llevarse un error por ello. Como el
+    guardado hace merge, el país que puso la administración se conserva.
+    """
+    if table_name != "profiles":
+        return
+    actor = active_admin_row(db, str((user or {}).get("id") or "")) if user else None
+    if (actor or {}).get("admin_role") in {"superadmin", "company_admin"}:
+        return
+    for item in items:
+        if isinstance(item, dict):
+            item.pop("country", None)
+
+
 def guard_module_catalog_write(table_name: str, operation: str) -> None:
     """El catálogo de módulos no se crea ni se borra desde el panel.
 
@@ -2060,6 +2084,7 @@ def insert(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict)
         guard_parcel_table_write(db, table_name, user)
         guard_privileged_table_write(db, table_name, user)
         guard_module_catalog_write(table_name, "insert")
+        guard_profile_country_write(db, table_name, user, items)
         for item in items:
             guard_admin_users_write(db, table_name, user, item if isinstance(item, dict) else None)
         rows = table(db, table_name)
@@ -2098,6 +2123,7 @@ def upsert(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict)
         guard_parcel_table_write(db, table_name, user)
         guard_privileged_table_write(db, table_name, user)
         guard_module_catalog_write(table_name, "upsert")
+        guard_profile_country_write(db, table_name, user, items)
         for item in items:
             guard_admin_users_write(db, table_name, user, item if isinstance(item, dict) else None)
         rows = table(db, table_name)
@@ -2147,6 +2173,7 @@ def update(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict)
         guard_parcel_table_write(db, table_name, user)
         guard_privileged_table_write(db, table_name, user)
         actor = guard_admin_users_write(db, table_name, user, payload.get("data") if isinstance(payload.get("data"), dict) else None)
+        guard_profile_country_write(db, table_name, user, [payload.get("data")])
         rows = scoped_table_rows(db, table_name, user)
         targets = apply_filters(rows, payload.get("filters") or [])
         targets = admin_users_rows_in_scope(db, table_name, actor, targets)
