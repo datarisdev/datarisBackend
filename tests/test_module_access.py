@@ -163,9 +163,33 @@ def test_sin_empresa_el_override_sigue_siendo_la_unica_fuente():
 
 def test_la_extension_aprobada_cuenta_como_paquete():
     assert module_access.module_is_granted(
-        "graniot",
-        overrides={"graniot": True},
+        "digiforms",
+        overrides={"digiforms": True},
         company_enabled=set(),
-        approved_extensions={"graniot"},
+        approved_extensions={"digiforms"},
         has_company=True,
     ) is True
+
+
+def test_una_solicitud_de_graniot_ya_no_salta_el_techo_de_la_empresa():
+    """Graniot se unificó con Monitoreo Satelital y dejó de ser extensión.
+
+    Su solicitud aprobada no puede seguir concediendo un módulo del paquete por
+    encima de lo contratado: ese acceso lo escribió la migración en
+    `company_modules`.
+    """
+    requests = [{
+        "status": "approved",
+        "extension_id": "graniot",
+        "company_id": COMPANY_ID,
+        "requested_by_user_id": USER_ID,
+    }]
+    assert module_access.approved_extension_ids(requests, USER_ID, COMPANY_ID) == set()
+
+    assert module_access.module_is_granted(
+        "satelite",
+        overrides={},
+        company_enabled=set(),
+        approved_extensions=set(),
+        has_company=True,
+    ) is False

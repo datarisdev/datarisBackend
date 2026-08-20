@@ -566,6 +566,7 @@ def normalize_db(db: Dict[str, Any]) -> Dict[str, Any]:
         ]
 
     sync_module_catalog_metadata(tables.get("platform_modules", []), t)
+    merge_graniot_into_satelite(db, t)
     backfill_user_module_overrides(db, t)
     cleanup_redundant_user_module_positives(db, t)
 
@@ -688,6 +689,153 @@ def backfill_user_module_overrides(db: Dict[str, Any], timestamp: str) -> Dict[s
 
     migrations[USER_MODULE_OVERRIDES_MIGRATION] = timestamp
     return {"applied": True, "rows_added": added}
+
+
+GRANIOT_MERGE_MIGRATION = "graniot_merged_into_satelite_v1"
+
+
+def admin_row_for_user(db: Dict[str, Any], user_id: str) -> Optional[Dict[str, Any]]:
+    """Ficha de administración de un usuario, buscada por `user_id`."""
+    return next(
+        (
+            row
+            for row in table(db, "admin_users")
+            if str(row.get("user_id") or "") == str(user_id) and row.get("is_active", True) is not False
+        ),
+        None,
+    )
+
+
+def merge_graniot_into_satelite(db: Dict[str, Any], timestamp: str) -> Dict[str, Any]:
+    """Graniot deja de ser un módulo aparte: era el mismo Monitoreo Satelital.
+
+    La pantalla de Monitoreo Satelital se alimenta de Graniot y la extensión no
+    daba nada más, así que tener las dos filas en el catálogo solo confundía a
+    quien reparte accesos. El catálogo ya solo conoce `satelite`, y `graniot`
+    quedó como alias histórico suyo.
+
+    Aquí se mueven los datos para que la unificación no le quite acceso a nadie:
+    quien tuviera Graniot —fila de empresa, fila de usuario o solicitud de
+    extensión aprobada— pasa a tener `satelite` en el mismo sitio donde lo
+    tenía. Después se retiran las filas de `graniot`, que ya no significan nada.
+
+    Detalles que importan:
+
+    - Las filas NEGATIVAS de `graniot` (alguien a quien se le había quitado la
+      extensión) no se convierten: escribir ese `false` sobre `satelite` le
+      quitaría una pantalla que sí tenía. Se descartan.
+    - Si ya existe una fila de `satelite` para esa empresa o ese usuario, manda
+      la que ya estaba; la de Graniot se descarta en vez de duplicar.
+    - Las solicitudes de extensión se conservan como histórico del panel; lo que
+      concedían se escribe en `company_modules` (o en `user_modules` si el
+      solicitante no tiene empresa), que es donde vive el acceso a un módulo del
+      paquete.
+    """
+    migrations = db.setdefault("migrations", {})
+    if migrations.get(GRANIOT_MERGE_MIGRATION):
+        return {"applied": False, "companies": 0, "users": 0, "rows_removed": 0}
+
+    def is_graniot(value: Any) -> bool:
+        return module_catalog.normalize_module_id(value) == "graniot"
+
+    def is_satelite(value: Any) -> bool:
+        return module_catalog.normalize_module_id(value) == "satelite"
+
+    companies = 0
+    users = 0
+    removed = 0
+
+    company_rows = table(db, "company_modules")
+    company_with_satelite = {
+        str(row.get("company_id"))
+        for row in company_rows
+        if row.get("company_id") and is_satelite(row.get("module_id"))
+    }
+    kept_company: List[Dict[str, Any]] = []
+    for row in company_rows:
+        if not is_graniot(row.get("module_id")):
+            kept_company.append(row)
+            continue
+        company_id = str(row.get("company_id") or "")
+        if module_access.row_is_enabled(row) and company_id and company_id not in company_with_satelite:
+            row["module_id"] = "satelite"
+            row["updated_at"] = timestamp
+            company_with_satelite.add(company_id)
+            kept_company.append(row)
+            companies += 1
+            continue
+        removed += 1
+    company_rows[:] = kept_company
+
+    user_rows = table(db, "user_modules")
+    user_with_satelite = {
+        str(row.get("user_id") or row.get("admin_user_id") or "")
+        for row in user_rows
+        if is_satelite(row.get("module_id"))
+    }
+    kept_user: List[Dict[str, Any]] = []
+    for row in user_rows:
+        if not is_graniot(row.get("module_id")):
+            kept_user.append(row)
+            continue
+        key = str(row.get("user_id") or row.get("admin_user_id") or "")
+        if module_access.row_is_enabled(row) and key and key not in user_with_satelite:
+            row["module_id"] = "satelite"
+            row["updated_at"] = timestamp
+            user_with_satelite.add(key)
+            kept_user.append(row)
+            users += 1
+            continue
+        removed += 1
+    user_rows[:] = kept_user
+
+    for request in table(db, "extension_requests"):
+        if not is_graniot(request.get("extension_id")):
+            continue
+        if request.get("status") not in {"approved", "enabled"}:
+            continue
+        company_id = str(request.get("company_id") or "")
+        if company_id:
+            if company_id in company_with_satelite:
+                continue
+            company_rows.append({
+                "id": str(uuid.uuid4()),
+                "company_id": company_id,
+                "module_id": "satelite",
+                "is_enabled": True,
+                "is_active": True,
+                "source": GRANIOT_MERGE_MIGRATION,
+                "created_at": timestamp,
+                "updated_at": timestamp,
+            })
+            company_with_satelite.add(company_id)
+            companies += 1
+            continue
+        user_id = str(request.get("requested_by_user_id") or "")
+        if not user_id or user_id in user_with_satelite:
+            continue
+        admin = admin_row_for_user(db, user_id)
+        user_rows.append({
+            "id": str(uuid.uuid4()),
+            "user_id": user_id,
+            "admin_user_id": admin.get("id") if admin else None,
+            "module_id": "satelite",
+            "is_enabled": True,
+            "is_active": True,
+            "source": GRANIOT_MERGE_MIGRATION,
+            "created_at": timestamp,
+            "updated_at": timestamp,
+        })
+        user_with_satelite.add(user_id)
+        users += 1
+
+    platform_rows = table(db, "platform_modules")
+    before = len(platform_rows)
+    platform_rows[:] = [row for row in platform_rows if not is_graniot(row.get("id"))]
+    removed += before - len(platform_rows)
+
+    migrations[GRANIOT_MERGE_MIGRATION] = timestamp
+    return {"applied": True, "companies": companies, "users": users, "rows_removed": removed}
 
 
 REDUNDANT_POSITIVES_MIGRATION = "user_module_redundant_positives_v1"

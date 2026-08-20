@@ -63,11 +63,11 @@ MODULE_SPECS: Tuple[ModuleSpec, ...] = (
     ModuleSpec(
         id="satelite",
         name="Monitoreo Satelital",
-        description="Análisis satelital de los lotes: índices, fechas y comparativas.",
+        description="Análisis satelital de los lotes: capas, índices de vegetación, fechas disponibles, estadísticas y comparativas.",
         icon="Satellite",
         category=CATEGORY_CORE,
         surface=SURFACE_MENU,
-        surface_hint="Menú lateral › Cartografía › Monitoreo satelital.",
+        surface_hint="Menú lateral › Cartografía › Monitoreo satelital. Incluye las capas satelitales de la Zona de Análisis.",
         routes=("/satelite",),
     ),
     ModuleSpec(
@@ -151,16 +151,6 @@ MODULE_SPECS: Tuple[ModuleSpec, ...] = (
         routes=("/digiforms",),
     ),
     ModuleSpec(
-        id="graniot",
-        name="Graniot",
-        description="Integración para capas satelitales, NDVI, fechas, estadísticas y sincronización de lotes desde Graniot.",
-        icon="Leaf",
-        category=CATEGORY_EXTENSION,
-        surface=SURFACE_EMBEDDED,
-        surface_hint="Extensión: alimenta las capas satelitales de la Zona de Análisis, sin entrada propia.",
-        routes=(),
-    ),
-    ModuleSpec(
         id="ml-training",
         name="Laboratorio de IA",
         description="Entrenamiento de modelos con datos de la plataforma. Herramienta interna de Dataris.",
@@ -198,10 +188,12 @@ MODULE_ALIASES: Dict[str, Tuple[str, ...]] = {
     "sig-agricola": ("sig-agricola", "sig_agricola", "sig"),
     "aplicaciones-aereas": ("aplicaciones-aereas", "aplicaciones_aereas", "drones", "drone", "helicoptero", "helicopter", "avioneta"),
     "ortofoto-analysis": ("ortofoto-analysis", "ortofoto_analysis", "ortofotos", "analisis-ortofotos", "analisis_de_ortofotos"),
-    "satelite": ("satelite", "satellite", "satélite"),
+    # Graniot era una extensión aparte que daba exactamente lo mismo: las capas
+    # satelitales de los lotes. Se unificó con Monitoreo Satelital, así que todo
+    # lo concedido con el id viejo sigue resolviendo al módulo de siempre.
+    "satelite": ("satelite", "satellite", "satélite", "graniot"),
     "telemetria": ("telemetria", "telemetría", "telemetry"),
     "digiforms": ("digiforms", "digiformsapp", "digiforms-app"),
-    "graniot": ("graniot",),
     "ml-training": ("ml-training", "ml_training", "laboratorio-ia", "laboratorio_ia"),
 }
 
