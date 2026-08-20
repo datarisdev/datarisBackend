@@ -145,6 +145,14 @@ def stored_row() -> dict:
     return next(p for p in graniot.table(db, "parcels") if p["id"] == LOCAL_ID)
 
 
+def wait_for_stores(timeout: float = 5.0) -> None:
+    """El guardado de la clave renovada va en segundo plano; se espera a que termine."""
+    import time as _time
+    deadline = _time.time() + timeout
+    while _time.time() < deadline and any(t.is_alive() for t in graniot._WMS_STORE_THREADS):
+        _time.sleep(0.05)
+
+
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch, tmp_path):
     monkeypatch.setattr(graniot, "GraniotClient", FakeGraniotClient)
@@ -197,6 +205,7 @@ def test_la_clave_nueva_se_guarda_en_la_subparcela_y_no_pisa_al_padre():
     client = TestClient(app)
     assert client.get("/api/graniot/wms-proxy", params=proxy_params(SUB_B)).status_code == 200
 
+    wait_for_stores()
     row = stored_row()
     sub_b = next(s for s in row["graniot_parcels"] if s["graniot_parcel_id"] == SUB_B["id"])
     sub_a = next(s for s in row["graniot_parcels"] if s["graniot_parcel_id"] == SUB_A["id"])

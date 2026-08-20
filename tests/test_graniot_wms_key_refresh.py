@@ -130,6 +130,14 @@ BASE_ROW = {
 }
 
 
+def wait_for_stores(timeout: float = 5.0) -> None:
+    """El guardado de la clave renovada va en segundo plano; se espera a que termine."""
+    import time as _time
+    deadline = _time.time() + timeout
+    while _time.time() < deadline and any(t.is_alive() for t in graniot._WMS_STORE_THREADS):
+        _time.sleep(0.05)
+
+
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch, tmp_path):
     monkeypatch.setattr(graniot, "GraniotClient", FakeGraniotClient)
@@ -223,6 +231,7 @@ def test_la_clave_renovada_queda_guardada_para_la_proxima_vez():
         "layer": "NDVI",
     })
 
+    wait_for_stores()
     db = graniot.read_db()
     row = next(p for p in graniot.table(db, "parcels") if p["id"] == LOCAL_ID)
     assert row["graniot_wms_access_key"] == FRESH_KEY

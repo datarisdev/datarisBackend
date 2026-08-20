@@ -8,6 +8,7 @@ import logging
 import time as time_module
 import uuid
 import asyncio
+import threading
 import hashlib
 import tempfile
 import httpx
@@ -1458,6 +1459,31 @@ def _store_recovered_wms_data(local: Optional[Dict[str, Any]], data: Optional[Di
             "exception_type": type(exc).__name__,
             "message": str(exc),
         })
+
+
+_WMS_STORE_THREADS: List[threading.Thread] = []
+
+
+def _store_recovered_wms_data_in_background(local: Optional[Dict[str, Any]], data: Optional[Dict[str, Any]]) -> None:
+    """Persiste la clave renovada sin retrasar la imagen.
+
+    Graniot re-firma la clave en cada lectura, así que casi siempre hay algo
+    que guardar, y guardar es reescribir el JSON completo de la plataforma en
+    Neon: 19 s medidos en producción. La imagen no tiene por qué esperar a eso.
+    Va en un hilo propio (no en el event loop): el guardado captura sus
+    excepciones y LOCK es un RLock, así que es seguro con el resto del proceso.
+    """
+    if not local or not data:
+        return
+    _WMS_STORE_THREADS[:] = [t for t in _WMS_STORE_THREADS if t.is_alive()]
+    thread = threading.Thread(
+        target=_store_recovered_wms_data,
+        args=(local, data),
+        name="wms-store-recovered",
+        daemon=False,
+    )
+    _WMS_STORE_THREADS.append(thread)
+    thread.start()
 
 
 def _layer_identifier_candidates(layer: str) -> List[str]:
@@ -6796,7 +6822,7 @@ async def _wms_proxy_impl(
                 recovered_key = recovered_wms_data.get("graniot_wms_access_key") or recovered_wms_data.get("graniot_access_key")
                 if recovered_key and not _is_uuid_like(recovered_key):
                     signed_template_access_key = str(recovered_key).strip()
-            await run_in_threadpool(_store_recovered_wms_data, local, recovered_wms_data)
+            _store_recovered_wms_data_in_background(local, recovered_wms_data)
             _wms_cloud_log(
                 logging.WARNING,
                 "refresh_wms_metadata_success",
@@ -7145,7 +7171,7 @@ async def _wms_proxy_impl(
                 or _signed_access_key_value(refreshed.get("graniot_access_key"))
                 or ""
             ).strip()
-            await run_in_threadpool(_store_recovered_wms_data, local, refreshed)
+            _store_recovered_wms_data_in_background(local, refreshed)
 
         if fresh_key and _normalized_token(fresh_key) != _normalized_token(access_key):
             retry_params = _clean_wms_params({
