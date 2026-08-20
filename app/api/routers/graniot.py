@@ -5449,10 +5449,89 @@ def _find_graniot_matches_for_local(local: Dict[str, Any], graniot_payload: Any)
 
     if wanted_name:
         name_matches = [f for f in features if wanted_name and (wanted_name == _graniot_name(f) or wanted_name in _graniot_name(f) or _graniot_name(f) in wanted_name)]
+        # Un lote llamado «1» casa por nombre con cualquier parcela cuyo nombre
+        # contenga «1», esté donde esté: así entró una parcela de Costa Rica
+        # como «subparcela» de lotes de Veracruz, el mapa encuadraba medio
+        # continente y la capa quedaba de un píxel. Con geometría local, la
+        # pareja por nombre tiene que estar además cerca del lote.
+        if local_geom is not None:
+            local_bounds = _bounds_dict_from_shapely_bounds(local_geom.bounds)
+            name_matches = [
+                f for f in name_matches
+                if _feature_geometry(f) is None
+                or _bounds_are_near(local_bounds, _bounds_dict_from_shapely_bounds(_feature_geometry(f).bounds))
+            ]
         if name_matches:
             return name_matches[:12]
 
     return []
+
+
+def _bounds_dict_from_shapely_bounds(bounds: Any) -> Optional[Dict[str, float]]:
+    try:
+        minx, miny, maxx, maxy = [float(v) for v in bounds]
+    except Exception:
+        return None
+    if not all(v == v for v in (minx, miny, maxx, maxy)):
+        return None
+    return {"west": minx, "south": miny, "east": maxx, "north": maxy}
+
+
+# Margen en grados (~5 km) con el que una fuente de Graniot todavía se
+# considera «del lote». Absorbe recortes y bbox generosos; no absorbe otro país.
+_SOURCE_NEAR_LOT_MARGIN_DEG = 0.05
+
+
+def _bounds_are_near(a: Optional[Dict[str, float]], b: Optional[Dict[str, float]], margin: float = _SOURCE_NEAR_LOT_MARGIN_DEG) -> bool:
+    """True si los dos bbox se tocan (con margen). Sin datos, no se descarta."""
+    if not a or not b:
+        return True
+    try:
+        return not (
+            float(b["west"]) > float(a["east"]) + margin
+            or float(b["east"]) < float(a["west"]) - margin
+            or float(b["south"]) > float(a["north"]) + margin
+            or float(b["north"]) < float(a["south"]) - margin
+        )
+    except Exception:
+        return True
+
+
+def _source_bounds(source: Dict[str, Any]) -> Optional[Dict[str, float]]:
+    return (
+        _bbox_from_graniot_bbox(source.get("graniot_bbox"))
+        or _bounds_from_wms_template(source.get("graniot_wms_url"))
+        or _bounds_from_wms_template(source.get("graniot_image_url"))
+    )
+
+
+def _drop_sources_far_from_lot(local: Dict[str, Any], sources: List[Dict[str, Any]], warnings: List[str]) -> List[Dict[str, Any]]:
+    """Quita las fuentes guardadas que no tocan el lote (p. ej. la parcela de
+    otro país que entró por nombre). Si se quedaran todas fuera, se conservan:
+    antes una capa desplazada que ninguna."""
+    local_geom = _local_parcel_geometry(local)
+    if local_geom is None or not sources:
+        return sources
+    local_bounds = _bounds_dict_from_shapely_bounds(local_geom.bounds)
+    if not local_bounds:
+        return sources
+    kept = [source for source in sources if _bounds_are_near(local_bounds, _source_bounds(source))]
+    dropped = len(sources) - len(kept)
+    if dropped and kept:
+        warnings.append(
+            f"Se omitieron {dropped} parcela(s) de Graniot asociadas a este lote que están lejos de su polígono."
+        )
+        log_event({
+            "event": "dataris.graniot.map_layer.sources_far_from_lot_dropped",
+            "operation": "ndvi-map-layer",
+            "local_parcel_id": local.get("id"),
+            "dropped": [
+                {"graniot_parcel_id": source.get("graniot_parcel_id"), "bounds": _source_bounds(source)}
+                for source in sources if source not in kept
+            ],
+        })
+        return kept
+    return sources
 
 
 def _date_from_graniot_sources(sources: List[Dict[str, Any]], preferred_resolution_id: Optional[int] = DEFAULT_NDVI_RESOLUTION_ID) -> Optional[str]:
@@ -5960,6 +6039,7 @@ async def get_local_parcel_ndvi_map_layer(
     # cambiar fecha podía no cambiar el raster visible.
     resolved_date = date or graniot_latest_date
 
+    sources = _drop_sources_far_from_lot(local, sources, warnings)
     render_sources = [source for source in sources if _source_has_image_for_resolution(source, resolved_resolution_id)]
     if not render_sources:
         render_sources = sources
