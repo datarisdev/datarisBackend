@@ -71,11 +71,23 @@ def test_al_pintar_se_descarta_la_fuente_de_otro_pais():
     assert warnings and "lejos" in warnings[0]
 
 
-def test_si_todas_estan_lejos_no_se_deja_el_mapa_en_blanco():
+def test_si_todas_estan_lejos_el_lote_no_tiene_parcela_y_se_resincroniza():
+    """El A10 de gmateo (18.58, -96.24) tenía como parcela el A10 de otra
+    finca a 90 km: pintarla «por no dejar el mapa en blanco» era pintar el
+    lote de otro. Sin fuentes cerca, se devuelve vacío y map-layer sincroniza."""
     warnings: list = []
-    sources = [source_at("b", COSTA_RICA)]
-    assert graniot._drop_sources_far_from_lot(LOCAL, sources, warnings) == sources
-    assert warnings == []
+    lejos_90km = (VERACRUZ[0] - 0.19, VERACRUZ[1] + 0.78)
+    sources = [source_at("a10-ajeno", lejos_90km), source_at("b", COSTA_RICA)]
+    assert graniot._drop_sources_far_from_lot(LOCAL, sources, warnings) == []
+    assert warnings and "sincronizar" in warnings[0]
+
+
+def test_el_id_guardado_tambien_tiene_que_estar_cerca():
+    local = dict(LOCAL, graniot_parcel_id="154642")
+    ajeno = feature(154642, "A10", (VERACRUZ[0] - 0.19, VERACRUZ[1] + 0.78))
+    assert graniot._find_graniot_matches_for_local(local, {"type": "FeatureCollection", "features": [ajeno]}) == []
+    propio = feature(154642, "A10", VERACRUZ)
+    assert [m["id"] for m in graniot._find_graniot_matches_for_local(local, {"type": "FeatureCollection", "features": [propio]})] == [154642]
 
 
 def test_sin_geometria_local_no_se_descarta_nada():

@@ -5427,6 +5427,16 @@ def _find_graniot_matches_for_local(local: Dict[str, Any], graniot_payload: Any)
     exact: List[Dict[str, Any]] = []
     if wanted_id:
         exact = [f for f in features if _normalized_token(f.get("id")) == wanted_id]
+        # El id guardado puede ser de un lote AJENO que entró por nombre (el
+        # «A10» de otra finca a 90 km). Si la parcela de Graniot con ese id está
+        # lejos del polígono local, no es este lote: se sigue buscando.
+        if exact and local_geom is not None:
+            local_bounds = _bounds_dict_from_shapely_bounds(local_geom.bounds)
+            exact = [
+                f for f in exact
+                if _feature_geometry(f) is None
+                or _bounds_are_near(local_bounds, _bounds_dict_from_shapely_bounds(_feature_geometry(f).bounds))
+            ]
         if exact:
             return exact
 
@@ -5506,9 +5516,13 @@ def _source_bounds(source: Dict[str, Any]) -> Optional[Dict[str, float]]:
 
 
 def _drop_sources_far_from_lot(local: Dict[str, Any], sources: List[Dict[str, Any]], warnings: List[str]) -> List[Dict[str, Any]]:
-    """Quita las fuentes guardadas que no tocan el lote (p. ej. la parcela de
-    otro país que entró por nombre). Si se quedaran todas fuera, se conservan:
-    antes una capa desplazada que ninguna."""
+    """Quita las fuentes guardadas que no tocan el lote.
+
+    Entraban por nombre parcelas de otra finca (el «A10» de otro usuario a
+    90 km) y hasta de otro país: la imagen se pintaba lejos del lote o el mapa
+    se alejaba hasta no verse nada. Si no queda ninguna cerca, este lote NO
+    tiene parcela en Graniot: se devuelve vacío para que map-layer lo
+    sincronice con su geometría real en vez de pintar la de otro."""
     local_geom = _local_parcel_geometry(local)
     if local_geom is None or not sources:
         return sources
@@ -5517,10 +5531,15 @@ def _drop_sources_far_from_lot(local: Dict[str, Any], sources: List[Dict[str, An
         return sources
     kept = [source for source in sources if _bounds_are_near(local_bounds, _source_bounds(source))]
     dropped = len(sources) - len(kept)
-    if dropped and kept:
-        warnings.append(
-            f"Se omitieron {dropped} parcela(s) de Graniot asociadas a este lote que están lejos de su polígono."
-        )
+    if dropped:
+        if kept:
+            warnings.append(
+                f"Se omitieron {dropped} parcela(s) de Graniot asociadas a este lote que están lejos de su polígono."
+            )
+        else:
+            warnings.append(
+                "Las parcelas de Graniot guardadas para este lote están lejos de su polígono; se vuelve a sincronizar con la geometría real."
+            )
         log_event({
             "event": "dataris.graniot.map_layer.sources_far_from_lot_dropped",
             "operation": "ndvi-map-layer",
@@ -5970,7 +5989,7 @@ async def get_local_parcel_ndvi_map_layer(
 
     # Start with locally stored Graniot WMS sources. If none exist, recover by
     # matching the local polygon against /api/parcels/ FeatureCollection.
-    sources: List[Dict[str, Any]] = _sources_from_local_row(local)
+    sources: List[Dict[str, Any]] = _drop_sources_far_from_lot(local, _sources_from_local_row(local), warnings)
 
     # La instantánea guardada durante el sync queda obsoleta con el tiempo: el
     # access_key firmado ROTA (Graniot responde "Invalid access key" con el
