@@ -73,13 +73,25 @@ def approved_extension_ids(
     user_id: str,
     company_id: Optional[str],
 ) -> Set[str]:
-    """Extensiones con solicitud aprobada, aunque no hayan dejado fila de acceso."""
+    """Extensiones con solicitud aprobada, aunque no hayan dejado fila de acceso.
+
+    Solo cuentan las que HOY son extensiones del catálogo. Graniot dejó de serlo
+    al unificarse con Monitoreo Satelital, y una solicitud suya aprobada no puede
+    seguir concediendo un módulo del paquete por encima de lo que la empresa
+    tiene contratado: ese acceso vive ahora en `company_modules` (lo escribió la
+    migración `graniot_merged_into_satelite_v1`).
+    """
     approved: Set[str] = set()
     for row in rows:
         if row.get("status") not in {"approved", "enabled"}:
             continue
-        if row.get("requested_by_user_id") == user_id or (company_id and row.get("company_id") == company_id):
-            approved.add(module_catalog.canonical_module_id(row.get("extension_id")))
+        if row.get("requested_by_user_id") != user_id and not (company_id and row.get("company_id") == company_id):
+            continue
+        module_id = module_catalog.canonical_module_id(row.get("extension_id"))
+        spec = module_catalog.SPECS_BY_ID.get(module_id)
+        if spec is not None and spec.category != module_catalog.CATEGORY_EXTENSION:
+            continue
+        approved.add(module_id)
     return approved
 
 

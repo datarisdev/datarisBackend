@@ -38,6 +38,7 @@ from app.services.digiforms_report_links import (
     suggest_field_map,
     template_fields,
 )
+from app.services import module_catalog
 from app.services.commercial_demo_seed import DEMO_COMPANY_ID, is_commercial_demo_user
 
 router = APIRouter(prefix="/compat/extensions", tags=["Compatibility Extensions"])
@@ -52,17 +53,10 @@ DIGIFORMS_MODULE = {
     "is_requestable": True,
 }
 
-GRANIOT_MODULE = {
-    "id": "graniot",
-    "name": "Graniot",
-    "description": "Integración para capas satelitales, NDVI, fechas, estadísticas y sincronización de lotes desde Graniot.",
-    "icon": "Leaf",
-    "is_active": True,
-    "is_extension": True,
-    "is_requestable": True,
-}
-
-DEFAULT_EXTENSION_MODULES = [DIGIFORMS_MODULE, GRANIOT_MODULE]
+# Graniot ya no está aquí: se unificó con Monitoreo Satelital (es la misma
+# capacidad) y dejó de ser una extensión que se solicita. Las solicitudes
+# antiguas siguen en `extension_requests` como histórico del panel.
+DEFAULT_EXTENSION_MODULES = [DIGIFORMS_MODULE]
 
 
 def require_user(authorization: Optional[str]) -> Dict[str, Any]:
@@ -148,7 +142,7 @@ def ensure_extension_catalog(db: Dict[str, Any]) -> List[Dict[str, Any]]:
             module["updated_at"] = module.get("updated_at") or t
         else:
             modules.append({**base, "created_at": t, "updated_at": t})
-    return [m for m in modules if m.get("is_extension") or normalize_extension_id(m.get("id") or m.get("name")) in {"digiforms", "graniot"}]
+    return [m for m in modules if m.get("is_extension") or normalize_extension_id(m.get("id") or m.get("name")) in {"digiforms"}]
 
 
 def ensure_digiforms_module(db: Dict[str, Any]) -> Dict[str, Any]:
@@ -222,7 +216,9 @@ def extension_enabled_for(db: Dict[str, Any], company_id: Optional[str], user_id
 
 def enable_extension_for(db: Dict[str, Any], company_id: Optional[str], user_id: Optional[str], extension_id: str = DIGIFORMS_MODULE["id"]) -> None:
     ensure_extension_catalog(db)
-    extension_id = normalize_extension_id(extension_id)
+    # El id se lleva al canónico del catálogo: aprobar una solicitud antigua de
+    # Graniot concede Monitoreo Satelital, que es en lo que se unificó.
+    extension_id = module_catalog.canonical_module_id(normalize_extension_id(extension_id))
     t = now()
     if company_id and not any(cm.get("company_id") == company_id and normalize_extension_id(cm.get("module_id")) == extension_id for cm in table(db, "company_modules")):
         table(db, "company_modules").append({

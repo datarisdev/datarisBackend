@@ -452,7 +452,7 @@ def _resolve_actor(
 
 
 def _extension_summary(extension_requests: List[Dict[str, Any]], platform_modules: List[Dict[str, Any]]) -> Dict[str, Any]:
-    extension_ids = {"digiforms", "graniot"}
+    extension_ids = {"digiforms"}
     extensions = [m for m in platform_modules if str(m.get("id") or "").lower() in extension_ids or str(m.get("category") or "").lower() == "extension"]
     counts = Counter(str(r.get("status") or "pending").lower() for r in extension_requests)
     return {

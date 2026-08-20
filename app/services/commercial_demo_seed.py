@@ -38,7 +38,6 @@ DEMO_MODULES = [
     ("personal", "Personal de Campo", "Control biométrico y georreferenciado", "Users"),
     ("alertas", "Alertas inteligentes", "Detección proactiva de riesgos operativos", "Bell"),
     ("digiforms", "DigiformsApp", "Formularios digitales de campo, GPS y evidencia", "FileText"),
-    ("graniot", "Graniot", "Capas satelitales, NDVI y sincronización de lotes", "Leaf"),
 ]
 
 
@@ -845,7 +844,6 @@ def _extension_rows() -> Dict[str, List[Dict[str, Any]]]:
     return {
         "extension_requests": [
             _tag({"id": request_id, "extension_id": "digiforms", "extension_name": "DigiformsApp", "status": "approved", "request_type": "existing_account", "has_existing_account": True, "existing_digiforms_user_id": "AGROVISION-DEMO", "company_id": DEMO_COMPANY_ID, "company_name_snapshot": "Agrovisión Demo", "requested_by_user_id": DEMO_USER_ID, "requester_email": DEMO_EMAIL, "requester_name": "Ejecutivo Demo", "contact_notes": "Dataset comercial precargado para recorrido de demostración.", "client_message": "Integración DigiForms habilitada para la demostración comercial.", "admin_notes": "Configuración demo aislada de servicios externos.", "reviewed_by_user_id": DEMO_USER_ID, "reviewed_at": _iso(40), "enabled_at": _iso(40), "created_at": _iso(45), "updated_at": _iso(2)}),
-            _tag({"id": _id("extension-request:graniot"), "extension_id": "graniot", "extension_name": "Graniot", "status": "approved", "request_type": "existing_account", "has_existing_account": True, "company_id": DEMO_COMPANY_ID, "company_name_snapshot": "Agrovisión Demo", "requested_by_user_id": DEMO_USER_ID, "requester_email": DEMO_EMAIL, "requester_name": "Ejecutivo Demo", "client_message": "Integración Graniot habilitada para la demostración comercial.", "reviewed_by_user_id": DEMO_USER_ID, "reviewed_at": _iso(40), "enabled_at": _iso(40), "created_at": _iso(45), "updated_at": _iso(2)}),
         ],
         "digiforms_accounts": [
             _tag({"id": _id("digiforms-account:demo"), "company_id": DEMO_COMPANY_ID, "user_id": DEMO_USER_ID, "extension_request_id": request_id, "digiforms_client_id": "DEMO-CLIENT", "digiforms_user_id": "AGROVISION-DEMO", "digiforms_user_name": "Agrovisión Demo", "digiforms_email": DEMO_EMAIL, "profile": "admin", "mode": "commercial_demo", "active": True, "api_status": "demo_dataset_ready", "created_at": _iso(40), "updated_at": _iso(1)})

@@ -44,10 +44,10 @@ MODULE_ALIASES: Dict[str, List[str]] = {
     "sig-agricola": ["sig-agricola", "sig_agricola", "sig"],
     "aplicaciones-aereas": ["aplicaciones-aereas", "aplicaciones_aereas", "drones", "drone", "helicoptero", "helicopter", "avioneta"],
     "ortofoto-analysis": ["ortofoto-analysis", "ortofoto_analysis", "ortofotos", "analisis-ortofotos", "analisis_de_ortofotos"],
-    "satelite": ["satelite", "satellite", "satélite"],
+    # Graniot se unificó con Monitoreo Satelital: era la misma capacidad.
+    "satelite": ["satelite", "satellite", "satélite", "graniot"],
     "telemetria": ["telemetria", "telemetría", "telemetry"],
     "digiforms": ["digiforms", "digiformsapp", "digiforms-app"],
-    "graniot": ["graniot"],
     "ml-training": ["ml-training", "ml_training", "laboratorio-ia", "laboratorio_ia"],
 }
 
