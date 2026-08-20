@@ -5732,21 +5732,33 @@ async def get_local_parcel_ndvi_map_layer(
     # matching the local polygon against /api/parcels/ FeatureCollection.
     sources: List[Dict[str, Any]] = _sources_from_local_row(local)
 
+    # La instantánea guardada durante el sync queda obsoleta con el tiempo: el
+    # access_key firmado ROTA (Graniot responde "Invalid access key" con el
+    # viejo) y su parcelresolution_set puede decir last_image_date nulo aunque
+    # Graniot ya tenga escenas procesadas. Si las fuentes guardadas no reportan
+    # NINGUNA fecha de imagen, se refrescan desde /api/parcels/ igual que
+    # cuando no hay fuentes; si el refresco falla, se conserva la instantánea.
+    snapshot_stale = bool(sources) and _date_from_graniot_sources(sources, resolution_id) is None
+
     raw_parcels = None
-    if not sources:
+    if not sources or snapshot_stale:
         try:
             raw_parcels = await client.get("/api/parcels/")
             matches = _find_graniot_matches_for_local(local, raw_parcels)
-            sources = [_extract_wms_data_from_parcel_object(match) for match in matches]
-            sources = [source for source in sources if source.get("graniot_wms_url") or source.get("graniot_image_url")]
-            if sources:
-                resolved_date = date or _date_from_graniot_sources(sources, resolution_id)
-                _persist_graniot_sources(local_parcel_id, user["id"], raw_parcels, sources, resolved_date)
+            fresh_sources = [_extract_wms_data_from_parcel_object(match) for match in matches]
+            fresh_sources = [source for source in fresh_sources if source.get("graniot_wms_url") or source.get("graniot_image_url")]
+            if fresh_sources:
+                resolved_date = date or _date_from_graniot_sources(fresh_sources, resolution_id)
+                _persist_graniot_sources(local_parcel_id, user["id"], raw_parcels, fresh_sources, resolved_date)
                 date = resolved_date
-            else:
+                sources = fresh_sources
+            elif not sources:
                 warnings.append("No se encontró un lote equivalente en Graniot para esta geometría local.")
         except Exception as exc:
-            warnings.append(f"No se pudo recuperar el lote desde Graniot: {exc}")
+            if sources:
+                warnings.append(f"No se pudo refrescar el lote desde Graniot; se usa la última instantánea guardada: {exc}")
+            else:
+                warnings.append(f"No se pudo recuperar el lote desde Graniot: {exc}")
 
     if not sources and auto_sync:
         sources = await _attempt_auto_sync_for_map_layer(
@@ -6214,6 +6226,65 @@ async def wms_proxy(
 time_module_perf_counter = time_module.perf_counter
 
 
+def _graniot_refs_of_local_row(row: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """Pares (id de Graniot, parcel_key) del lote y de sus subparcelas."""
+    refs: List[Tuple[str, str]] = [(
+        str(row.get("graniot_parcel_id") or ""),
+        _normalized_token(row.get("graniot_parcel_key")),
+    )]
+    subparcels = row.get("graniot_parcels")
+    if isinstance(subparcels, list):
+        for item in subparcels:
+            if not isinstance(item, dict):
+                continue
+            refs.append((
+                str(item.get("graniot_parcel_id") or item.get("id") or ""),
+                _normalized_token(item.get("graniot_parcel_key") or item.get("key")),
+            ))
+    return refs
+
+
+def _find_local_parcel_for_wms(parcel_id: Optional[str], access_key: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Localiza el lote de Dataris al que pertenece una petición WMS.
+
+    El identificador que llega en la URL no siempre es el id local: el módulo
+    Satélite envía el id de la parcela **en Graniot**. Buscando solo por el id
+    local nos quedábamos sin fila, y sin fila no hay plantilla ni forma de
+    renovar la access_key: Graniot rechazaba los 32 intentos con
+    "Invalid access key." y el usuario recibía un 502 opaco.
+
+    Por eso buscamos también por los identificadores de Graniot (del lote y de
+    sus subparcelas) y por el parcel_key que viaja dentro de la propia
+    access_key firmada, que es el dato más fiable porque lo emite Graniot.
+    """
+    if not parcel_id and not access_key:
+        return None
+
+    db = read_db()
+    rows = table(db, "parcels")
+
+    wanted_id = str(parcel_id or "").strip()
+    if wanted_id:
+        row = next((p for p in rows if str(p.get("id") or "") == wanted_id), None)
+        if row:
+            return row
+
+    wanted_key = _normalized_token(
+        _parcel_key_from_signed_wms_access_key(access_key)
+        or (access_key if _is_uuid_like(access_key) else "")
+    )
+    if not wanted_id and not wanted_key:
+        return None
+
+    for row in rows:
+        for graniot_id, parcel_key in _graniot_refs_of_local_row(row):
+            if wanted_id and graniot_id and graniot_id == wanted_id:
+                return row
+            if wanted_key and parcel_key and parcel_key == wanted_key:
+                return row
+    return None
+
+
 async def _wms_proxy_impl(
     parcel_id: Optional[str] = None,
     access_key: Optional[str] = None,
@@ -6263,12 +6334,13 @@ async def _wms_proxy_impl(
         _wms_cloud_log(logging.WARNING, "cache_hit", parcel_id=parcel_id, layer=clean_layer, time=time, cache_key=stable_wms_cache_key)
         return cached_wms
 
-    local: Optional[Dict[str, Any]] = None
-    if parcel_id:
-        db = read_db()
-        local = next((p for p in table(db, "parcels") if p.get("id") == parcel_id), None)
-        if local and not access_key:
-            access_key = local.get("graniot_access_key") or local.get("graniot_parcel_key")
+    local: Optional[Dict[str, Any]] = _find_local_parcel_for_wms(parcel_id, access_key)
+    if local and not access_key:
+        access_key = (
+            local.get("graniot_wms_access_key")
+            or local.get("graniot_access_key")
+            or local.get("graniot_parcel_key")
+        )
 
     access_key = str(access_key or "").strip()
     if not access_key:
@@ -6611,6 +6683,119 @@ async def _wms_proxy_impl(
                     use_auth=use_auth,
                 )
                 continue
+
+    # Último recurso ante "Invalid access key": la clave firmada de Graniot
+    # caduca, y la que guardamos durante el sync puede tener semanas. Repetir
+    # las 32 variantes con la misma clave muerta no cambia nada, así que se pide
+    # una recién firmada y se prueba UNA vez con la forma mínima, que es la
+    # única que Graniot necesita (el polígono viaja dentro de la access_key).
+    status_errors = [item for item in errors if item.get("status_code")]
+    all_invalid_key = bool(status_errors) and all(
+        "invalid access key" in str(item.get("message") or "").lower()
+        for item in status_errors
+    )
+    if all_invalid_key:
+        refreshed = await _recover_wms_data_from_graniot(
+            client,
+            access_key=access_key,
+            graniot_parcel_id=local_graniot_parcel_id,
+        )
+        fresh_key = ""
+        if refreshed:
+            fresh_key = str(
+                _signed_wms_access_key(refreshed.get("graniot_wms_url"))
+                or _signed_access_key_value(refreshed.get("graniot_wms_access_key"))
+                or _signed_access_key_value(refreshed.get("graniot_access_key"))
+                or ""
+            ).strip()
+            _store_recovered_wms_data(local, refreshed)
+
+        if fresh_key and _normalized_token(fresh_key) != _normalized_token(access_key):
+            retry_params = _clean_wms_params({
+                "access_key": fresh_key,
+                "layers": layer_candidates[0] if layer_candidates else clean_layer,
+                "response_format": "image/png",
+                "time": time,
+            })
+            _wms_cloud_log(
+                logging.WARNING,
+                "retry_with_fresh_key",
+                parcel_id=parcel_id,
+                layer=clean_layer,
+                time=time,
+                expired_access_key=_wms_token_info(access_key),
+                fresh_access_key=_wms_token_info(fresh_key),
+            )
+            try:
+                raw = await client.binary_get(
+                    wms_path,
+                    params=retry_params,
+                    use_auth=False,
+                    include_client_id=False,
+                    debug_context={
+                        "operation": "wms-proxy-retry-fresh-key",
+                        "local_parcel_id": parcel_id,
+                        "layer": clean_layer,
+                        "time": time,
+                    },
+                )
+                if _is_image_response(raw):
+                    media_type = raw.headers.get("content-type") or "image/png"
+                    _write_wms_disk_cache(stable_wms_cache_key, raw.content, media_type)
+                    _wms_cloud_log(
+                        logging.WARNING,
+                        "retry_with_fresh_key_success",
+                        parcel_id=parcel_id,
+                        layer=clean_layer,
+                        time=time,
+                        content_length=len(raw.content or b""),
+                    )
+                    return _response_with_cache_headers(Response(
+                        content=raw.content,
+                        media_type=media_type,
+                    ), "MISS")
+                errors.append({
+                    "variant_index": "retry_fresh_key",
+                    "status_code": getattr(raw, "status_code", None),
+                    "message": _response_preview_text(raw),
+                })
+            except Exception as exc:
+                errors.append({
+                    "variant_index": "retry_fresh_key",
+                    "message": str(exc),
+                    "exception_type": type(exc).__name__,
+                })
+                _wms_cloud_exception(
+                    "retry_with_fresh_key_failed",
+                    exc,
+                    parcel_id=parcel_id,
+                    layer=clean_layer,
+                    time=time,
+                )
+        else:
+            # Graniot no devuelve una clave nueva para esta parcela: el problema
+            # ya no es la caducidad, es que el lote perdió su parcela allí. Un
+            # 502 haría pensar en una avería; esto es un lote por resincronizar.
+            log_event({
+                "event": "dataris.graniot.wms_proxy.parcel_gone",
+                "operation": "wms-proxy",
+                "local_parcel_id": parcel_id,
+                "graniot_parcel_id": local_graniot_parcel_id,
+                "layer": clean_layer,
+                "time": time,
+                "found_local_row": bool(local),
+                "recovered": bool(refreshed),
+            })
+            raise HTTPException(status_code=409, detail={
+                "message": (
+                    "Este lote ya no tiene una parcela válida en Graniot: la clave de acceso "
+                    "caducó y Graniot no devuelve una nueva. Vuelve a sincronizar el lote "
+                    "desde el panel de lotes."
+                ),
+                "requires_resync": True,
+                "local_parcel_id": parcel_id,
+                "graniot_parcel_id": local_graniot_parcel_id,
+            })
 
     log_event({
         "event": "dataris.graniot.wms_proxy.failed",
