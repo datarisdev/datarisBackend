@@ -5867,13 +5867,20 @@ async def _attempt_auto_sync_for_map_layer(
     intentionally called only after direct id/geometry matching failed.
     """
     try:
-        sync_result = await sync_local_parcel(
+        # Se llama al servicio, no al endpoint: invocado como función normal,
+        # el parámetro `user_id = Query(default=None)` del endpoint llegaba
+        # como objeto Query, _acting_user lo tomaba por «en nombre de otro
+        # usuario» y respondía 403 a todo cliente sin permiso de gestor. El
+        # auto-sync llevaba semanas fallando en silencio («pide al
+        # administrador sincronizarlo»).
+        user = _require_user(authorization)
+        sync_result = await sync_local_parcel_to_graniot(
+            user,
             local_parcel_id,
-            payload={"metadata": {"auto_sync_source": "ndvi-map-layer"}},
-            authorization=authorization,
+            {"metadata": {"auto_sync_source": "ndvi-map-layer"}},
         )
-        raw = (sync_result.get("data") or {}).get("graniot") if isinstance(sync_result, dict) else None
-        synced_parcel = (sync_result.get("data") or {}).get("parcel") if isinstance(sync_result, dict) else None
+        raw = sync_result.get("graniot") if isinstance(sync_result, dict) else None
+        synced_parcel = sync_result.get("parcel") if isinstance(sync_result, dict) else None
 
         sources: List[Dict[str, Any]] = []
         if isinstance(synced_parcel, dict):
@@ -5907,7 +5914,15 @@ async def _attempt_auto_sync_for_map_layer(
             warnings.append("El lote se intentó sincronizar con Graniot, pero la respuesta no incluyó WMS/image_url todavía.")
         return deduped
     except Exception as exc:
-        warnings.append(f"No se pudo sincronizar automáticamente el lote con Graniot: {exc}")
+        detail = getattr(exc, "detail", None) or str(exc)
+        warnings.append(f"No se pudo sincronizar automáticamente el lote con Graniot: {detail}")
+        log_event({
+            "event": "dataris.graniot.map_layer.auto_sync_failed",
+            "operation": "ndvi-map-layer",
+            "local_parcel_id": local_parcel_id,
+            "exception_type": type(exc).__name__,
+            "message": str(detail),
+        })
         return []
 
 @router.get("/parcels/{local_parcel_id}/ndvi/map-layer")
