@@ -691,9 +691,6 @@ def backfill_user_module_overrides(db: Dict[str, Any], timestamp: str) -> Dict[s
     return {"applied": True, "rows_added": added}
 
 
-GRANIOT_MERGE_MIGRATION = "graniot_merged_into_satelite_v1"
-
-
 def admin_row_for_user(db: Dict[str, Any], user_id: str) -> Optional[Dict[str, Any]]:
     """Ficha de administración de un usuario, buscada por `user_id`."""
     return next(
@@ -730,11 +727,16 @@ def merge_graniot_into_satelite(db: Dict[str, Any], timestamp: str) -> Dict[str,
       concedían se escribe en `company_modules` (o en `user_modules` si el
       solicitante no tiene empresa), que es donde vive el acceso a un módulo del
       paquete.
-    """
-    migrations = db.setdefault("migrations", {})
-    if migrations.get(GRANIOT_MERGE_MIGRATION):
-        return {"applied": False, "companies": 0, "users": 0, "rows_removed": 0}
 
+    NO lleva marca en `db["migrations"]`, a diferencia de las otras dos: se
+    ejecuta en cada normalización. Con marca no habría convergido — durante el
+    despliegue conviven unos minutos la revisión vieja y la nueva sobre el mismo
+    estado, y a la vieja le basta una petición para volver a sembrar `graniot`
+    (su catálogo aún lo tenía) sobre un estado que ya llevaba la marca puesta:
+    los restos se quedaban ahí para siempre. Recorrer tres listas cortas en cada
+    normalización es más barato que ese riesgo, y así el estado converge solo
+    aunque algo vuelva a escribir el id viejo.
+    """
     def is_graniot(value: Any) -> bool:
         return module_catalog.normalize_module_id(value) == "graniot"
 
@@ -804,7 +806,7 @@ def merge_graniot_into_satelite(db: Dict[str, Any], timestamp: str) -> Dict[str,
                 "module_id": "satelite",
                 "is_enabled": True,
                 "is_active": True,
-                "source": GRANIOT_MERGE_MIGRATION,
+                "source": "graniot_merged_into_satelite",
                 "created_at": timestamp,
                 "updated_at": timestamp,
             })
@@ -822,7 +824,7 @@ def merge_graniot_into_satelite(db: Dict[str, Any], timestamp: str) -> Dict[str,
             "module_id": "satelite",
             "is_enabled": True,
             "is_active": True,
-            "source": GRANIOT_MERGE_MIGRATION,
+            "source": "graniot_merged_into_satelite",
             "created_at": timestamp,
             "updated_at": timestamp,
         })
@@ -834,8 +836,7 @@ def merge_graniot_into_satelite(db: Dict[str, Any], timestamp: str) -> Dict[str,
     platform_rows[:] = [row for row in platform_rows if not is_graniot(row.get("id"))]
     removed += before - len(platform_rows)
 
-    migrations[GRANIOT_MERGE_MIGRATION] = timestamp
-    return {"applied": True, "companies": companies, "users": users, "rows_removed": removed}
+    return {"companies": companies, "users": users, "rows_removed": removed}
 
 
 REDUNDANT_POSITIVES_MIGRATION = "user_module_redundant_positives_v1"
