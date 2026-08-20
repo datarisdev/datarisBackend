@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, parse_qsl, quote, urlencode, urlparse, urlunparse
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Response
+from starlette.concurrency import run_in_threadpool
 from shapely.geometry import box as shapely_box, mapping, shape as shapely_shape
 from shapely.ops import transform, unary_union
 from shapely import wkt as shapely_wkt
@@ -840,21 +841,32 @@ def _wms_template_from_local(
     subparcels = local.get("graniot_parcels")
     if isinstance(subparcels, list):
         fallback_subparcel_template: Optional[str] = None
-        for item in subparcels:
-            if not isinstance(item, dict):
-                continue
-            template = item.get("graniot_wms_url") or item.get("graniot_image_url") or item.get("wms_url") or item.get("image_url")
-            if isinstance(template, str) and template.strip() and not fallback_subparcel_template:
-                fallback_subparcel_template = template.strip()
-            data = {
-                "graniot_access_key": item.get("graniot_access_key"),
-                "graniot_wms_access_key": item.get("graniot_wms_access_key"),
-                "graniot_parcel_key": item.get("graniot_parcel_key"),
-                "graniot_parcel_id": item.get("graniot_parcel_id"),
-                "graniot_wms_url": template,
-            }
-            if template and _wms_data_matches_requested(data, access_key=access_key, graniot_parcel_id=graniot_parcel_id):
-                return str(template).strip()
+        # La fila padre guarda el graniot_parcel_id de la PRIMERA subparcela,
+        # así que emparejar por id devolvía siempre la plantilla de esa primera
+        # subparcela para las 13 del lote. La clave firmada que manda el
+        # navegador identifica la subparcela exacta: primero se busca por clave
+        # y solo si ninguna coincide se recurre al id.
+        for match_by_key_only in (True, False):
+            for item in subparcels:
+                if not isinstance(item, dict):
+                    continue
+                template = item.get("graniot_wms_url") or item.get("graniot_image_url") or item.get("wms_url") or item.get("image_url")
+                if isinstance(template, str) and template.strip() and not fallback_subparcel_template:
+                    fallback_subparcel_template = template.strip()
+                if not template:
+                    continue
+                data = {
+                    "graniot_access_key": item.get("graniot_access_key"),
+                    "graniot_wms_access_key": item.get("graniot_wms_access_key"),
+                    "graniot_parcel_key": item.get("graniot_parcel_key"),
+                    "graniot_parcel_id": item.get("graniot_parcel_id"),
+                    "graniot_wms_url": template,
+                }
+                if match_by_key_only:
+                    if access_key and _wms_data_matches_requested(data, access_key=access_key, graniot_parcel_id=None):
+                        return str(template).strip()
+                elif _wms_data_matches_requested(data, access_key=access_key, graniot_parcel_id=graniot_parcel_id):
+                    return str(template).strip()
         if fallback_subparcel_template and not (access_key or graniot_parcel_id):
             return fallback_subparcel_template
 
@@ -1291,7 +1303,101 @@ async def _recover_wms_data_from_graniot(
     return None
 
 
+_WMS_RECOVERY_TTL_SECONDS = 20 * 60
+_WMS_RECOVERY_LOCKS: Dict[str, asyncio.Lock] = {}
+
+
+def _wms_recovery_cache_key(graniot_parcel_id: Optional[str], access_key: Optional[str]) -> str:
+    token = _normalized_token(graniot_parcel_id) or _normalized_token(_parcel_key_from_signed_wms_access_key(access_key)) or _normalized_token(access_key)
+    return f"wms-recovery:{token}"
+
+
+async def _recover_wms_data_shared(
+    client: GraniotClient,
+    *,
+    access_key: Optional[str],
+    graniot_parcel_id: Optional[str] = None,
+    force: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Recupera los metadatos WMS de Graniot una sola vez por parcela.
+
+    Un lote dividido dispara una imagen por subparcela, todas a la vez, y cada
+    una pedía a Graniot la misma parcela y reescribía la base local: con 13
+    subparcelas el servidor dejó de responder al /health y Azure lo reinició.
+    Las peticiones concurrentes de la misma parcela comparten una llamada y el
+    resultado se recuerda 20 minutos (la clave firmada dura días). Con
+    ``force`` se salta la memoria: es el camino del reintento cuando Graniot
+    rechazó la clave.
+    """
+    cache_key = _wms_recovery_cache_key(graniot_parcel_id, access_key)
+    if not force:
+        cached = _cache_get(cache_key)
+        if isinstance(cached, dict) and cached:
+            return cached
+    # Un asyncio.Lock queda ligado al loop que lo usa; se guarda por loop para
+    # que un lock de otro ciclo (tests, reinicios) nunca se reutilice.
+    lock_key = f"{id(asyncio.get_running_loop())}:{cache_key}"
+    if len(_WMS_RECOVERY_LOCKS) > 500:
+        _WMS_RECOVERY_LOCKS.clear()
+    lock = _WMS_RECOVERY_LOCKS.setdefault(lock_key, asyncio.Lock())
+    async with lock:
+        if not force:
+            cached = _cache_get(cache_key)
+            if isinstance(cached, dict) and cached:
+                return cached
+        recovered = await _recover_wms_data_from_graniot(
+            client,
+            access_key=access_key,
+            graniot_parcel_id=graniot_parcel_id,
+        )
+        if recovered:
+            _cache_set(cache_key, recovered, _WMS_RECOVERY_TTL_SECONDS)
+        return recovered
+
+
+def _graniot_parcel_id_for_wms_request(local: Optional[Dict[str, Any]], access_key: Optional[str]) -> Optional[str]:
+    """Id en Graniot de la (sub)parcela a la que pertenece la clave firmada.
+
+    La fila padre lleva el id de su primera subparcela; si la clave del
+    navegador es de otra subparcela, renovar con el id del padre devolvía la
+    clave —y la imagen— equivocada.
+    """
+    if not isinstance(local, dict):
+        return None
+    wanted_key = _normalized_token(_parcel_key_from_signed_wms_access_key(access_key))
+    wanted_raw = _normalized_token(access_key)
+    subparcels = local.get("graniot_parcels")
+    if (wanted_key or wanted_raw) and isinstance(subparcels, list):
+        for item in subparcels:
+            if not isinstance(item, dict):
+                continue
+            item_keys = {
+                _normalized_token(item.get("graniot_parcel_key") or item.get("key")),
+                _normalized_token(item.get("graniot_access_key")),
+                _normalized_token(item.get("graniot_wms_access_key")),
+                _normalized_token(_parcel_key_from_signed_wms_access_key(item.get("graniot_access_key"))),
+                _normalized_token(_parcel_key_from_signed_wms_access_key(item.get("graniot_wms_access_key"))),
+                _normalized_token(_parcel_key_from_signed_wms_access_key(_access_key_from_wms_template(item.get("graniot_wms_url")))),
+            }
+            item_keys.discard("")
+            if (wanted_key and wanted_key in item_keys) or (wanted_raw and wanted_raw in item_keys):
+                item_id = item.get("graniot_parcel_id") or item.get("id")
+                if item_id not in (None, ""):
+                    return str(item_id)
+    if local.get("graniot_parcel_id"):
+        return str(local.get("graniot_parcel_id"))
+    return None
+
+
 def _store_recovered_wms_data(local: Optional[Dict[str, Any]], data: Optional[Dict[str, Any]]) -> None:
+    """Guarda en la fila local la clave/plantilla recién firmada por Graniot.
+
+    Si la clave pertenece a una subparcela (``graniot_parcels``), se actualiza
+    esa entrada y no la fila padre: antes cada imagen de un lote dividido
+    pisaba los campos del padre con la subparcela que hubiera llegado última.
+    Solo se reescribe la base cuando algún valor cambia de verdad; con 13
+    imágenes concurrentes eso evita 13 reescrituras del JSON completo.
+    """
     if not local or not data:
         return
     updates = {k: v for k, v in {
@@ -1306,13 +1412,42 @@ def _store_recovered_wms_data(local: Optional[Dict[str, Any]], data: Optional[Di
     }.items() if v not in (None, "")}
     if not updates:
         return
+    recovered_id = _normalized_token(data.get("graniot_parcel_id"))
+    recovered_key = _normalized_token(data.get("graniot_parcel_key"))
+
+    def _same_graniot_parcel(item: Dict[str, Any]) -> bool:
+        item_id = _normalized_token(item.get("graniot_parcel_id") or item.get("id"))
+        item_key = _normalized_token(item.get("graniot_parcel_key") or item.get("key"))
+        return bool((recovered_id and item_id == recovered_id) or (recovered_key and item_key == recovered_key))
+
     try:
         with LOCK:
             db = read_db()
             row = next((p for p in table(db, "parcels") if p.get("id") == local.get("id")), None)
             if not row:
                 return
-            row.update(updates)
+            subparcels = row.get("graniot_parcels")
+            target: Optional[Dict[str, Any]] = None
+            if isinstance(subparcels, list):
+                target = next((item for item in subparcels if isinstance(item, dict) and _same_graniot_parcel(item)), None)
+            if target is None and (not recovered_id and not recovered_key or _same_graniot_parcel(row)):
+                target = row
+            if target is None:
+                # La clave recuperada no es de este lote ni de sus subparcelas:
+                # no se pisa nada.
+                return
+            changed = {}
+            for k, v in updates.items():
+                if k in ("graniot_parcel_id", "graniot_parcel_key"):
+                    # Graniot devuelve el id como entero; si ya está guardado
+                    # (como texto), no se toca.
+                    if _normalized_token(target.get(k)) != _normalized_token(v):
+                        changed[k] = str(v)
+                elif target.get(k) != v:
+                    changed[k] = v
+            if not changed:
+                return
+            target.update(changed)
             row["updated_at"] = now()
             write_db(db)
     except Exception as exc:
@@ -6576,7 +6711,10 @@ async def _wms_proxy_impl(
         _wms_cloud_log(logging.WARNING, "cache_hit", parcel_id=parcel_id, layer=clean_layer, time=time, cache_key=stable_wms_cache_key)
         return cached_wms
 
-    local: Optional[Dict[str, Any]] = _find_local_parcel_for_wms(parcel_id, access_key)
+    # read_db() carga el JSON completo de la plataforma desde Neon de forma
+    # síncrona: en el hilo del event loop congelaba /health y Azure reiniciaba
+    # el contenedor con las imágenes a medio servir.
+    local: Optional[Dict[str, Any]] = await run_in_threadpool(_find_local_parcel_for_wms, parcel_id, access_key)
     if local and not access_key:
         access_key = (
             local.get("graniot_wms_access_key")
@@ -6590,7 +6728,7 @@ async def _wms_proxy_impl(
 
     client = GraniotClient()
 
-    local_graniot_parcel_id = str(local.get("graniot_parcel_id")) if local and local.get("graniot_parcel_id") else None
+    local_graniot_parcel_id = _graniot_parcel_id_for_wms_request(local, access_key)
     template = _wms_template_from_local(
         local,
         access_key=access_key,
@@ -6643,7 +6781,7 @@ async def _wms_proxy_impl(
             request_access_key=_wms_token_info(access_key),
             template_access_key=_wms_token_info(signed_template_access_key),
         )
-        recovered_wms_data = await _recover_wms_data_from_graniot(
+        recovered_wms_data = await _recover_wms_data_shared(
             client,
             access_key=access_key,
             graniot_parcel_id=local_graniot_parcel_id,
@@ -6658,7 +6796,7 @@ async def _wms_proxy_impl(
                 recovered_key = recovered_wms_data.get("graniot_wms_access_key") or recovered_wms_data.get("graniot_access_key")
                 if recovered_key and not _is_uuid_like(recovered_key):
                     signed_template_access_key = str(recovered_key).strip()
-            _store_recovered_wms_data(local, recovered_wms_data)
+            await run_in_threadpool(_store_recovered_wms_data, local, recovered_wms_data)
             _wms_cloud_log(
                 logging.WARNING,
                 "refresh_wms_metadata_success",
@@ -6993,10 +7131,11 @@ async def _wms_proxy_impl(
         for item in status_errors
     )
     if all_invalid_key:
-        refreshed = await _recover_wms_data_from_graniot(
+        refreshed = await _recover_wms_data_shared(
             client,
             access_key=access_key,
             graniot_parcel_id=local_graniot_parcel_id,
+            force=True,
         )
         fresh_key = ""
         if refreshed:
@@ -7006,7 +7145,7 @@ async def _wms_proxy_impl(
                 or _signed_access_key_value(refreshed.get("graniot_access_key"))
                 or ""
             ).strip()
-            _store_recovered_wms_data(local, refreshed)
+            await run_in_threadpool(_store_recovered_wms_data, local, refreshed)
 
         if fresh_key and _normalized_token(fresh_key) != _normalized_token(access_key):
             retry_params = _clean_wms_params({
