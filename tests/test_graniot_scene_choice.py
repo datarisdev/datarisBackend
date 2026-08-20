@@ -154,6 +154,19 @@ def test_detecta_la_escena_nublada_y_respeta_la_despejada():
     assert graniot._scene_looks_flat(CLEAR_PNG) is False
 
 
+def test_el_borde_antialiased_no_disfraza_la_escena_nublada():
+    """El caso que se escapó en producción: la imagen real de Graniot llega con
+    el polígono recortado y un borde anti-aliased. Un reescalado con
+    interpolación mezclaba ese borde con la transparencia, inventaba cientos de
+    colores intermedios y la escena nublada dejaba de parecer plana."""
+    base = Image.new("RGBA", (640, 640), (0, 0, 0, 0))
+    solid = Image.new("RGBA", (400, 400), (200, 30, 30, 255))
+    base.paste(solid, (120, 120))
+    # rotate con BICUBIC genera el borde suavizado típico del recorte.
+    rotated = base.rotate(17, resample=Image.BICUBIC)
+    assert graniot._scene_looks_flat(png_bytes(rotated)) is True
+
+
 def test_ante_bytes_ilegibles_no_descarta_nada():
     assert graniot._scene_looks_flat(b"esto no es un png") is False
     assert graniot._scene_looks_flat(b"") is False
