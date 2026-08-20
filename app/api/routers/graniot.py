@@ -5805,6 +5805,38 @@ async def get_local_parcel_ndvi_map_layer(
         if resolved_resolution_id is not None:
             warnings.append(f"El lote no reporta imagen para la resolución {resolved_resolution_id}; se intentará renderizar con la información WMS disponible.")
 
+    # Sin fecha del calendario, se prefiere la escena LIMPIA más reciente sobre
+    # la última reportada, que puede estar tapada por nubes (el «rojo plano»).
+    # La elección la comparte el wms-proxy, así la etiqueta de fecha, las
+    # estadísticas y la imagen pintada corresponden a la misma escena.
+    if not date and render_sources:
+        scene_source = render_sources[0]
+        scene_access_key = (
+            scene_source.get("graniot_wms_access_key")
+            or _signed_wms_access_key(scene_source.get("graniot_wms_url"))
+            or _signed_wms_access_key(scene_source.get("graniot_image_url"))
+            or scene_source.get("graniot_access_key")
+        )
+        scene_graniot_id = scene_source.get("graniot_parcel_id") or local.get("graniot_parcel_id")
+        try:
+            clear_scene = await _choose_clear_scene_date(
+                client,
+                parcel_token=local_parcel_id,
+                access_key=scene_access_key,
+                layer=resolved_layer.get("wms_layer") or DEFAULT_NDVI_WMS_LAYER,
+                graniot_parcel_id=str(scene_graniot_id) if scene_graniot_id else None,
+                resolution_key=resolved_layer.get("resolution_key"),
+                wms_path=_wms_path_from_template(scene_source.get("graniot_wms_url")),
+            )
+        except Exception:
+            clear_scene = None
+        if clear_scene and clear_scene != resolved_date:
+            warnings.append(
+                f"La escena más reciente ({resolved_date or 'sin fecha'}) está cubierta de nubes; "
+                f"se muestra la del {clear_scene}, la última con datos útiles."
+            )
+            resolved_date = clear_scene
+
     overlays = [
         overlay for overlay in (
             _source_to_map_overlay(
@@ -6285,6 +6317,199 @@ def _find_local_parcel_for_wms(parcel_id: Optional[str], access_key: Optional[st
     return None
 
 
+# --- Elección de escena por calidad -----------------------------------------
+#
+# Graniot sirve siempre la escena más reciente cuando la petición WMS no lleva
+# `time`, y su parámetro MAXCC no filtra nada (verificado en vivo): una pasada
+# nublada produce un raster casi monocolor —el «rojo plano» que el cliente veía
+# como avería—. La escena buena suele estar unos días atrás, y Graniot sí la
+# sirve si se le pide con `time=YYYY-MM-DD`.
+#
+# Estrategia: cuando el llamador no fija fecha, se recorren las fechas reales
+# del catálogo del lote (de la más nueva a la más vieja) sondeando una imagen
+# pequeña por fecha, y gana la primera que no esté plana. La elección se
+# recuerda unas horas por lote+capa para que el sondeo no se repita en cada
+# carga. Una fecha pedida explícitamente por el usuario NUNCA se toca.
+
+SCENE_CHOICE_TTL_SECONDS = int(os.environ.get("GRANIOT_SCENE_CHOICE_TTL_SECONDS", str(6 * 3600)))
+SCENE_CHOICE_NEGATIVE_TTL_SECONDS = int(os.environ.get("GRANIOT_SCENE_CHOICE_NEGATIVE_TTL_SECONDS", str(2 * 3600)))
+# Umbral medido sobre lotes reales: las escenas nubladas dan 6-10 colores y las
+# despejadas 96 o más; 25 deja margen por ambos lados.
+SCENE_FLAT_MAX_COLORS = int(os.environ.get("GRANIOT_SCENE_FLAT_MAX_COLORS", "25"))
+SCENE_PROBE_MAX_DATES = int(os.environ.get("GRANIOT_SCENE_PROBE_MAX_DATES", "6"))
+SCENE_PROBE_SIZE = 256
+
+
+def _scene_choice_cache_key(parcel_token: Optional[str], access_key: Optional[str], layer: Optional[str]) -> str:
+    """Clave estable por lote+capa: el parcel_key firmado no cambia al re-firmar."""
+    token = _normalized_token(
+        _parcel_key_from_signed_wms_access_key(access_key)
+        or str(parcel_token or "")
+        or str(access_key or "")
+    )
+    return _stable_hash({"scope": "graniot-scene-choice", "parcel": token, "layer": str(layer or "").strip().upper()})
+
+
+def _scene_looks_flat(content: Optional[bytes]) -> bool:
+    """¿El raster es casi monocolor? Señal de escena nublada.
+
+    Solo devuelve True con certeza (hay píxeles visibles y muy pocos colores):
+    ante cualquier duda —imagen ilegible, vacía, sin píxeles— responde False
+    para no descartar escenas válidas.
+    """
+    if not content:
+        return False
+    try:
+        import io as _io
+
+        from PIL import Image
+
+        with Image.open(_io.BytesIO(content)) as raw_image:
+            image = raw_image.convert("RGBA")
+        image.thumbnail((SCENE_PROBE_SIZE, SCENE_PROBE_SIZE))
+        colors: set = set()
+        visible = 0
+        for pixel in image.getdata():
+            if pixel[3] > 0:
+                visible += 1
+                colors.add(pixel[:3])
+                if len(colors) >= SCENE_FLAT_MAX_COLORS:
+                    return False
+        return visible > 0
+    except Exception:
+        return False
+
+
+async def _list_scene_dates(client: GraniotClient, graniot_parcel_id: Optional[str], resolution_key: Optional[str]) -> List[str]:
+    """Fechas con imagen del lote, de la más nueva a la más vieja."""
+    if not graniot_parcel_id:
+        return []
+    resolution = str(resolution_key or DEFAULT_NDVI_RESOLUTION_KEY).strip() or DEFAULT_NDVI_RESOLUTION_KEY
+    try:
+        raw = await client.get(
+            f"/api/parcels/{graniot_parcel_id}/resolutions/{resolution}/dates/",
+            debug_context={"operation": "scene-choice-dates", "graniot_parcel_id": graniot_parcel_id},
+        )
+    except Exception:
+        return []
+    items = raw.get("data") if isinstance(raw, dict) else raw
+    dates: List[str] = []
+    for item in items if isinstance(items, list) else []:
+        value = item.get("date") if isinstance(item, dict) else item
+        if value:
+            dates.append(str(value)[:10])
+    return dates
+
+
+async def _probe_scene(
+    client: GraniotClient,
+    *,
+    wms_path: str,
+    access_key: str,
+    layer: str,
+    scene_date: str,
+) -> Optional[bytes]:
+    """Imagen pequeña de una fecha concreta; None si Graniot no da un raster."""
+    params = _clean_wms_params({
+        "access_key": access_key,
+        "layers": layer,
+        "response_format": "image/png",
+        "time": scene_date,
+        "width": SCENE_PROBE_SIZE,
+        "height": SCENE_PROBE_SIZE,
+    })
+    try:
+        raw = await client.binary_get(
+            wms_path,
+            params=params,
+            use_auth=False,
+            include_client_id=False,
+            debug_context={"operation": "scene-choice-probe", "layer": layer, "time": scene_date},
+        )
+    except Exception:
+        return None
+    if _is_image_response(raw):
+        return raw.content
+    return None
+
+
+async def _choose_clear_scene_date(
+    client: GraniotClient,
+    *,
+    parcel_token: Optional[str],
+    access_key: Optional[str],
+    layer: Optional[str],
+    graniot_parcel_id: Optional[str],
+    resolution_key: Optional[str] = None,
+    wms_path: str = "/api/wms/",
+    latest_content: Optional[bytes] = None,
+) -> Optional[str]:
+    """Fecha de la primera escena útil, o None para conservar el comportamiento
+    de siempre (última escena).
+
+    `latest_content`, si viene, es el raster de la escena más reciente ya
+    descargado: si no está plano no hay nada que elegir. Sin él, se sondea
+    también la fecha más nueva del catálogo.
+
+    El resultado (incluido el negativo «todas nubladas») se cachea por
+    lote+capa: el sondeo cuesta una petición pequeña a Graniot por fecha.
+    """
+    clean_layer = str(layer or "").strip()
+    clean_key = str(access_key or "").strip()
+    if not clean_layer or not clean_key or not graniot_parcel_id:
+        return None
+
+    choice_key = _scene_choice_cache_key(parcel_token, clean_key, clean_layer)
+    cached = _cache_get(choice_key)
+    if isinstance(cached, dict):
+        return cached.get("date") or None
+
+    if latest_content is not None and not _scene_looks_flat(latest_content):
+        _cache_set(choice_key, {"date": ""}, SCENE_CHOICE_TTL_SECONDS)
+        return None
+
+    dates = await _list_scene_dates(client, graniot_parcel_id, resolution_key)
+    candidates = dates[: SCENE_PROBE_MAX_DATES + 1]
+    if latest_content is not None and candidates:
+        # La más nueva ya se descargó y estaba plana: no se sondea dos veces.
+        candidates = candidates[1:]
+
+    chosen: Optional[str] = None
+    probed = 0
+    for scene_date in candidates:
+        if probed >= SCENE_PROBE_MAX_DATES:
+            break
+        probed += 1
+        content = await _probe_scene(
+            client,
+            wms_path=wms_path,
+            access_key=clean_key,
+            layer=clean_layer,
+            scene_date=scene_date,
+        )
+        if content is None:
+            continue
+        if not _scene_looks_flat(content):
+            chosen = scene_date
+            break
+
+    log_event({
+        "event": "dataris.graniot.scene_choice",
+        "operation": "scene-choice",
+        "graniot_parcel_id": graniot_parcel_id,
+        "layer": clean_layer,
+        "dates_available": len(dates),
+        "probed": probed,
+        "chosen": chosen,
+    })
+    _cache_set(
+        choice_key,
+        {"date": chosen or ""},
+        SCENE_CHOICE_TTL_SECONDS if chosen else SCENE_CHOICE_NEGATIVE_TTL_SECONDS,
+    )
+    return chosen
+
+
 async def _wms_proxy_impl(
     parcel_id: Optional[str] = None,
     access_key: Optional[str] = None,
@@ -6314,6 +6539,15 @@ async def _wms_proxy_impl(
     # make the browser look like the layer is broken.
     width = max(128, min(int(width or 768), 2048))
     height = max(128, min(int(height or 768), 2048))
+
+    # Sin fecha pedida, se respeta la escena limpia ya elegida para este
+    # lote+capa (si la hay): así el disco cachea directamente la imagen buena.
+    # Va antes de calcular la clave de caché para que la clave lleve la fecha.
+    caller_pinned_time = bool(str(time or "").strip())
+    if not caller_pinned_time:
+        cached_scene_choice = _cache_get(_scene_choice_cache_key(parcel_id, access_key, clean_layer))
+        if isinstance(cached_scene_choice, dict) and cached_scene_choice.get("date"):
+            time = cached_scene_choice["date"]
 
     stable_wms_cache_key = _wms_cache_public_key(
         cache_key=cache_key,
@@ -6641,6 +6875,62 @@ async def _wms_proxy_impl(
                     "source_media_type": media_type,
                     "output_media_type": final_media_type,
                 })
+
+                # Escena nublada: si el llamador no fijó fecha y la última
+                # escena salió plana, se cambia por la primera limpia del
+                # catálogo. El detector solo actúa con certeza (ver
+                # _scene_looks_flat); si no hay escena mejor, se sirve esta.
+                if not caller_pinned_time and not time and _scene_looks_flat(content):
+                    chosen_scene = await _choose_clear_scene_date(
+                        client,
+                        parcel_token=parcel_id,
+                        access_key=params.get("access_key") or access_key,
+                        layer=params.get("layers") or clean_layer,
+                        graniot_parcel_id=local_graniot_parcel_id,
+                        wms_path=wms_path,
+                        latest_content=content,
+                    )
+                    if chosen_scene:
+                        swap_params = _clean_wms_params({
+                            "access_key": params.get("access_key") or access_key,
+                            "layers": params.get("layers") or clean_layer,
+                            "response_format": "image/png",
+                            "time": chosen_scene,
+                            "width": width,
+                            "height": height,
+                        })
+                        try:
+                            swapped = await client.binary_get(
+                                wms_path,
+                                params=swap_params,
+                                use_auth=False,
+                                include_client_id=False,
+                                debug_context={
+                                    "operation": "wms-proxy-scene-swap",
+                                    "local_parcel_id": parcel_id,
+                                    "layer": clean_layer,
+                                    "time": chosen_scene,
+                                },
+                            )
+                            if _is_image_response(swapped):
+                                content = swapped.content
+                                final_media_type = swapped.headers.get("content-type") or final_media_type
+                                _wms_cloud_log(
+                                    logging.WARNING,
+                                    "scene_swapped_for_clouds",
+                                    parcel_id=parcel_id,
+                                    layer=clean_layer,
+                                    time=chosen_scene,
+                                    content_length=len(content or b""),
+                                )
+                        except Exception as exc:
+                            _wms_cloud_exception(
+                                "scene_swap_failed",
+                                exc,
+                                parcel_id=parcel_id,
+                                layer=clean_layer,
+                                time=chosen_scene,
+                            )
 
                 _write_wms_disk_cache(stable_wms_cache_key, content, final_media_type)
                 return _response_with_cache_headers(Response(
