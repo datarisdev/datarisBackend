@@ -14,6 +14,7 @@ con DigiformsApp, que es la única extensión que queda.
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import uuid
@@ -164,8 +165,7 @@ def _modules_of(rows, key, value):
 
 def test_la_migracion_convierte_graniot_en_satelite():
     db = _db_con_graniot()
-    result = compat.merge_graniot_into_satelite(db, "2026-08-20T00:00:00+00:00")
-    assert result["applied"] is True
+    compat.merge_graniot_into_satelite(db, "2026-08-20T00:00:00+00:00")
 
     company_rows = compat.table(db, "company_modules")
     user_rows = compat.table(db, "user_modules")
@@ -189,8 +189,23 @@ def test_la_migracion_convierte_graniot_en_satelite():
     assert not [m for m in compat.table(db, "platform_modules") if m.get("id") == "graniot"]
 
 
-def test_la_migracion_no_se_repite():
+def test_la_migracion_es_idempotente_y_limpia_lo_que_reaparezca():
+    """Se ejecuta en cada normalización, así que repetirla no puede cambiar nada.
+
+    Y si algo vuelve a escribir el id viejo —durante un despliegue, la revisión
+    anterior sigue sembrando `graniot` unos minutos—, la siguiente pasada lo
+    recoge en lugar de dejarlo ahí para siempre.
+    """
     db = _db_con_graniot()
     compat.merge_graniot_into_satelite(db, "2026-08-20T00:00:00+00:00")
-    again = compat.merge_graniot_into_satelite(db, "2026-08-21T00:00:00+00:00")
-    assert again["applied"] is False
+    antes = json.dumps(db["tables"], sort_keys=True)
+    compat.merge_graniot_into_satelite(db, "2026-08-21T00:00:00+00:00")
+    assert json.dumps(db["tables"], sort_keys=True) == antes
+
+    compat.table(db, "platform_modules").append({"id": "graniot", "name": "Graniot"})
+    compat.table(db, "company_modules").append(
+        {"id": "cm-9", "company_id": "empresa-nueva", "module_id": "graniot", "is_enabled": True}
+    )
+    compat.merge_graniot_into_satelite(db, "2026-08-22T00:00:00+00:00")
+    assert not [m for m in compat.table(db, "platform_modules") if m.get("id") == "graniot"]
+    assert _modules_of(compat.table(db, "company_modules"), "company_id", "empresa-nueva") == {"satelite"}
