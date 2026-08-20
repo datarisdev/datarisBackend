@@ -6343,8 +6343,8 @@ SCENE_PROBE_SIZE = 256
 def _scene_choice_cache_key(parcel_token: Optional[str], access_key: Optional[str], layer: Optional[str]) -> str:
     """Clave estable por lote+capa: el parcel_key firmado no cambia al re-firmar."""
     token = _normalized_token(
-        _parcel_key_from_signed_wms_access_key(access_key)
-        or str(parcel_token or "")
+        str(parcel_token or "")
+        or _parcel_key_from_signed_wms_access_key(access_key)
         or str(access_key or "")
     )
     return _stable_hash({"scope": "graniot-scene-choice", "parcel": token, "layer": str(layer or "").strip().upper()})
@@ -6366,15 +6366,23 @@ def _scene_looks_flat(content: Optional[bytes]) -> bool:
 
         with Image.open(_io.BytesIO(content)) as raw_image:
             image = raw_image.convert("RGBA")
-        image.thumbnail((SCENE_PROBE_SIZE, SCENE_PROBE_SIZE))
+        # NEAREST: un reescalado con interpolación mezcla el borde del polígono
+        # con la transparencia e inventa cientos de colores intermedios, y una
+        # escena nublada real dejaba de parecer plana.
+        image.thumbnail((SCENE_PROBE_SIZE, SCENE_PROBE_SIZE), Image.NEAREST)
         colors: set = set()
         visible = 0
         for pixel in image.getdata():
-            if pixel[3] > 0:
-                visible += 1
-                colors.add(pixel[:3])
-                if len(colors) >= SCENE_FLAT_MAX_COLORS:
-                    return False
+            # Solo los píxeles opacos: el borde anti-aliased no es dato.
+            if pixel[3] < 200:
+                continue
+            visible += 1
+            # En cubetas de 8 niveles: el ruido de compresión no cuenta como
+            # color; la diferencia real entre 6-10 colores (nubes) y ~100
+            # (escena útil) sobrevive de sobra.
+            colors.add((pixel[0] // 8, pixel[1] // 8, pixel[2] // 8))
+            if len(colors) >= SCENE_FLAT_MAX_COLORS:
+                return False
         return visible > 0
     except Exception:
         return False
