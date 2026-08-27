@@ -459,3 +459,51 @@ def test_al_volver_a_la_lista_la_bitacora_reaparece_intacta(client, token, empre
     ciclos = client.get("/api/compat/field-log/cycles", headers=_auth(token)).json()["data"]
     assert ciclos["is_configured"] is True
     assert any(item["kpis"]["economics"]["investment_per_ha"] == pytest.approx(14156.0) for item in ciclos["cycles"])
+
+
+# ── Sincronizar por otra empresa ──────────────────────────────────────────────
+def test_solo_un_superadmin_sincroniza_por_otra_empresa(client, token, empresa_conectada):
+    """El superadmin configura la integración de un cliente; también la dispara.
+
+    Sin esto, dejar todo listo y no poder sincronizar obliga a que alguien de esa
+    empresa entre a pulsar el botón, que es donde se quedaban paradas las altas.
+    """
+    # Una empresa sin conexión no se puede sincronizar aunque se pida por id.
+    respuesta = client.post(
+        "/api/compat/sig-agricola/sync",
+        headers=_auth(token),
+        json={"company_id": "empresa-que-no-existe"},
+    )
+    assert respuesta.status_code == 404
+    assert "conexión" in respuesta.json()["detail"].lower()
+
+
+def test_un_usuario_normal_no_puede_sincronizar_por_otra_empresa(client, token, empresa_conectada):
+    """El override es solo para el superadmin: nadie más cruza de empresa."""
+    alta = client.post(
+        "/api/compat/admin/users/manual",
+        headers=_auth(token),
+        json={
+            "email": "tecnico-bitacora@ejemplo.com",
+            "password": "clave-de-prueba-1",
+            "first_name": "Tecnico",
+            "last_name": "Prueba",
+            "admin_role": "company_user",
+            "modules": [],
+        },
+    )
+    assert alta.status_code == 200, alta.text
+    entrada = client.post(
+        "/api/compat/auth/sign-in",
+        json={"email": "tecnico-bitacora@ejemplo.com", "password": "clave-de-prueba-1"},
+    )
+    assert entrada.status_code == 200, entrada.text
+    ajeno = entrada.json()["data"]["session"]["access_token"]
+    # Pide una empresa que no es la suya: ahí es donde entra el guard.
+    respuesta = client.post(
+        "/api/compat/sig-agricola/sync",
+        headers=_auth(ajeno),
+        json={"company_id": "otra-empresa-cualquiera"},
+    )
+    assert respuesta.status_code == 403
+    assert "superadmin" in respuesta.json()["detail"].lower()

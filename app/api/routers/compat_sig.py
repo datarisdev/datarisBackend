@@ -15,7 +15,7 @@ from openpyxl import load_workbook
 from shapely.geometry import Point, shape
 from shapely.geometry.base import BaseGeometry
 
-from app.api.routers.compat import LOCK, bearer_user, now, read_db, table, write_db
+from app.api.routers.compat import LOCK, _is_platform_superadmin, bearer_user, now, read_db, table, write_db
 from app.core.config import settings
 from app.services.telemetry.sig_planning import process_planning_upload
 from app.services.analytics.posthog_client import track_event as _track_analytics_event
@@ -1564,9 +1564,27 @@ async def sync_from_digiforms_api(
         return {"data": {"runs": rows[:2], "errors": [], "demo": True}, "error": None, "message": "Dataset comercial DigiForms actualizado sin consumir servicios externos."}
     with LOCK:
         db = read_db()
-        company_id = _company_id_for_user(db, user_id)
-        if company_id and not extension_enabled_for(db, company_id, user_id):
-            raise HTTPException(status_code=403, detail="DigiForms no está habilitado para tu empresa")
+        # Un superadmin puede sincronizar POR otra empresa indicando su
+        # `company_id`. Sin esto, dejar la integración de un cliente configurada
+        # y no poder dispararla obliga a que alguien de ese cliente entre a
+        # pulsar el botón, que es donde se quedaban paradas las altas nuevas.
+        # El aterrizaje se atribuye a un usuario activo de esa empresa, igual
+        # que hace el cron, para que los datos queden donde deben.
+        requested_company_id = _safe_text(payload.get("company_id"))
+        if requested_company_id and requested_company_id != str(_company_id_for_user(db, user_id) or ""):
+            if not _is_platform_superadmin(db, user_id):
+                raise HTTPException(status_code=403, detail="Solo un superadmin puede sincronizar por otra empresa.")
+            connection = connection_for_company(db, requested_company_id)
+            if not connection:
+                raise HTTPException(status_code=404, detail="Esa empresa no tiene una conexión DigiForms configurada.")
+            actor = _active_company_actor(db, requested_company_id, connection)
+            if not actor:
+                raise HTTPException(status_code=400, detail="Esa empresa no tiene ningún usuario activo al que atribuir la sincronización.")
+            company_id, user_id = requested_company_id, actor
+        else:
+            company_id = _company_id_for_user(db, user_id)
+            if company_id and not extension_enabled_for(db, company_id, user_id):
+                raise HTTPException(status_code=403, detail="DigiForms no está habilitado para tu empresa")
         form_types = _sync_types(db, company_id, payload)
     if not form_types:
         raise HTTPException(status_code=400, detail="Configura al menos un FormId desde Extensiones → DigiForms para sincronizar.")
