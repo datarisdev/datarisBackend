@@ -507,3 +507,26 @@ def test_un_usuario_normal_no_puede_sincronizar_por_otra_empresa(client, token, 
     )
     assert respuesta.status_code == 403
     assert "superadmin" in respuesta.json()["detail"].lower()
+
+
+def test_se_puede_sincronizar_un_solo_formulario_de_la_bitacora(client, token, empresa_conectada):
+    """Cada pasada reescribe el documento compat entero varias veces.
+
+    Con los tres formularios en una sola petición eso son nueve reescrituras de
+    un documento que lleva miles de parcelas, y la petición no llega viva al
+    final. Poder pedir uno solo deja cada pasada al coste de la de cosecha, que
+    siempre ha funcionado.
+    """
+    from app.api.routers import compat
+    from app.api.routers.compat_sig import _sync_types
+
+    with compat.LOCK:
+        db = compat.read_db()
+        company_id = empresa_conectada
+        todos = _sync_types(db, company_id, {})
+        uno = _sync_types(db, company_id, {"form_type": FIELD_LOG_ENTRY_FORM_TYPE})
+        inexistente = _sync_types(db, company_id, {"form_type": "field_log_cycle"})
+
+    assert set(FIELD_LOG_FORM_TYPES).issubset(set(todos))
+    assert uno == [FIELD_LOG_ENTRY_FORM_TYPE]
+    assert inexistente == [FIELD_LOG_CYCLE_FORM_TYPE]

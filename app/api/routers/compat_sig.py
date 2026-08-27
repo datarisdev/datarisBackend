@@ -1462,6 +1462,11 @@ def _sync_types(db: Dict[str, Any], company_id: Optional[str], payload: Dict[str
     # el botón "sincronizar ahora" de un vínculo concreto.
     if is_report_form_type(requested):
         return [requested] if requested in _report_form_types(db, company_id) else []
+    # La bitácora son tres formularios y cada uno tarda lo suyo contra el
+    # proveedor; poder pedir uno solo evita que una pasada larga se lleve por
+    # delante a las otras dos, y es lo mismo que ya se podía hacer con cosecha.
+    if is_field_log_form_type(requested):
+        return [requested] if requested in _configured_form_types(db, company_id) else []
     return _configured_form_types(db, company_id)
 
 
