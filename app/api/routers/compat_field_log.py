@@ -26,6 +26,7 @@ from app.api.routers.compat_sig import (
 from app.services.digiforms_company_config import mappings_for_company
 from app.services.digiforms_field_log import (
     FIELD_LOG_CYCLE_FORM_TYPE,
+    allowed_for as field_log_allowed_for,
     FIELD_LOG_ENTRY_FORM_TYPE,
     FIELD_LOG_FORM_TYPE_LABELS,
     FIELD_LOG_FORM_TYPES,
@@ -96,6 +97,10 @@ def get_status(authorization: Optional[str] = Header(default=None)):
     with LOCK:
         db = read_db()
         company_id = _company_id_for_user(db, str(user.get("id") or ""))
+        # Fuera de la lista blanca la respuesta es la misma que la de quien no ha
+        # configurado nada: la Bitácora no existe para esa empresa.
+        if not field_log_allowed_for(db, company_id, user):
+            return {"data": {"is_configured": False, "forms": []}, "error": None}
         forms = _connection_status(db, company_id)
     return {
         "data": {"is_configured": any(item["is_linked"] for item in forms), "forms": forms},
@@ -111,6 +116,12 @@ def list_cycles(authorization: Optional[str] = Header(default=None)):
     with LOCK:
         db = read_db()
         company_id = _company_id_for_user(db, user_id)
+        if not field_log_allowed_for(db, company_id, user):
+            return {
+                "data": {"cycles": [], "forms": [], "is_configured": False,
+                         "totals": {"cycles": 0, "entries": 0, "cycle_sheets": 0, "phenology": 0}},
+                "error": None,
+            }
         rows = _load(db, company_id=company_id, user_id=user_id)
         status = _connection_status(db, company_id)
     cycles = group_by_cycle(
@@ -142,6 +153,8 @@ def get_cycle(cycle_key: str, authorization: Optional[str] = Header(default=None
     with LOCK:
         db = read_db()
         company_id = _company_id_for_user(db, user_id)
+        if not field_log_allowed_for(db, company_id, user):
+            raise HTTPException(status_code=404, detail="Esa bitácora no existe o no pertenece a tu empresa.")
         rows = _load(db, company_id=company_id, user_id=user_id)
 
     def mine(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -181,6 +194,8 @@ def list_entries(
     with LOCK:
         db = read_db()
         company_id = _company_id_for_user(db, user_id)
+        if not field_log_allowed_for(db, company_id, user):
+            return {"data": [], "error": None, "count": 0}
         entries = _scoped(
             db,
             table_for_form_type(FIELD_LOG_ENTRY_FORM_TYPE),

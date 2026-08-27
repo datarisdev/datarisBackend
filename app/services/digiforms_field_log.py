@@ -27,6 +27,7 @@ forma que esas funciones esperan.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from app.modules.field_log import kpi as field_log_kpi
@@ -56,6 +57,72 @@ FIELD_LOG_TABLES: Dict[str, str] = {
     FIELD_LOG_CYCLE_FORM_TYPE: "field_log_cycle_sheets",
     FIELD_LOG_PHENOLOGY_FORM_TYPE: "field_log_phenology_records",
 }
+
+
+# ── Lista blanca ──────────────────────────────────────────────────────────────
+# La Bitácora está abierta SOLO a FIRA por ahora. No basta con esconder el menú:
+# si el gate viviera solo en el frontend, cualquiera podría pedir los endpoints
+# a mano. Se comprueba aquí, y los tres routers preguntan antes de responder.
+#
+# Se ajusta sin tocar código con DATARIS_FIELD_LOG_ALLOWED (entradas separadas
+# por comas: id de empresa, nombre de empresa o email de usuario, indistintamente;
+# "*" desactiva la restricción y "*@dominio" es comodín de dominio, pensados para
+# desarrollo y tests).
+DEFAULT_FIELD_LOG_ALLOWED = "fira"
+
+
+def field_log_allowlist() -> set[str]:
+    raw = os.getenv("DATARIS_FIELD_LOG_ALLOWED") or DEFAULT_FIELD_LOG_ALLOWED
+    return {entry.strip().lower() for entry in raw.split(",") if entry.strip()}
+
+
+def _matches_allowlist(candidates: Iterable[str], allowed: set[str]) -> bool:
+    for raw in candidates:
+        value = _text(raw).lower()
+        if not value:
+            continue
+        if value in allowed or normalize_key(value) in {normalize_key(item) for item in allowed}:
+            return True
+        # "*@fira.mx": comodín de dominio sobre el email.
+        if any(item.startswith("*") and len(item) > 1 and value.endswith(item[1:]) for item in allowed):
+            return True
+    return False
+
+
+def company_is_allowed(
+    *,
+    company_id: Optional[str],
+    company_name: Optional[str] = None,
+    user_email: Optional[str] = None,
+) -> bool:
+    """¿Esta empresa tiene abierta la Bitácora?
+
+    Se acepta por id, por nombre o por el email de quien pregunta, porque la
+    lista se escribe a mano y quien la escribe no siempre tiene a la vista el
+    uuid de la empresa. Sin empresa resuelta se responde que no: la bitácora es
+    de una empresa, no de un usuario suelto.
+    """
+    allowed = field_log_allowlist()
+    if "*" in allowed:
+        return True
+    if not company_id:
+        return False
+    return _matches_allowlist([company_id, company_name, user_email], allowed)
+
+
+def allowed_for(db: Dict[str, Any], company_id: Optional[str], user: Optional[Dict[str, Any]] = None) -> bool:
+    """`company_is_allowed` resolviendo el nombre de la empresa desde el almacén.
+
+    Es lo que preguntan los routers: cada uno tiene el `db` y el usuario del
+    bearer a mano, y ninguno debería tener que saber cómo se busca una empresa.
+    """
+    rows = db.setdefault("tables", {}).setdefault("companies", [])
+    company = next((row for row in rows if str(row.get("id") or "") == str(company_id or "")), None)
+    return company_is_allowed(
+        company_id=company_id,
+        company_name=(company or {}).get("name"),
+        user_email=(user or {}).get("email"),
+    )
 
 
 def is_field_log_form_type(value: Any) -> bool:

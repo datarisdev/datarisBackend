@@ -46,6 +46,7 @@ from app.services.digiforms_report_links import (
 )
 from app.services.digiforms_field_log import (
     FIELD_LOG_FORM_TYPES,
+    allowed_for as field_log_allowed_for,
     is_field_log_form_type,
     parse_row as parse_field_log_row,
     table_for_form_type as field_log_table_for_form_type,
@@ -568,6 +569,12 @@ def _configured_form_types(db: Dict[str, Any], company_id: Optional[str]) -> Lis
         configured = [form_type for form_type in [HARVEST_FORM_TYPE, PEST_WEED_FORM_TYPE] if _form_id_for_type(db, company_id, form_type)]
     # Los formularios enlazados a plantillas se sincronizan en la misma pasada
     # que los dos formatos históricos, con su propio cursor cada uno.
+    #
+    # La bitácora, además, solo se sincroniza si la empresa la tiene abierta: un
+    # vínculo que sobreviva a un cambio de la lista blanca no debe seguir
+    # trayendo datos a un módulo que ya nadie de esa empresa puede abrir.
+    if not field_log_allowed_for(db, company_id):
+        configured = [form_type for form_type in configured if form_type not in FIELD_LOG_FORM_TYPES]
     return [*configured, *_report_form_types(db, company_id)]
 
 
@@ -1831,6 +1838,8 @@ def list_field_log_records(
     with LOCK:
         db = read_db()
         company_id = _company_id_for_user(db, user_id)
+        if not field_log_allowed_for(db, company_id, user):
+            return {"data": [], "error": None, "count": 0}
         rows = [
             {key: row.get(key) for key in campos_de_mapa}
             for row in table(db, "field_log_records")

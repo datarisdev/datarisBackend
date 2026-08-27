@@ -23,6 +23,9 @@ import pytest
 os.environ.setdefault("DISABLE_AZURE_BLOB_STORAGE", "true")
 os.environ["DATARIS_COMPAT_PERSISTENCE"] = "file"
 os.environ["DATARIS_COMPAT_STORAGE_DIR"] = tempfile.mkdtemp(prefix="dataris-compat-bitacora-")
+# La Bitácora está abierta solo a FIRA en producción. Aquí se abre a la empresa
+# semilla para poder ejercitar el flujo; el cierre tiene sus propios casos.
+os.environ["DATARIS_FIELD_LOG_ALLOWED"] = "DATARIS"
 
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -34,6 +37,7 @@ from app.api.routers.compat_sig import (  # noqa: E402
 )
 from app.services.digiforms_field_log import (  # noqa: E402
     FIELD_LOG_CYCLE_FORM_TYPE,
+    company_is_allowed,
     FIELD_LOG_FORM_TYPES,
     FIELD_LOG_ENTRY_FORM_TYPE,
     FIELD_LOG_PHENOLOGY_FORM_TYPE,
@@ -398,3 +402,60 @@ def test_una_labor_sin_gps_se_guarda_pero_no_se_pinta(client, token, empresa_con
     huerfano = next(item for item in ciclos if item["ciclo"] == "PV 2026 SIN GPS")
     assert huerfano["kpis"]["economics"]["investment_per_ha"] == pytest.approx(500.0)
     assert huerfano["located_entry_count"] == 0
+
+
+# ── Lista blanca ──────────────────────────────────────────────────────────────
+@pytest.mark.parametrize(
+    "company_name, esperado",
+    [("FIRA", True), ("fira", True), ("Summagro", False), ("DATARIS", False)],
+)
+def test_solo_las_empresas_de_la_lista_tienen_bitacora(monkeypatch, company_name, esperado):
+    """Por ahora solo FIRA. El nombre se compara sin distinguir mayúsculas."""
+    monkeypatch.setenv("DATARIS_FIELD_LOG_ALLOWED", "fira")
+    assert company_is_allowed(company_id="c-1", company_name=company_name) is esperado
+
+
+def test_sin_empresa_resuelta_no_hay_bitacora(monkeypatch):
+    """La bitácora es de una empresa; un usuario suelto no la abre."""
+    monkeypatch.setenv("DATARIS_FIELD_LOG_ALLOWED", "fira")
+    assert company_is_allowed(company_id=None, company_name="FIRA") is False
+
+
+def test_una_empresa_fuera_de_la_lista_no_ve_nada(client, token, empresa_conectada, monkeypatch):
+    """El cierre vive en el backend, no en el menú.
+
+    Aunque la empresa tenga sus formularios enlazados y sus respuestas ya
+    sincronizadas —que es el caso a estas alturas del módulo—, quedarse fuera de
+    la lista blanca la deja sin bitácora por todas las vías, no solo sin entrada
+    en el menú.
+    """
+    monkeypatch.setenv("DATARIS_FIELD_LOG_ALLOWED", "fira")
+
+    estado = client.get("/api/compat/field-log/status", headers=_auth(token))
+    assert estado.json()["data"] == {"is_configured": False, "forms": []}
+
+    ciclos = client.get("/api/compat/field-log/cycles", headers=_auth(token))
+    assert ciclos.json()["data"]["cycles"] == []
+    assert ciclos.json()["data"]["is_configured"] is False
+
+    assert client.get("/api/compat/field-log/entries", headers=_auth(token)).json()["data"] == []
+    assert client.get("/api/compat/sig-agricola/field-log-records", headers=_auth(token)).json()["data"] == []
+
+    vinculos = client.get("/api/compat/extensions/digiforms/field-log-links", headers=_auth(token))
+    assert vinculos.json()["data"] == {"links": [], "can_edit": False}
+
+    # Y no se puede enlazar a ciegas: el error dice qué hacer.
+    intento = client.post(
+        "/api/compat/extensions/digiforms/field-log-links",
+        headers=_auth(token),
+        json={"entry_form_id": "2534"},
+    )
+    assert intento.status_code == 403
+    assert "DATARIS_FIELD_LOG_ALLOWED" in intento.json()["detail"]
+
+
+def test_al_volver_a_la_lista_la_bitacora_reaparece_intacta(client, token, empresa_conectada):
+    """Cerrar el acceso no borra nada: es una puerta, no un borrado."""
+    ciclos = client.get("/api/compat/field-log/cycles", headers=_auth(token)).json()["data"]
+    assert ciclos["is_configured"] is True
+    assert any(item["kpis"]["economics"]["investment_per_ha"] == pytest.approx(14156.0) for item in ciclos["cycles"])

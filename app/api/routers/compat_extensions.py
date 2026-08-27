@@ -30,6 +30,7 @@ from app.services.digiforms_company_config import (
 from app.services.digiforms_data_api import DigiformsDataAPI, DigiformsDataAPIError
 from app.services.digiforms_field_log import (
     FIELD_LOG_CYCLE_FORM_TYPE,
+    allowed_for as field_log_allowed_for,
     FIELD_LOG_ENTRY_FORM_TYPE as FIELD_LOG_FORM_TYPE,
     FIELD_LOG_FORM_TYPE_LABELS,
     FIELD_LOG_FORM_TYPES,
@@ -1584,6 +1585,8 @@ def list_field_log_links(authorization: Optional[str] = Header(default=None)):
         db = read_db()
         scope = current_link_scope(db, user)
         company_id = scope.get("company_id")
+        if not field_log_allowed_for(db, company_id, user):
+            return {"data": {"links": [], "can_edit": False}, "error": None}
         mappings = {str(row.get("form_type")): row for row in mappings_for_company(db, company_id)}
         catalog = {str(item.get("form_id")): item for item in forms_for_company(db, company_id)}
         links = []
@@ -1617,6 +1620,14 @@ def save_field_log_links(payload: Dict[str, Any] = Body(default_factory=dict), a
         db = read_db()
         scope = require_company_admin_scope(db, user, str(payload.get("company_id") or "") or None)
         company_id = str(scope.get("company_id") or "")
+        if not field_log_allowed_for(db, company_id, user):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "La Bitácora de campo todavía no está abierta para esta empresa. "
+                    "Añádela a DATARIS_FIELD_LOG_ALLOWED antes de enlazar sus formularios."
+                ),
+            )
         default_start, default_end = _default_initial_sync_dates()
         timestamp = now()
         saved = []
