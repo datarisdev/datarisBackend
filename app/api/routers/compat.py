@@ -85,6 +85,7 @@ TABLES = [
     "extension_requests", "digiforms_accounts", "digiforms_user_links", "digiforms_operation_logs",
     "digiforms_connections", "digiforms_form_mappings",
     "sig_import_runs", "sig_harvest_records", "sig_pest_weed_records", "sig_harvest_overrides", "sig_sync_cursors", "digiforms_raw_submissions",
+    "field_log_records", "field_log_cycle_sheets", "field_log_phenology_records",
 ]
 
 USER_SCOPED_TABLES = {
@@ -118,6 +119,12 @@ USER_SCOPED_TABLES = {
     # configuración de un cliente y no debe verse desde otro.
     "digiforms_forms",
     "digiforms_form_mappings",
+    # Bitácora de campo: las labores, las fichas de ciclo y la fenología que
+    # llegan de AgtechApps se comparten dentro de la empresa —el técnico las
+    # llena y el gabinete las lee— y no salen de ella.
+    "field_log_records",
+    "field_log_cycle_sheets",
+    "field_log_phenology_records",
 }
 
 PARCEL_CHILD_TABLES = {
@@ -1232,7 +1239,12 @@ def scoped_table_rows(db: Dict[str, Any], table_name: str, user: Optional[Dict[s
         # sale de ella. Sin empresa resuelta no se ve nada.
         cid = str(_company_for_user(db, user_id) or "")
         return [row for row in rows if cid and str(row.get("company_id") or "") == cid]
-    if table_name == "report_submissions":
+    if table_name in {
+        "report_submissions",
+        "field_log_records",
+        "field_log_cycle_sheets",
+        "field_log_phenology_records",
+    }:
         # Los envíos se comparten dentro de la empresa; además cada quien ve los
         # suyos aunque su empresa no esté resuelta.
         cid = str(_company_for_user(db, user_id) or "")

@@ -29,37 +29,16 @@ from sqlalchemy.sql import func
 
 from app.models.base import Base
 
-# Las diez categorías de la bitácora, en el orden en el que se presentan y se
-# suman. El orden importa: es el del resumen de costos y el de la exportación.
-LOG_CATEGORIES: tuple[str, ...] = (
-    "acondicionamiento",
-    "siembra",
-    "riego",
-    "fertilizante",
-    "malezas",
-    "plagas",
-    "enfermedades",
-    "foliar",
-    "diversos",
-    "cosecha",
+# El vocabulario de la bitácora vive en `catalog.py`, sin dependencias del
+# ORM, para que los cálculos y el conector de AgtechApps puedan importarlo
+# sin cargar los modelos. Se reexporta aquí porque es donde lo buscan el
+# resto de módulos desde que existe la bitácora.
+from app.modules.field_log.catalog import (  # noqa: F401,E402
+    CATEGORY_LABELS,
+    CYCLE_STATUSES,
+    ENTRY_SOURCES,
+    LOG_CATEGORIES,
 )
-
-CATEGORY_LABELS: dict[str, str] = {
-    "acondicionamiento": "1. Acondicionamiento",
-    "siembra": "2. Siembra",
-    "riego": "3. Riegos",
-    "fertilizante": "4. Fertilizante",
-    "malezas": "5. Manejo de malezas",
-    "plagas": "6. Manejo de plagas",
-    "enfermedades": "7. Manejo de enfermedades",
-    "foliar": "8. Aplicaciones foliares",
-    "diversos": "9. Diversos",
-    "cosecha": "10. Cosecha",
-}
-
-CYCLE_STATUSES: tuple[str, ...] = ("planning", "active", "closed")
-
-ENTRY_SOURCES: tuple[str, ...] = ("mobile", "web", "digiforms", "import", "harvest")
 
 
 class CropCycle(Base):
