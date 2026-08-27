@@ -82,6 +82,27 @@ def _connection_status(db: Dict[str, Any], company_id: Optional[str]) -> List[Di
     return status
 
 
+@router.get("/status")
+def get_status(authorization: Optional[str] = Header(default=None)):
+    """Si la empresa tiene la bitácora conectada, y nada más.
+
+    Lo consulta la barra lateral para decidir si enseña el módulo, así que tiene
+    que ser barato: mira los vínculos y los cursores, sin leer las respuestas ni
+    calcular ningún indicador. `/cycles` hace ambas cosas y sería un desperdicio
+    ejecutarlo en cada carga de página solo para pintar —o no— una entrada de
+    menú.
+    """
+    user = _require_user(authorization)
+    with LOCK:
+        db = read_db()
+        company_id = _company_id_for_user(db, str(user.get("id") or ""))
+        forms = _connection_status(db, company_id)
+    return {
+        "data": {"is_configured": any(item["is_linked"] for item in forms), "forms": forms},
+        "error": None,
+    }
+
+
 @router.get("/cycles")
 def list_cycles(authorization: Optional[str] = Header(default=None)):
     """Todas las bitácoras de la empresa, ya calculadas."""

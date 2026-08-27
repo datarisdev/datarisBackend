@@ -34,6 +34,7 @@ from app.api.routers.compat_sig import (  # noqa: E402
 )
 from app.services.digiforms_field_log import (  # noqa: E402
     FIELD_LOG_CYCLE_FORM_TYPE,
+    FIELD_LOG_FORM_TYPES,
     FIELD_LOG_ENTRY_FORM_TYPE,
     FIELD_LOG_PHENOLOGY_FORM_TYPE,
     cycle_key,
@@ -272,6 +273,20 @@ def empresa_conectada(client: TestClient, token: str) -> str:
     return response.json()["data"]["connection"]["company_id"]
 
 
+def test_el_estado_dice_que_no_antes_de_enlazar_nada(client, token, empresa_conectada):
+    """La barra lateral pregunta esto para decidir si enseña el módulo.
+
+    Antes de enlazar, tiene que responder que no: el módulo se retiró en agosto
+    justo por aparecer sin llevar a ninguna parte.
+    """
+    response = client.get("/api/compat/field-log/status", headers=_auth(token))
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["is_configured"] is False
+    assert {item["form_type"] for item in data["forms"]} == set(FIELD_LOG_FORM_TYPES)
+    assert not any(item["is_linked"] for item in data["forms"])
+
+
 def test_los_tres_formularios_se_enlazan_de_una_vez(client, token, empresa_conectada):
     response = client.post(
         "/api/compat/extensions/digiforms/field-log-links",
@@ -286,6 +301,10 @@ def test_los_tres_formularios_se_enlazan_de_una_vez(client, token, empresa_conec
     assert links[FIELD_LOG_CYCLE_FORM_TYPE]["form_id"] == "2533"
     assert links[FIELD_LOG_PHENOLOGY_FORM_TYPE]["form_id"] == "2532"
     assert all(item["is_enabled"] for item in links.values())
+
+    # Y a partir de aquí el módulo sí se le enseña a esta empresa.
+    estado = client.get("/api/compat/field-log/status", headers=_auth(token))
+    assert estado.json()["data"]["is_configured"] is True
 
 
 def _sincroniza(form_type: str, form_id: str, rows: list, company_id: str, user_id: str, parcelas=()):
