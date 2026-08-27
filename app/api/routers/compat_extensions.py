@@ -28,6 +28,14 @@ from app.services.digiforms_company_config import (
     safe_mappings,
 )
 from app.services.digiforms_data_api import DigiformsDataAPI, DigiformsDataAPIError
+from app.services.digiforms_field_log import (
+    FIELD_LOG_CYCLE_FORM_TYPE,
+    allowed_for as field_log_allowed_for,
+    FIELD_LOG_ENTRY_FORM_TYPE as FIELD_LOG_FORM_TYPE,
+    FIELD_LOG_FORM_TYPE_LABELS,
+    FIELD_LOG_FORM_TYPES,
+    FIELD_LOG_PHENOLOGY_FORM_TYPE,
+)
 from app.services.digiforms_report_links import (
     find_form,
     forms_for_company,
@@ -1558,3 +1566,106 @@ def delete_report_link(form_id: str, authorization: Optional[str] = Header(defau
             cursors.remove(cursor)
         write_db(db)
     return {"data": {"ok": True}, "error": None}
+
+
+# ---------------------------------------------------------------------------
+# Vínculo de la Bitácora de campo con sus tres formularios de AgtechApps
+# ---------------------------------------------------------------------------
+#
+# La bitácora no se enlaza con una plantilla libre como los reportes: sus tres
+# formularios tienen un significado fijo —labores, ficha del ciclo y fenología—
+# porque de ahí salen los cálculos de la hoja del CDT. Por eso se configuran los
+# tres de una vez y no hay mapeo de campos que revisar.
+
+
+@router.get("/digiforms/field-log-links")
+def list_field_log_links(authorization: Optional[str] = Header(default=None)):
+    user = require_user(authorization)
+    with LOCK:
+        db = read_db()
+        scope = current_link_scope(db, user)
+        company_id = scope.get("company_id")
+        if not field_log_allowed_for(db, company_id, user):
+            return {"data": {"links": [], "can_edit": False}, "error": None}
+        mappings = {str(row.get("form_type")): row for row in mappings_for_company(db, company_id)}
+        catalog = {str(item.get("form_id")): item for item in forms_for_company(db, company_id)}
+        links = []
+        for form_type in FIELD_LOG_FORM_TYPES:
+            mapping = mappings.get(form_type) or {}
+            form_id = str(mapping.get("form_id") or "")
+            links.append({
+                "form_type": form_type,
+                "label": FIELD_LOG_FORM_TYPE_LABELS[form_type],
+                "form_id": form_id,
+                "form_name": (catalog.get(form_id) or {}).get("name") or mapping.get("display_name") or "",
+                "is_enabled": bool(form_id) and mapping.get("is_enabled", True) is not False,
+                "initial_response_id": int(mapping.get("initial_response_id") or 0),
+                "initial_sync_start_date": mapping.get("initial_sync_start_date"),
+                "initial_sync_end_date": mapping.get("initial_sync_end_date"),
+            })
+        can_edit = is_admin(scope.get("admin"))
+    return {"data": {"links": links, "can_edit": can_edit}, "error": None}
+
+
+@router.post("/digiforms/field-log-links")
+def save_field_log_links(payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
+    """Enlaza los tres formularios de la bitácora de una empresa.
+
+    Un formulario vacío desactiva su parte sin borrar lo ya sincronizado: se
+    puede empezar solo por las labores y añadir la ficha del ciclo más tarde,
+    que es el orden en el que un cliente suele arrancar.
+    """
+    user = require_user(authorization)
+    with LOCK:
+        db = read_db()
+        scope = require_company_admin_scope(db, user, str(payload.get("company_id") or "") or None)
+        company_id = str(scope.get("company_id") or "")
+        if not field_log_allowed_for(db, company_id, user):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "La Bitácora de campo todavía no está abierta para esta empresa. "
+                    "Añádela a DATARIS_FIELD_LOG_ALLOWED antes de enlazar sus formularios."
+                ),
+            )
+        default_start, default_end = _default_initial_sync_dates()
+        timestamp = now()
+        saved = []
+        for form_type, key in (
+            (FIELD_LOG_FORM_TYPE, "entry_form_id"),
+            (FIELD_LOG_CYCLE_FORM_TYPE, "cycle_form_id"),
+            (FIELD_LOG_PHENOLOGY_FORM_TYPE, "phenology_form_id"),
+        ):
+            form_id = str(payload.get(key) or "").strip()
+            previous = mapping_for_company(db, company_id, form_type) or {}
+            if not form_id and not previous:
+                continue
+            initial_response_id = int(payload.get("initial_response_id") or previous.get("initial_response_id") or 0)
+            start_date = _clean_iso_date(payload.get("initial_sync_start_date"), str(previous.get("initial_sync_start_date") or default_start))
+            end_date = _clean_iso_date(payload.get("initial_sync_end_date"), str(previous.get("initial_sync_end_date") or default_end))
+            catalog_entry = find_form(db, company_id, form_id) if form_id else None
+            mapping = _upsert_form_mapping(
+                db,
+                company_id=company_id,
+                form_type=form_type,
+                form_id=form_id,
+                display_name=str((catalog_entry or {}).get("name") or FIELD_LOG_FORM_TYPE_LABELS[form_type]),
+                initial_response_id=initial_response_id,
+                initial_sync_start_date=start_date,
+                initial_sync_end_date=end_date,
+                timestamp=timestamp,
+            )
+            # Cambiar de formulario invalida la posición del cursor: el id de
+            # respuesta de un formulario no significa nada en otro.
+            if form_id and (str(previous.get("form_id") or "") != form_id or payload.get("reset_cursor") is True):
+                _reset_company_cursor(
+                    db,
+                    company_id=company_id,
+                    form_type=form_type,
+                    form_id=form_id,
+                    initial_response_id=initial_response_id,
+                    timestamp=timestamp,
+                )
+            saved.append(safe_mappings([mapping])[0])
+        write_db(db)
+    return {"data": {"links": saved}, "error": None, "message": "Bitácora de campo enlazada con AgtechApps."}

@@ -26,7 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 
-from app.modules.field_log.models import CATEGORY_LABELS, LOG_CATEGORIES
+from app.modules.field_log.catalog import CATEGORY_LABELS, LOG_CATEGORIES
 
 
 @dataclass(frozen=True)

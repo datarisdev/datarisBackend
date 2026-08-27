@@ -44,6 +44,13 @@ from app.services.digiforms_report_links import (
     photos_from_image_urls,
     values_from_response,
 )
+from app.services.digiforms_field_log import (
+    FIELD_LOG_FORM_TYPES,
+    allowed_for as field_log_allowed_for,
+    is_field_log_form_type,
+    parse_row as parse_field_log_row,
+    table_for_form_type as field_log_table_for_form_type,
+)
 from app.api.routers.compat_extensions import company_for_user, extension_enabled_for
 from app.services.commercial_demo_seed import is_commercial_demo_user
 
@@ -562,6 +569,12 @@ def _configured_form_types(db: Dict[str, Any], company_id: Optional[str]) -> Lis
         configured = [form_type for form_type in [HARVEST_FORM_TYPE, PEST_WEED_FORM_TYPE] if _form_id_for_type(db, company_id, form_type)]
     # Los formularios enlazados a plantillas se sincronizan en la misma pasada
     # que los dos formatos históricos, con su propio cursor cada uno.
+    #
+    # La bitácora, además, solo se sincroniza si la empresa la tiene abierta: un
+    # vínculo que sobreviva a un cambio de la lista blanca no debe seguir
+    # trayendo datos a un módulo que ya nadie de esa empresa puede abrir.
+    if not field_log_allowed_for(db, company_id):
+        configured = [form_type for form_type in configured if form_type not in FIELD_LOG_FORM_TYPES]
     return [*configured, *_report_form_types(db, company_id)]
 
 
@@ -950,6 +963,252 @@ def _persist_report_submissions(
     return run
 
 
+def _parcel_name_index(parcels: Sequence[Dict[str, Any]]) -> Dict[str, str]:
+    """Índice de nombres y códigos de lote → id de parcela.
+
+    Se mide contra datos reales que el cruce por código de lote gana al
+    point-in-polygon: con los registros del SIG, el GPS resolvió 6 de 9 (tres
+    puntos caían en el borde o en el camino) y el código de lote resolvió 9 de
+    9. Por eso la bitácora usa el texto del campo «Parcela / Lote» como fuente
+    primaria y deja las coordenadas como respaldo.
+
+    Se indexan varias formas de escribir lo mismo, y las ambiguas se descartan:
+    si dos parcelas comparten un código, ese código no identifica a ninguna.
+    """
+    index: Dict[str, str] = {}
+    ambiguous: set[str] = set()
+
+    def add(key: str, parcel_id: str) -> None:
+        normalized = _normalize(key)
+        if len(normalized) < 3:
+            return
+        current = index.get(normalized)
+        if current and current != parcel_id:
+            ambiguous.add(normalized)
+            return
+        index[normalized] = parcel_id
+
+    for parcel in parcels:
+        parcel_id = _safe_text(parcel.get("id"))
+        if not parcel_id:
+            continue
+        for value in (parcel.get("name"), parcel.get("lote"), parcel.get("codigo")):
+            text = _safe_text(value)
+            if not text:
+                continue
+            add(text, parcel_id)
+            # "0311 (NUEVA LINDA (PILAR))" también se busca por su código suelto.
+            head = text.split("(")[0].strip()
+            if head and head != text:
+                add(head, parcel_id)
+
+    for key in ambiguous:
+        index.pop(key, None)
+    return index
+
+
+def _match_parcel_by_name(value: Any, name_index: Dict[str, str]) -> Optional[str]:
+    normalized = _normalize(value)
+    if len(normalized) < 3:
+        return None
+    if normalized in name_index:
+        return name_index[normalized]
+    # El técnico escribe «Lote 0311» donde la parcela se llama «0311»: se acepta
+    # la coincidencia por contención cuando es la única.
+    matches = {
+        parcel_id
+        for key, parcel_id in name_index.items()
+        if len(key) >= 4 and (key in normalized or normalized in key)
+    }
+    return matches.pop() if len(matches) == 1 else None
+
+
+def _field_log_record(
+    row: Dict[str, Any],
+    index: int,
+    features: Sequence[Tuple[str, str, BaseGeometry]],
+    name_index: Dict[str, str],
+    *,
+    form_type: str,
+) -> Dict[str, Any]:
+    """Convierte una respuesta de la bitácora en un registro calculable.
+
+    Como en los reportes —y al revés que cosecha y malezas— una respuesta sin
+    GPS **no se descarta**: la bitácora sirve para calcular costos, y perder una
+    labor porque el móvil no fijó posición falsearía la inversión del ciclo. Se
+    guarda igual, marcada, y solo se queda fuera de la capa del mapa.
+    """
+    parsed = parse_field_log_row(form_type, row)
+    coords = _parse_coordinates(row)
+    lat, lng = coords if coords else (None, None)
+    gps_parcel_id, feature_key = _match_point(lat, lng, features) if coords else (None, None)
+    named_parcel_id = _match_parcel_by_name(parsed.get("parcela"), name_index)
+    parcel_id = named_parcel_id or gps_parcel_id
+    return {
+        **parsed,
+        "external_response_id": _stable_external_id(form_type, row, index),
+        "lat": lat,
+        "lng": lng,
+        "has_location": coords is not None,
+        "parcel_id": parcel_id,
+        "parcel_match_source": "lote" if named_parcel_id else ("gps" if gps_parcel_id else None),
+        "feature_key": feature_key,
+        "outside_registered_parcel": coords is not None and feature_key is None,
+        "digiforms_state": _safe_text(_first_value(row, ["State", "EstadoAprobacion", "ApprovalState"], "0")) or "0",
+        "image_urls": [_safe_text(value) for value in (row.get("_image_urls") or []) if _safe_text(value)],
+        "dynamic_fields": _json_safe(dynamic_fields_from_payload(row)),
+        "raw_payload": _json_safe(row.get("_raw_api_payload") or {key: value for key, value in row.items() if key not in {"_hyperlinks", "_raw_api_payload"}}),
+    }
+
+
+def _persist_field_log_records(
+    *,
+    db: Dict[str, Any],
+    user_id: str,
+    company_id: Optional[str],
+    form_type: str,
+    form_id: str,
+    response_rows: Sequence[Dict[str, Any]],
+    image_rows: Sequence[Dict[str, Any]],
+    parcels: Sequence[Dict[str, Any]],
+    cursor_before: int,
+    sync_mode: str,
+    initial_sync_start_date: Optional[str] = None,
+    initial_sync_end_date: Optional[str] = None,
+    warning: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Aterriza las respuestas de la bitácora en su tabla y actualiza el cursor.
+
+    Cada uno de los tres formularios tiene su propia tabla —labores, fichas de
+    ciclo y fenología— porque son entidades distintas que se consultan juntas
+    solo al calcular. Los cálculos no se guardan: se recalculan al consultar,
+    igual que la hoja los recalcula al abrirla.
+    """
+    features = _build_feature_index(parcels)
+    name_index = _parcel_name_index(parcels)
+    image_map = _api_image_map(image_rows)
+
+    run_id = str(uuid.uuid4())
+    timestamp = now()
+    raw_rows_persisted = _persist_raw_api_submissions(
+        db=db,
+        user_id=user_id,
+        company_id=company_id,
+        form_type=form_type,
+        form_id=form_id,
+        response_rows=response_rows,
+        image_map=image_map,
+        timestamp=timestamp,
+    )
+
+    destination = table(db, field_log_table_for_form_type(form_type))
+    existing_by_external = {
+        str(item.get("external_response_id")): item
+        for item in destination
+        if _same_company_or_legacy_user(item, company_id=company_id, user_id=user_id) and item.get("external_response_id")
+    }
+
+    imported_rows = 0
+    updated_rows = 0
+    duplicate_rows = 0
+    without_location = 0
+    outside_rows = 0
+    unclassified_rows = 0
+    unmatched_parcel_rows = 0
+    seen_in_response: set[str] = set()
+
+    for index, api_row in enumerate(response_rows[:MAX_ROWS_PER_IMPORT]):
+        row = dict(api_row)
+        response_id = response_id_from_payload(row)
+        row["_image_urls"] = image_map.get(response_id, [])
+        row.setdefault("State", state_from_payload(row))
+        parsed = _field_log_record(row, index, features, name_index, form_type=form_type)
+
+        external_id = str(parsed["external_response_id"])
+        if external_id in seen_in_response:
+            duplicate_rows += 1
+            continue
+        seen_in_response.add(external_id)
+        if not parsed["has_location"]:
+            without_location += 1
+        if parsed["outside_registered_parcel"]:
+            outside_rows += 1
+        if not parsed.get("parcel_id"):
+            unmatched_parcel_rows += 1
+        if "categoria" in parsed and not parsed.get("categoria_reconocida", True):
+            unclassified_rows += 1
+
+        common = {
+            **parsed,
+            "form_type": form_type,
+            "digiforms_form_id": form_id,
+            "company_id": company_id,
+            "user_id": user_id,
+            "source": DIGIFORMS_RESULTS_API_SOURCE,
+            "import_run_id": run_id,
+            "updated_at": timestamp,
+        }
+        existing = existing_by_external.get(external_id)
+        if existing:
+            existing.update(common)
+            updated_rows += 1
+        else:
+            item = {"id": str(uuid.uuid4()), "created_at": timestamp, **common}
+            destination.append(item)
+            existing_by_external[external_id] = item
+            imported_rows += 1
+
+    cursor_after = _highest_response_id(response_rows, cursor_before)
+    cursor = _cursor_row(db, company_id, user_id, form_type, create=True)
+    if cursor is not None:
+        cursor.update({
+            "form_id": form_id,
+            "last_response_id": cursor_after,
+            "last_sync_at": timestamp,
+            "last_success_at": timestamp,
+            "last_error": None,
+            "last_request_mode": sync_mode,
+            "updated_at": timestamp,
+        })
+
+    run = {
+        "id": run_id,
+        "user_id": user_id,
+        "company_id": company_id,
+        "form_type": form_type,
+        "form_id": form_id,
+        "source": DIGIFORMS_RESULTS_API_SOURCE,
+        "file_name": "API por fechas" if sync_mode == "initial_date_range" else "API incremental",
+        "status": "completed",
+        "total_rows": len(response_rows),
+        "valid_rows": len(seen_in_response),
+        "imported_rows": imported_rows,
+        "updated_rows": updated_rows,
+        "duplicate_rows": duplicate_rows,
+        "invalid_rows": 0,
+        "rows_without_location": without_location,
+        "outside_registered_parcel_rows": outside_rows,
+        # Las dos señales que dicen si hay que revisar el formulario o el
+        # catálogo de lotes, en vez de dejar el dato mal sumado en silencio.
+        "unclassified_category_rows": unclassified_rows,
+        "unmatched_parcel_rows": unmatched_parcel_rows,
+        "parcel_features_received": len(features),
+        "images_received": len(image_rows),
+        "raw_rows_persisted": raw_rows_persisted,
+        "discovered_fields": discover_field_names(response_rows),
+        "sync_mode": sync_mode,
+        "initial_sync_start_date": initial_sync_start_date,
+        "initial_sync_end_date": initial_sync_end_date,
+        "cursor_before": cursor_before,
+        "cursor_after": cursor_after,
+        "warning": warning,
+        "created_at": timestamp,
+        "updated_at": timestamp,
+    }
+    table(db, "sig_import_runs").append(run)
+    return run
+
+
 def _persist_api_records(
     *,
     db: Dict[str, Any],
@@ -966,6 +1225,23 @@ def _persist_api_records(
     initial_sync_end_date: Optional[str] = None,
     warning: Optional[str] = None,
 ) -> Dict[str, Any]:
+    if is_field_log_form_type(form_type):
+        return _persist_field_log_records(
+            db=db,
+            user_id=user_id,
+            company_id=company_id,
+            form_type=form_type,
+            form_id=form_id,
+            response_rows=response_rows,
+            image_rows=image_rows,
+            parcels=parcels,
+            cursor_before=cursor_before,
+            sync_mode=sync_mode,
+            initial_sync_start_date=initial_sync_start_date,
+            initial_sync_end_date=initial_sync_end_date,
+            warning=warning,
+        )
+
     if is_report_form_type(form_type):
         return _persist_report_submissions(
             db=db,
@@ -1531,6 +1807,49 @@ def list_report_records(
         names = {str(item.get("id")): item.get("name") for item in table(db, "report_templates")}
     for row in rows:
         row["template_name"] = names.get(str(row.get("template_id") or "")) or row.get("template_key")
+    return {"data": rows, "error": None, "count": len(rows)}
+
+
+@router.get("/field-log-records")
+def list_field_log_records(
+    cycle_key: Optional[str] = Query(default=None),
+    include_non_approved: bool = Query(default=False),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Labores de la bitácora con GPS, para pintarlas como capa del SIG.
+
+    Es la respuesta directa a «si lleno el formulario, que aparezca en el
+    mapa»: cada labor que el técnico registró en AgtechApps con su ubicación
+    sale aquí con lo mínimo para dibujar el punto y abrir su globo —categoría,
+    concepto, costo y lote— sin arrastrar el payload crudo del proveedor.
+
+    Las labores **sin** GPS no salen: siguen contando para los cálculos del
+    módulo de Bitácora, pero no hay dónde dibujarlas.
+    """
+    user = _require_user(authorization)
+    user_id = str(user.get("id") or "")
+    campos_de_mapa = (
+        "id", "external_response_id", "cycle_key", "ciclo", "validacion", "parcela", "sector",
+        "categoria", "categoria_label", "concepto", "unidad", "cantidad", "costo_unitario",
+        "costo_ha", "operador", "fecha", "hora", "observaciones", "data",
+        "lat", "lng", "parcel_id", "parcel_match_source", "feature_key",
+        "outside_registered_parcel", "digiforms_form_id", "source", "created_at", "updated_at",
+    )
+    with LOCK:
+        db = read_db()
+        company_id = _company_id_for_user(db, user_id)
+        if not field_log_allowed_for(db, company_id, user):
+            return {"data": [], "error": None, "count": 0}
+        rows = [
+            {key: row.get(key) for key in campos_de_mapa}
+            for row in table(db, "field_log_records")
+            if _same_company_or_legacy_user(row, company_id=company_id, user_id=user_id)
+            and row.get("lat") is not None
+            and row.get("lng") is not None
+            and (not cycle_key or str(row.get("cycle_key") or "") == cycle_key)
+            and (include_non_approved or _safe_text(row.get("digiforms_state") or "0") == "0")
+        ]
+    rows.sort(key=lambda row: str(row.get("fecha") or row.get("updated_at") or ""), reverse=True)
     return {"data": rows, "error": None, "count": len(rows)}
 
 

@@ -10,7 +10,20 @@ from app.core.config import settings
 
 HARVEST_FORM_TYPE = "harvest"
 PEST_WEED_FORM_TYPE = "pest_weed"
-SUPPORTED_FORM_TYPES = (HARVEST_FORM_TYPE, PEST_WEED_FORM_TYPE)
+# La bitácora de campo son tres formularios de AgtechApps que se sincronizan
+# igual que los dos históricos, cada uno con su propio cursor. Se declaran aquí
+# —y no como vínculos con plantilla— porque su destino es una tabla propia con
+# los cálculos de la hoja del CDT, no un reporte libre.
+FIELD_LOG_FORM_TYPE = "field_log"
+FIELD_LOG_CYCLE_FORM_TYPE = "field_log_cycle"
+FIELD_LOG_PHENOLOGY_FORM_TYPE = "field_log_phenology"
+SUPPORTED_FORM_TYPES = (
+    HARVEST_FORM_TYPE,
+    PEST_WEED_FORM_TYPE,
+    FIELD_LOG_FORM_TYPE,
+    FIELD_LOG_CYCLE_FORM_TYPE,
+    FIELD_LOG_PHENOLOGY_FORM_TYPE,
+)
 
 
 def _text(value: Any) -> str:

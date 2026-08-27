@@ -15,7 +15,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-from app.modules.field_log.models import CATEGORY_LABELS, LOG_CATEGORIES
+from app.modules.field_log.catalog import CATEGORY_LABELS, LOG_CATEGORIES
 
 # Campos comunes a todas las categorías. Los declara la plantilla igual que los
 # específicos para que el formulario del móvil se construya de una sola fuente.
