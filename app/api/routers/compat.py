@@ -1843,6 +1843,72 @@ def create_manual_admin_user(payload: Dict[str, Any] = Body(default_factory=dict
     }
 
 
+@router.post("/admin/users/{user_id}/email")
+def change_user_email(user_id: str, payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
+    """Cambia el correo de una cuenta ajena: el de acceso y el de su ficha.
+
+    El correo vive en DOS sitios —la credencial con la que se entra y el perfil
+    que se muestra— y hasta ahora sólo `/auth/update-user` lo tocaba, sobre la
+    propia sesión y sin actualizar el perfil. Cambiar uno solo deja la cuenta
+    incoherente: la persona seguiría entrando con el correo viejo mientras su
+    ficha muestra el nuevo. Por eso este endpoint es el único sitio donde se
+    cambia para otra persona, y mueve los dos a la vez.
+
+    No toca nada más: ni la contraseña, ni el rol, ni la empresa, ni los
+    módulos, ni sus lotes.
+    """
+    with LOCK:
+        db = read_db()
+        ctx = require_admin_context(authorization, db)
+        current_admin = ctx["admin"]
+        is_super_admin = current_admin.get("admin_role") == "superadmin"
+
+        target = next((u for u in db.get("users") or [] if str(u.get("id") or "") == str(user_id)), None)
+        if not target:
+            raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+        # Un admin de empresa sólo puede cambiar correos de su propia empresa.
+        target_admin = active_admin_row(db, str(user_id))
+        target_company = (target_admin or {}).get("company_id")
+        if not is_super_admin and target_company != current_admin.get("company_id"):
+            raise HTTPException(status_code=403, detail="Ese usuario no pertenece a tu empresa")
+
+        email = clean_email(payload.get("email"))
+        anterior = str(target.get("email") or "")
+        if email == anterior.lower():
+            raise HTTPException(status_code=400, detail="Ese ya es el correo de la cuenta")
+        if any(
+            str(u.get("email", "")).lower() == email and str(u.get("id") or "") != str(user_id)
+            for u in db.get("users") or []
+        ):
+            raise HTTPException(status_code=400, detail="Ya existe un usuario con ese correo")
+
+        t = now()
+        target["email"] = email
+        target["updated_at"] = t
+
+        # El perfil es lo que se ve en el panel y en la ficha del usuario.
+        perfiles = [
+            row for row in table(db, "profiles")
+            if str(row.get("user_id") or row.get("id") or "") == str(user_id)
+        ]
+        for row in perfiles:
+            row["email"] = email
+            row["updated_at"] = t
+
+        write_db(db)
+
+    return {
+        "data": {
+            "user": public_user(target),
+            "email_anterior": anterior,
+            "perfiles_actualizados": len(perfiles),
+        },
+        "error": None,
+        "message": "Correo actualizado en el acceso y en la ficha del usuario.",
+    }
+
+
 @router.get("/admin/panel-access")
 def admin_panel_access(authorization: Optional[str] = Header(default=None)):
     """¿Puede la cuenta del bearer entrar al panel /admin?
