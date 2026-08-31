@@ -165,6 +165,27 @@ def verify_password(password: str, hashed: str) -> bool:
     return password_hash(password) == hashed
 
 
+# Marca de "contraseña temporal": la que un administrador teclea al dar de alta
+# una cuenta viaja por correo o por WhatsApp y no debe sobrevivir al primer
+# acceso. Vive en el `user_metadata` del usuario y la retira `/auth/change-password`.
+MUST_CHANGE_PASSWORD_FIELD = "must_change_password"
+
+MIN_PASSWORD_LENGTH = 8
+
+
+def must_change_password(user: Dict[str, Any]) -> bool:
+    metadata = user.get("user_metadata") or {}
+    return bool(metadata.get(MUST_CHANGE_PASSWORD_FIELD))
+
+
+def set_must_change_password(user: Dict[str, Any], value: bool) -> None:
+    metadata = user.setdefault("user_metadata", {})
+    if value:
+        metadata[MUST_CHANGE_PASSWORD_FIELD] = True
+    else:
+        metadata.pop(MUST_CHANGE_PASSWORD_FIELD, None)
+
+
 def token_for(user_id: str) -> str:
     return jwt.encode(
         {
@@ -187,6 +208,10 @@ def public_user(user: Dict[str, Any]) -> Dict[str, Any]:
         "updated_at": user.get("updated_at"),
         "user_metadata": user.get("user_metadata") or {},
         "app_metadata": user.get("app_metadata") or {},
+        # De primer nivel además de en el metadata: el frontend decide con esto
+        # si bloquea la sesión con el diálogo de cambio de contraseña, y leerlo
+        # de un sitio fijo evita depender de la forma del metadata.
+        MUST_CHANGE_PASSWORD_FIELD: must_change_password(user),
     }
 
 
@@ -1576,6 +1601,9 @@ def update_user(payload: Dict[str, Any] = Body(default_factory=dict), authorizat
         db_user = next((u for u in db["users"] if u.get("id") == user["id"]), None)
         if payload.get("password"):
             db_user["password_hash"] = password_hash(str(payload["password"]))
+            # Estrenar contraseña propia cierra la exigencia de cambiarla, venga
+            # por aquí o por /auth/change-password.
+            set_must_change_password(db_user, False)
         if payload.get("email"):
             db_user["email"] = str(payload["email"]).lower().strip()
         if payload.get("data"):
@@ -1583,6 +1611,55 @@ def update_user(payload: Dict[str, Any] = Body(default_factory=dict), authorizat
         db_user["updated_at"] = now()
         write_db(db)
         return {"data": {"user": public_user(db_user)}, "error": None}
+
+
+@router.post("/auth/change-password")
+def change_own_password(payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
+    """Cambia la contraseña de la propia sesión y retira la marca de temporal.
+
+    Es la vía del diálogo de primer acceso: la contraseña que un administrador
+    teclea al dar de alta la cuenta se le entrega a la persona por un canal que
+    no es secreto (correo, WhatsApp), así que la cuenta nace marcada y no se
+    considera suya hasta que la cambia.
+
+    Cuando la cuenta viene marcada NO se pide la contraseña actual: la acaba de
+    usar para entrar y volver a teclearla solo añade fricción al primer acceso.
+    Para un cambio voluntario, en cambio, sí se exige: una sesión abierta y
+    desatendida no debe bastar para quedarse con la cuenta.
+    """
+    user = bearer_user(authorization)
+    if not user:
+        raise HTTPException(status_code=401, detail="No autenticado")
+
+    new_password = clean_password(payload.get("new_password") or payload.get("password"))
+    if len(new_password) < MIN_PASSWORD_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"La contraseña debe tener al menos {MIN_PASSWORD_LENGTH} caracteres",
+        )
+
+    with LOCK:
+        db = read_db()
+        db_user = next((u for u in db["users"] if u.get("id") == user["id"]), None)
+        if not db_user:
+            raise HTTPException(status_code=401, detail="No autenticado")
+
+        if not must_change_password(db_user):
+            current_password = str(payload.get("current_password") or "")
+            if not current_password:
+                raise HTTPException(status_code=400, detail="Escribe tu contraseña actual")
+            if not verify_password(current_password, db_user.get("password_hash", "")):
+                raise HTTPException(status_code=400, detail="La contraseña actual no es correcta")
+
+        if verify_password(new_password, db_user.get("password_hash", "")):
+            raise HTTPException(status_code=400, detail="La nueva contraseña debe ser distinta de la actual")
+
+        db_user["password_hash"] = password_hash(new_password)
+        set_must_change_password(db_user, False)
+        db_user["updated_at"] = now()
+        write_db(db)
+
+    return {"data": {"user": public_user(db_user), "session": session_for(db_user)}, "error": None}
 
 
 @router.post("/auth/reset-password")
@@ -1692,8 +1769,12 @@ def create_manual_admin_user(payload: Dict[str, Any] = Body(default_factory=dict
             raise HTTPException(status_code=400, detail="Ya existe un usuario con ese correo")
 
         manual_password = clean_password(payload.get("password"))
-        if len(manual_password) < 8:
+        if len(manual_password) < MIN_PASSWORD_LENGTH:
             raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 8 caracteres")
+
+        # La contraseña que teclea el administrador se entrega por correo o por
+        # WhatsApp: nace como temporal salvo que se pida lo contrario.
+        require_password_change = bool(payload.get("require_password_change", True))
 
         company_id = payload.get("company_id") or current_admin.get("company_id")
         if not is_super_admin and company_id != current_admin.get("company_id"):
@@ -1755,6 +1836,7 @@ def create_manual_admin_user(payload: Dict[str, Any] = Body(default_factory=dict
                 "first_name": first_name,
                 "last_name": last_name,
                 "manual_password": True,
+                **({MUST_CHANGE_PASSWORD_FIELD: True} if require_password_change else {}),
             },
         }
         db.setdefault("users", []).append(user)
@@ -1836,6 +1918,7 @@ def create_manual_admin_user(payload: Dict[str, Any] = Body(default_factory=dict
             "user": public_user(user),
             "admin_user": enrich(db, "admin_users", admin_row),
             "manual_password": True,
+            "require_password_change": require_password_change,
             "email_sent": False,
             "email_message": None,
         },
@@ -1906,6 +1989,55 @@ def change_user_email(user_id: str, payload: Dict[str, Any] = Body(default_facto
         },
         "error": None,
         "message": "Correo actualizado en el acceso y en la ficha del usuario.",
+    }
+
+
+@router.post("/admin/users/{user_id}/password")
+def reset_user_password(user_id: str, payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
+    """Da a una cuenta ajena una contraseña temporal que tendrá que cambiar.
+
+    Sirve para el «se me olvidó la contraseña» que hoy se resuelve por teléfono
+    y para marcar cuentas antiguas cuya contraseña la escribió un administrador.
+    La contraseña que sale de aquí no es la definitiva: la cuenta queda marcada
+    y el primer acceso obliga a cambiarla.
+
+    Si no se pasa `password`, se genera una legible (sin caracteres ambiguos).
+    """
+    with LOCK:
+        db = read_db()
+        ctx = require_admin_context(authorization, db)
+        current_admin = ctx["admin"]
+        is_super_admin = current_admin.get("admin_role") == "superadmin"
+
+        target = next((u for u in db.get("users") or [] if str(u.get("id") or "") == str(user_id)), None)
+        if not target:
+            raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+        target_admin = active_admin_row(db, str(user_id))
+        target_company = (target_admin or {}).get("company_id")
+        if not is_super_admin and target_company != current_admin.get("company_id"):
+            raise HTTPException(status_code=403, detail="Ese usuario no pertenece a tu empresa")
+
+        nueva = str(payload.get("password") or "").strip() or generate_temporary_password()
+        if len(nueva) < MIN_PASSWORD_LENGTH:
+            raise HTTPException(
+                status_code=400,
+                detail=f"La contraseña debe tener al menos {MIN_PASSWORD_LENGTH} caracteres",
+            )
+
+        target["password_hash"] = password_hash(nueva)
+        set_must_change_password(target, bool(payload.get("require_password_change", True)))
+        target["updated_at"] = now()
+        write_db(db)
+
+    return {
+        "data": {
+            "user": public_user(target),
+            "password": nueva,
+            "require_password_change": must_change_password(target),
+        },
+        "error": None,
+        "message": "Contraseña temporal asignada. La persona deberá cambiarla al entrar.",
     }
 
 
@@ -1980,8 +2112,10 @@ def onboard_client(payload: Dict[str, Any] = Body(default_factory=dict), authori
             raise HTTPException(status_code=400, detail="Ya existe un usuario con ese correo")
 
         password = clean_password(payload.get("password"))
-        if len(password) < 8:
+        if len(password) < MIN_PASSWORD_LENGTH:
             raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 8 caracteres")
+
+        require_password_change = bool(payload.get("require_password_change", True))
 
         first_name = str(payload.get("first_name") or "").strip() or None
         last_name = str(payload.get("last_name") or "").strip() or None
@@ -2028,7 +2162,12 @@ def onboard_client(payload: Dict[str, Any] = Body(default_factory=dict), authori
             "is_active": True,
             "created_at": t,
             "updated_at": t,
-            "user_metadata": {"first_name": first_name, "last_name": last_name, "manual_password": True},
+            "user_metadata": {
+                "first_name": first_name,
+                "last_name": last_name,
+                "manual_password": True,
+                **({MUST_CHANGE_PASSWORD_FIELD: True} if require_password_change else {}),
+            },
         }
         db.setdefault("users", []).append(new_user)
 
