@@ -46,6 +46,36 @@ Todo ocurre al abrir el módulo Satélite. Si algo falla —Graniot caído, la p
 no consta como responsable de ninguna finca, el alta no se completa a tiempo— se
 sirve el portal de servicio de siempre: **el mapa nunca se queda esperando**.
 
+### El cliente nuevo nace con su portal
+
+Lo anterior resuelve a quien YA tiene fincas en Graniot. Pero el cliente que el
+equipo da de alta en el panel no es responsable de ninguna: **sus lotes los carga
+Dataris después**. Sin cuenta embebida propia, el destino de sincronización
+degradaba a la cuenta de servicio, el autosync se plantaba (exige cuenta propia)
+y sus lotes no salían de Dataris.
+
+Por eso el panel de administración crea la cuenta antes de que haga falta:
+
+- **Al dar de alta al usuario** (`POST /api/compat/admin/users/manual`) se
+  encarga el alta de su portal en segundo plano, para no atar la creación del
+  cliente al tiempo de respuesta de Graniot.
+- **Al cargarle lotes** (`POST /api/compat/admin/parcels/{upload,manual}`) se
+  asegura primero su cuenta y después se suben: así el lote se crea dentro del
+  portal de su dueño, en una finca con el nombre de la finca del lote.
+- El alias de esa cuenta se deriva de su correo de Dataris (`dataris-embed+u…@`)
+  en vez del id numérico de plataforma, que todavía no existe. Es estable —el
+  mismo correo reconstruye siempre el mismo alias— y propio de cada persona, para
+  que dos clientes sin fincas no acaben compartiendo portal. Si más adelante esa
+  persona aparece en el censo con fincas, la reconciliación se las asigna a esa
+  misma cuenta.
+- Dentro de la cuenta del cliente, un lote sin finca propia ya no cae en una
+  finca llamada «Dataris»: se usa el nombre de su empresa (o el suyo), que es lo
+  que su portal muestra como sección.
+
+Nada de esto puede tumbar el alta ni la carga: si Graniot falla, queda el motivo
+registrado en los logs (`dataris.compat.embed_provision.*`) y el lote sigue en
+Dataris, listo para reintentar con `POST /api/graniot/embed/links`.
+
 ### Detalles que importan
 
 - **Presupuesto de tiempo** (`GRANIOT_EMBED_PROVISION_TIMEOUT_SECONDS`, 12 s): un
@@ -67,7 +97,10 @@ sirve el portal de servicio de siempre: **el mapa nunca se queda esperando**.
   borrar del todo desde la aplicación de Graniot. Por eso el alta prueba hasta
   cuatro alias (`…+{uid}@`, `…+{uid}-1@`, …) antes de rendirse, y por eso
   conviene no usar `?delete_account=true` salvo que haga falta de verdad.
-- **Sin fincas no se crea cuenta**: un portal vacío es peor que el fallback.
+- **Sin fincas no se crea cuenta al abrir el mapa**: para quien solo pasa por el
+  módulo Satélite, un portal vacío es peor que el fallback. El alta sin fincas se
+  reserva a lo que pide el panel (alta de cliente y carga de lotes), donde esa
+  cuenta es justo el destino que sus lotes necesitan.
 - Los lotes que Dataris sube van a la misma cuenta que el usuario ve. Si aún no
   tiene cuenta embebida pero sí es usuario de plataforma, se suben con su
   `client_id` numérico, así que ya no hacen falta las cuentas de la sección API.
@@ -84,7 +117,9 @@ sirve el portal de servicio de siempre: **el mapa nunca se queda esperando**.
 | `GET` | `/api/graniot/parcels/sync-target` | usuario | A qué cuenta van sus lotes |
 
 `POST /api/graniot/embed/links` acepta `platform_email` cuando la persona usa en
-Graniot un correo distinto del que tiene en Dataris.
+Graniot un correo distinto del que tiene en Dataris, y crea el portal aunque no
+tenga fincas todavía; con `require_farms: true` se recupera la conducta estricta,
+que falla si esa persona no es responsable de ninguna.
 
 ## Interruptores
 
@@ -104,3 +139,7 @@ Graniot un correo distinto del que tiene en Dataris.
 idempotencia, el fallo por finca, la concurrencia, el presupuesto de tiempo, la
 reconciliación y el destino de los lotes. `tests/test_graniot_embed.py` mantiene
 el fallback y la renovación del token.
+`tests/test_graniot_embed_alta_desde_admin.py` cubre el cliente nuevo: alias
+propio y estable, alta al crear el usuario y al cargarle lotes, destino de sus
+lotes, nombre de su finca y que un fallo de Graniot no rompa ninguna de las dos
+operaciones.

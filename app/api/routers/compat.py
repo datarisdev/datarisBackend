@@ -1757,7 +1757,11 @@ def send_temporary_password_email(email: str, password: str, first_name: Optiona
 
 
 @router.post("/admin/users/manual")
-def create_manual_admin_user(payload: Dict[str, Any] = Body(default_factory=dict), authorization: Optional[str] = Header(default=None)):
+def create_manual_admin_user(
+    background_tasks: BackgroundTasks,
+    payload: Dict[str, Any] = Body(default_factory=dict),
+    authorization: Optional[str] = Header(default=None),
+):
     with LOCK:
         db = read_db()
         ctx = require_admin_context(authorization, db)
@@ -1912,6 +1916,15 @@ def create_manual_admin_user(payload: Dict[str, Any] = Body(default_factory=dict
             company["updated_at"] = t
 
         write_db(db)
+
+    # El cliente nace con su portal de Graniot: es la cuenta a la que irán los
+    # lotes que el equipo le cargue después, y sin ella esos lotes se quedarían
+    # solo en Dataris. Se hace en segundo plano para no atar el alta al tiempo
+    # de respuesta de Graniot, y solo para quien tenga el módulo satelital: dar
+    # de baja una cuenta en Graniot quema su correo, así que no se crean
+    # portales para cuentas internas que nunca van a abrir el mapa.
+    if module_catalog.canonical_module_id("satelite") in (chosen | inherited):
+        schedule_graniot_embed_account(background_tasks, user, provisioned_by="admin-user-create")
 
     return {
         "data": {
@@ -2683,8 +2696,47 @@ def _graniot_log(event: str, **fields: Any) -> None:
         pass
 
 
-async def _graniot_sync_parcels_task(user: Dict[str, Any], parcel_ids: List[str]) -> None:
+async def _graniot_ensure_embed_account_task(
+    user: Dict[str, Any],
+    *,
+    provisioned_by: str = "admin-auto",
+) -> None:
+    """Crea el portal de Graniot del usuario si todavía no lo tiene.
+
+    Sin cuenta propia sus lotes no salen de Dataris: el autosync exige cuenta
+    (`require_account=True`) y el destino degrada a la de servicio, que es de
+    otro. Por eso el alta del portal precede a la subida de los lotes.
+    """
+    from app.api.routers.graniot import ensure_embed_account_for_user
+
+    result = await ensure_embed_account_for_user(user, provisioned_by=provisioned_by)
+    _graniot_log(
+        "dataris.compat.embed_provision.ok" if result.get("provisioned") else "dataris.compat.embed_provision.skipped",
+        operation="ensure-embed-account",
+        email=result.get("email"),
+        reason=result.get("reason"),
+    )
+
+
+async def _graniot_sync_parcels_task(
+    user: Dict[str, Any],
+    parcel_ids: List[str],
+    ensure_account: bool = False,
+) -> None:
     from app.api.routers.graniot import sync_local_parcel_to_graniot
+
+    if ensure_account:
+        # Un fallo aquí no detiene la subida: el propio sync volverá a decidir a
+        # qué cuenta van los lotes y dejará constancia si no hay ninguna.
+        try:
+            await _graniot_ensure_embed_account_task(user, provisioned_by="parcel-upload")
+        except Exception as exc:  # noqa: BLE001 — tarea de fondo
+            _graniot_log(
+                "dataris.compat.embed_provision.failed",
+                operation="ensure-embed-account",
+                exception_type=type(exc).__name__,
+                message=str(exc),
+            )
 
     for parcel_id in parcel_ids:
         try:
@@ -2752,7 +2804,15 @@ def schedule_graniot_parcel_sync(
     background: Optional[BackgroundTasks],
     user: Optional[Dict[str, Any]],
     parcels: Iterable[Dict[str, Any]],
+    *,
+    ensure_account: bool = False,
 ) -> None:
+    """Sube en segundo plano los lotes recién creados a la cuenta de su dueño.
+
+    Con ``ensure_account`` se le crea antes el portal de Graniot si le falta: es
+    lo que hace el panel de administración, donde los lotes se cargan en nombre
+    de clientes que pueden no existir todavía en Graniot.
+    """
     if background is None or not user or not settings.GRANIOT_PARCEL_AUTOSYNC_ENABLED:
         return
     if not settings.GRANIOT_PARCEL_SYNC_PER_USER_ENABLED:
@@ -2760,7 +2820,28 @@ def schedule_graniot_parcel_sync(
     parcel_ids = [str(row.get("id")) for row in parcels if isinstance(row, dict) and row.get("id")]
     if not parcel_ids:
         return
-    background.add_task(_graniot_sync_parcels_task, dict(user), parcel_ids)
+    background.add_task(_graniot_sync_parcels_task, dict(user), parcel_ids, ensure_account)
+
+
+def schedule_graniot_embed_account(
+    background: Optional[BackgroundTasks],
+    user: Optional[Dict[str, Any]],
+    *,
+    provisioned_by: str = "admin-auto",
+) -> None:
+    """Encarga el alta del portal de Graniot de un usuario recién creado.
+
+    Va en segundo plano porque el alta habla varias veces con Graniot (censo de
+    fincas, creación de la cuenta y asignación) y quien da de alta al cliente no
+    tiene por qué esperar a que Graniot conteste.
+    """
+    if background is None or not user:
+        return
+    if not settings.GRANIOT_EMBED_PER_USER_ENABLED or not settings.GRANIOT_EMBED_AUTOPROVISION_ENABLED:
+        return
+    if not str((user or {}).get("email") or "").strip():
+        return
+    background.add_task(_graniot_ensure_embed_account_task, dict(user), provisioned_by=provisioned_by)
 
 
 def schedule_graniot_parcel_delete(

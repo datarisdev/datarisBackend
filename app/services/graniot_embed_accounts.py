@@ -26,6 +26,7 @@ configurado y no tocan la base de datos de Dataris.
 """
 from __future__ import annotations
 
+import hashlib
 from typing import Any, Dict, Iterable, List, Optional
 
 from app.services.graniot_client import GraniotAPIError, GraniotClient
@@ -149,6 +150,25 @@ def embed_alias(email: str, user_id: Any, template: str, *, attempt: int = 0) ->
         return alias
     alias_local, _, alias_domain = alias.partition("@")
     return f"{alias_local}-{attempt}@{alias_domain}" if alias_domain else f"{alias}-{attempt}"
+
+
+def standalone_alias_uid(email: Any) -> str:
+    """Identificador de alias para quien todavía no existe en Graniot.
+
+    El alias normal lleva dentro el id numérico del usuario de plataforma, pero
+    un cliente recién dado de alta en Dataris no tiene ninguno: no es
+    responsable de ninguna finca, así que no aparece en el censo. Sin un
+    identificador propio, todos ellos compartirían el mismo alias y, con él, el
+    mismo portal — que es justo lo que hay que evitar.
+
+    Se deriva del correo de Dataris: es estable (el mismo usuario reconstruye
+    siempre el mismo alias, aunque se pierda el registro local), único y no
+    revela el correo del cliente en el padrón de Graniot. El prefijo ``u`` lo
+    distingue de los ids numéricos de plataforma, para que
+    ``platform_user_id_from_alias`` no lo confunda con uno de ellos.
+    """
+    digest = hashlib.sha1(normalize_email(email).encode("utf-8")).hexdigest()
+    return f"u{digest[:10]}"
 
 
 def platform_user_id_from_alias(account_email: Any, template: str) -> Optional[str]:

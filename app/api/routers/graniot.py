@@ -52,6 +52,7 @@ from app.services.graniot_embed_accounts import (
     index_platform_users,
     link_farm_to_account,
     platform_user_id_from_alias,
+    standalone_alias_uid,
     unlink_farm_from_account,
 )
 
@@ -2751,12 +2752,62 @@ async def _farm_id_for_finca(client: GraniotClient, finca: str) -> Optional[str]
     return farm_id
 
 
+def _owner_farm_name(user: Dict[str, Any]) -> Optional[str]:
+    """Nombre con el que llamar a la finca por defecto de un cliente.
+
+    Solo se usa cuando el lote no trae finca propia y se está subiendo dentro de
+    la cuenta del cliente: allí la finca genérica de Dataris no le dice nada.
+    Se prefiere el nombre de su empresa, luego el suyo y, en último término, el
+    correo, porque el portal muestra ese nombre como sección.
+    """
+    user_id = str((user or {}).get("id") or "").strip()
+    email = str((user or {}).get("email") or "").strip()
+    if not user_id and not email:
+        return None
+    try:
+        db = read_db()
+        profile = next(
+            (
+                row
+                for row in table(db, "profiles")
+                if str(row.get("user_id") or "") == user_id or str(row.get("id") or "") == user_id
+            ),
+            {},
+        )
+        admin_row = next(
+            (row for row in table(db, "admin_users") if str(row.get("user_id") or "") == user_id),
+            {},
+        )
+        company = next(
+            (
+                row
+                for row in table(db, "companies")
+                if str(row.get("id") or "") == str(admin_row.get("company_id") or "")
+            ),
+            {},
+        )
+        metadata = (user or {}).get("user_metadata") or {}
+        person = " ".join(
+            part
+            for part in [
+                profile.get("first_name") or metadata.get("first_name"),
+                profile.get("last_name") or metadata.get("last_name"),
+            ]
+            if part
+        ).strip()
+        candidates = [company.get("name"), profile.get("company_name"), person, email.split("@")[0]]
+    except Exception:  # noqa: BLE001 — el nombre es un adorno, nunca un bloqueo
+        candidates = [email.split("@")[0] if email else None]
+    return next((str(value).strip() for value in candidates if str(value or "").strip()), None)
+
+
 async def _resolve_farm_id(
     client: GraniotClient,
     local: Dict[str, Any],
     payload: Dict[str, Any],
     *,
     allow_global_default: bool = True,
+    fallback_farm_name: Optional[str] = None,
 ) -> str:
     # Acepta camelCase y snake_case porque el frontend puede enviar farmId,
     # mientras que Graniot y el backend usan farm_id/graniot_farm_id.
@@ -2802,7 +2853,15 @@ async def _resolve_farm_id(
         # If listing farms is not available for this key, try creating one below.
         pass
 
-    return await _create_default_farm(client, name=None if allow_global_default else settings.GRANIOT_PARCEL_SYNC_FARM_NAME)
+    if allow_global_default:
+        return await _create_default_farm(client, name=None)
+    # Dentro de la cuenta del cliente, una finca llamada "Dataris" no le dice
+    # nada: se usa su nombre (o el de su empresa) para que reconozca la sección
+    # bajo la que aparecen sus lotes.
+    return await _create_default_farm(
+        client,
+        name=str(fallback_farm_name or "").strip() or settings.GRANIOT_PARCEL_SYNC_FARM_NAME,
+    )
 
 
 def _public_parcel(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -3110,10 +3169,23 @@ def _account_by_id(payload: Any, account_id: Any) -> Optional[Dict[str, Any]]:
 GRANIOT_EMBED_ALIAS_MAX_ATTEMPTS = int(os.getenv("GRANIOT_EMBED_ALIAS_MAX_ATTEMPTS", "4"))
 
 
-def _embed_alias_for(platform_user: Dict[str, Any], email: str, *, attempt: int = 0) -> str:
+def _embed_alias_for(
+    platform_user: Optional[Dict[str, Any]],
+    email: str,
+    *,
+    attempt: int = 0,
+) -> str:
+    """Alias de la cuenta embebida de este usuario.
+
+    Con usuario de plataforma el alias lleva su id numérico. Sin él —un cliente
+    recién dado de alta, que todavía no es responsable de ninguna finca— se
+    deriva del correo de Dataris, para que cada persona tenga su propio portal
+    en vez de compartir uno.
+    """
+    uid = (platform_user or {}).get("user_id")
     return embed_alias(
         email,
-        (platform_user or {}).get("user_id"),
+        uid if _clean_id(uid) else standalone_alias_uid(email),
         settings.GRANIOT_EMBED_ALIAS_TEMPLATE or "dataris-embed+{uid}@dataris.es",
         attempt=attempt,
     )
@@ -3121,7 +3193,7 @@ def _embed_alias_for(platform_user: Dict[str, Any], email: str, *, attempt: int 
 
 async def _create_embed_account_for_user(
     email: str,
-    platform_user: Dict[str, Any],
+    platform_user: Optional[Dict[str, Any]],
     *,
     operation: str,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Exception]]:
@@ -3177,9 +3249,12 @@ async def _find_embed_account(
         _raw_account_for_email(accounts, normalized),
         _raw_account_for_email(accounts, (link or {}).get("account_email")),
     ]
-    if platform_user:
+    # Se prueban los dos alias posibles: el que lleva el id de plataforma y el
+    # que se deriva del correo. Así se reencuentra la cuenta aunque el usuario
+    # haya pasado de no tener fincas a tenerlas (o al revés) desde que se creó.
+    for owner in ([platform_user] if platform_user else []) + [None]:
         candidates.extend(
-            _raw_account_for_email(accounts, _embed_alias_for(platform_user, normalized, attempt=attempt))
+            _raw_account_for_email(accounts, _embed_alias_for(owner, normalized, attempt=attempt))
             for attempt in range(max(1, GRANIOT_EMBED_ALIAS_MAX_ATTEMPTS))
         )
     return next((account for account in candidates if account), None)
@@ -3242,12 +3317,24 @@ async def _provision_embed_account(
     platform_user: Optional[Dict[str, Any]] = None,
     provisioned_by: Optional[str] = None,
     operation: str = "graniot-embed-provision",
+    allow_without_farms: bool = False,
 ) -> Dict[str, Any]:
     """Da de alta el portal embebido de un usuario y le asigna sus fincas.
 
     Devuelve siempre un diagnóstico (``reason`` explica por qué no se hizo nada).
-    Nunca crea una cuenta para quien no tiene fincas en Graniot: sería un portal
-    vacío, y el usuario está mejor servido por el fallback existente.
+
+    Con ``allow_without_farms`` la cuenta se crea aunque esa persona todavía no
+    sea responsable de ninguna finca en Graniot. Es el caso de un cliente recién
+    dado de alta desde el panel: sus lotes los carga después el equipo de
+    Dataris, y **necesitan una cuenta a la que ir**. Sin ella el destino de
+    sincronización degrada a la cuenta de servicio, el autosync no sube nada
+    (exige cuenta propia) y sus lotes se quedan solo en Dataris. Con la cuenta
+    creada de antemano, cada lote crea su finca —con el nombre de la finca del
+    lote— dentro del portal de su dueño.
+
+    Sin ese permiso explícito se mantiene la conducta de siempre: no se crean
+    portales vacíos para quien abre el mapa, que está mejor servido por el
+    fallback.
     """
     normalized = str(email or "").strip().lower()
     result: Dict[str, Any] = {
@@ -3264,7 +3351,7 @@ async def _provision_embed_account(
 
     if platform_user is None:
         platform_user = await _platform_user_for_email(normalized)
-    if not platform_user:
+    if not platform_user and not allow_without_farms:
         result["reason"] = "no_platform_farms_for_email"
         return result
 
@@ -3283,7 +3370,11 @@ async def _provision_embed_account(
             return result
         _cache_delete_prefix(_EMBED_ACCOUNTS_CACHE_KEY)
 
-    farms = await _sync_embed_account_farms(account, platform_user, operation=operation)
+    farms = (
+        await _sync_embed_account_farms(account, platform_user, operation=operation)
+        if platform_user
+        else {"linked": [], "errors": []}
+    )
     result["farms"] = farms
     result["account"] = {
         "id": account.get("id"),
@@ -3293,10 +3384,14 @@ async def _provision_embed_account(
     result["link"] = _public_embed_link(_save_embed_link(normalized, {
         "account_id": account.get("id"),
         "account_email": account.get("account_email"),
-        "platform_email": platform_user.get("email"),
-        "platform_user_id": platform_user.get("user_id"),
+        "platform_email": (platform_user or {}).get("email"),
+        "platform_user_id": (platform_user or {}).get("user_id"),
         "farm_ids": sorted(
-            {str(farm.get("id")) for farm in platform_user.get("farms") or [] if farm.get("id") is not None}
+            {
+                str(farm.get("id"))
+                for farm in (platform_user or {}).get("farms") or []
+                if farm.get("id") is not None
+            }
         ),
         "farms_synced_at": now() if not farms.get("errors") else None,
         "provisioned_by": provisioned_by or "auto",
@@ -3400,6 +3495,7 @@ async def _provision_embed_account_guarded(
     *,
     platform_user: Optional[Dict[str, Any]] = None,
     provisioned_by: Optional[str] = None,
+    allow_without_farms: bool = False,
 ) -> Dict[str, Any]:
     """Aprovisiona sin que dos peticiones simultáneas dupliquen la cuenta."""
     async with _embed_provision_lock(email):
@@ -3408,8 +3504,72 @@ async def _provision_embed_account_guarded(
         if link and link.get("account_id") and not _embed_farm_sync_is_stale(link):
             return {"email": email, "provisioned": True, "reason": "already_provisioned", "link": _public_embed_link(link)}
         return await _provision_embed_account(
-            email, platform_user=platform_user, provisioned_by=provisioned_by
+            email,
+            platform_user=platform_user,
+            provisioned_by=provisioned_by,
+            allow_without_farms=allow_without_farms,
         )
+
+
+async def ensure_embed_account_for_user(
+    user: Dict[str, Any],
+    *,
+    provisioned_by: str = "admin-auto",
+    operation: str = "ensure-embed-account",
+) -> Dict[str, Any]:
+    """Garantiza que este usuario de Dataris tenga su portal de Graniot.
+
+    Es el punto de entrada que usa el panel de administración: al dar de alta a
+    un cliente y al cargarle lotes en su nombre. Crea la cuenta embebida si no
+    existe —aunque todavía no tenga fincas— y le asigna las que ya sean suyas en
+    Graniot, de modo que sus lotes se suban a su propia cuenta y el portal los
+    muestre con el nombre de su finca.
+
+    No lanza nunca: es trabajo de fondo y un fallo de Graniot no puede tumbar el
+    alta del usuario ni la carga de sus lotes. Devuelve el diagnóstico.
+    """
+    email = str((user or {}).get("email") or "").strip().lower()
+    result: Dict[str, Any] = {"email": email, "provisioned": False, "reason": None}
+    if not email or "@" not in email:
+        result["reason"] = "user_without_email"
+        return result
+    if not settings.GRANIOT_EMBED_PER_USER_ENABLED or not settings.GRANIOT_EMBED_AUTOPROVISION_ENABLED:
+        result["reason"] = "autoprovision_disabled"
+        return result
+    if email in _embed_service_account_emails():
+        # Las cuentas de servicio ya tienen su portal; no se les crea un alias.
+        result["reason"] = "service_account"
+        return result
+
+    try:
+        # Un usuario ya vinculado y al día no necesita nada: esta ruta se
+        # recorre en cada carga de lotes y no debe llamar a Graniot en balde.
+        link = _find_embed_link(read_db(), email)
+        if link and link.get("account_id") and not _embed_farm_sync_is_stale(link):
+            return {
+                "email": email,
+                "provisioned": True,
+                "reason": "already_provisioned",
+                "link": _public_embed_link(link),
+            }
+        platform_user = await _platform_user_for_email(email)
+        return await _provision_embed_account_guarded(
+            email,
+            platform_user=platform_user,
+            provisioned_by=provisioned_by,
+            allow_without_farms=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — nunca puede romper a quien la llama
+        log_event({
+            "event": "dataris.graniot.embed_provision.ensure_failed",
+            "operation": operation,
+            "email": email,
+            "exception_type": type(exc).__name__,
+            "message": str(exc)[:300],
+        })
+        result["reason"] = "provision_failed"
+        result["error"] = str(exc)[:300]
+        return result
 
 
 async def _refresh_embed_farms_in_background(email: str) -> None:
@@ -4094,7 +4254,13 @@ async def sync_local_parcel_to_graniot(
 
     acts_on_behalf = target.get("mode") != SYNC_MODE_SERVICE
     try:
-        farm_id = await _resolve_farm_id(client, local, payload, allow_global_default=not acts_on_behalf)
+        farm_id = await _resolve_farm_id(
+            client,
+            local,
+            payload,
+            allow_global_default=not acts_on_behalf,
+            fallback_farm_name=_owner_farm_name(user),
+        )
 
         farm_ref = _as_int_if_numeric(farm_id)
 
@@ -4918,9 +5084,12 @@ async def list_embed_links(
             _account_by_id(accounts, (link or {}).get("account_id"))
             or accounts_by_email.get(email)
             or (accounts_by_email.get(_embed_alias_for(platform_user, email)) if platform_user else None)
+            # El alias derivado del correo cubre a los clientes cuyo portal se
+            # creó antes de tener fincas (alta desde el panel).
+            or accounts_by_email.get(_embed_alias_for(None, email))
         )
         if account:
-            portal = "own_account" if not platform_user or account.get("account_email") == email else "provisioned"
+            portal = "own_account" if account.get("account_email") == email else "provisioned"
         elif platform_user:
             portal = "pending_provision"
         else:
@@ -4933,7 +5102,7 @@ async def list_embed_links(
             "account_email": (account or {}).get("account_email"),
             "platform_user_id": (platform_user or {}).get("user_id"),
             "platform_farms": len((platform_user or {}).get("farms") or []),
-            "expected_alias": _embed_alias_for(platform_user, email) if platform_user else None,
+            "expected_alias": _embed_alias_for(platform_user, email),
             "link": _public_embed_link(link),
         })
     items.sort(key=lambda item: (item["portal"], item["user_email"]))
@@ -4972,6 +5141,11 @@ async def provision_embed_link(
     Da de alta su cuenta de mapa embebido si no la tiene y le asigna las fincas
     de su usuario de plataforma de Graniot. Es idempotente: repetirlo solo añade
     las fincas que falten, así que sirve también como "volver a sincronizar".
+
+    Un cliente recién dado de alta todavía no tiene fincas en Graniot, y aun así
+    necesita su cuenta: es a donde irán los lotes que el equipo le cargue. Por
+    eso el portal se crea igualmente. Con ``require_farms: true`` se recupera la
+    conducta estricta, que falla si esa persona no es responsable de ninguna.
     """
     db = read_db()
     require_admin_context(authorization, db)
@@ -4989,12 +5163,14 @@ async def provision_embed_link(
     # El correo del usuario de plataforma puede diferir del de Dataris (otra
     # cuenta de la misma persona): quien administra puede indicarlo a mano.
     platform_email = str(payload.get("platform_email") or "").strip().lower() or email
+    require_farms = bool(payload.get("require_farms"))
     try:
         platform_user = await _platform_user_for_email(platform_email, refresh=bool(payload.get("refresh")))
         result = await _provision_embed_account(
             email,
             platform_user=platform_user,
             provisioned_by="admin",
+            allow_without_farms=not require_farms,
         )
     except Exception as exc:
         _raise_graniot_error(exc)

@@ -190,7 +190,10 @@ async def upload_parcel_for_user(
     ctx = _require_manager(authorization)
     owner = _target_user(ctx["db"], ctx["permission"], user_id)
     created_rows = await store_parcel_file_for_user(owner, file, name)
-    schedule_graniot_parcel_sync(background_tasks, owner, created_rows)
+    # El dueño puede no tener todavía cuenta en Graniot (cliente recién dado de
+    # alta): se le crea su portal antes de subir, para que los lotes acaben en
+    # su cuenta y no se queden solo en Dataris.
+    schedule_graniot_parcel_sync(background_tasks, owner, created_rows, ensure_account=True)
     return {"data": {"parcel": created_rows[0], "parcels": created_rows}, "error": None}
 
 
@@ -203,7 +206,7 @@ def create_manual_parcel_for_target_user(
     ctx = _require_manager(authorization)
     owner = _target_user(ctx["db"], ctx["permission"], payload.get("user_id"))
     row = create_manual_parcel_for_user(owner, payload.get("name"), payload.get("geometry"))
-    schedule_graniot_parcel_sync(background_tasks, owner, [row])
+    schedule_graniot_parcel_sync(background_tasks, owner, [row], ensure_account=True)
     return {"data": {"parcel": row}, "error": None}
 
 
