@@ -32,6 +32,7 @@ from PIL import Image, ImageDraw
 from app.api.routers.compat import (
     LOCK,
     bearer_user,
+    dedupe_user_parcels,
     now,
     parcel_manager_covers_user,
     parcel_manager_permission,
@@ -42,6 +43,7 @@ from app.api.routers.compat import (
 )
 from app.core.config import settings
 from app.services.graniot_client import GraniotAPIError, GraniotClient, GraniotNotConfigured
+from app.services.commercial_demo_seed import is_commercial_demo_user
 from app.services.graniot_debug import clear_logs, get_log_file_path, log_event, read_logs, safe_payload
 from app.services.graniot_embed_accounts import (
     account_is_manager,
@@ -5043,11 +5045,46 @@ async def delete_graniot_account(
 
 
 def _local_parcels_by_user(db: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
-    """Lotes de Dataris agrupados por dueño."""
+    """Lotes de Dataris agrupados por dueño, contados como los cuenta el panel.
+
+    La tabla guarda también las versiones anteriores de un mismo lote (una fila
+    por subida), así que contarla en crudo multiplica el problema: el primer
+    diagnóstico contra producción daba 3.321 lotes para un cliente que en su
+    panel ve muchos menos. ``dedupe_user_parcels`` se queda con la última
+    versión de cada lote, que es la única que hay que subir a Graniot.
+    """
     grouped: Dict[str, List[Dict[str, Any]]] = {}
-    for row in table(db, "parcels"):
+    for row in dedupe_user_parcels(table(db, "parcels")):
         grouped.setdefault(str(row.get("user_id") or ""), []).append(row)
     return grouped
+
+
+def _reconcile_exclusion(user: Dict[str, Any], db: Dict[str, Any]) -> Optional[str]:
+    """Por qué este usuario NO entra en el cuadre automático.
+
+    Ni las cuentas de servicio del embed (tienen su portal aparte, con su token
+    acuñado) ni las de demostración deben crear cuentas en Graniot ni subir sus
+    lotes de mentira al padrón real de un cliente.
+    """
+    email = str((user or {}).get("email") or "").strip().lower()
+    if email in _embed_service_account_emails():
+        return "service_account"
+    if is_commercial_demo_user(user):
+        return "demo_user"
+    company_id = next(
+        (
+            row.get("company_id")
+            for row in table(db, "admin_users")
+            if str(row.get("user_id") or "") == str((user or {}).get("id") or "")
+        ),
+        None,
+    )
+    if company_id and any(
+        str(row.get("id") or "") == str(company_id) and row.get("demo_seed")
+        for row in table(db, "companies")
+    ):
+        return "demo_company"
+    return None
 
 
 def _parcel_status(
@@ -5152,6 +5189,7 @@ async def list_embed_links(
             # un usuario con lotes cargados aquí y sin portal propio está viendo
             # un mapa que no es el suyo.
             **_parcel_status(parcels_by_user.get(str(user.get("id") or "")) or [], account),
+            "excluded": _reconcile_exclusion(user, db),
         })
     items.sort(key=lambda item: (item["portal"], item["user_email"]))
 
@@ -5180,7 +5218,9 @@ async def list_embed_links(
             "needs_reconcile": [
                 item["user_email"]
                 for item in items
-                if item["local_parcels"] and (item["portal"] == "service_fallback" or item["parcels_out_of_place"])
+                if item["local_parcels"]
+                and not item["excluded"]
+                and (item["portal"] == "service_fallback" or item["parcels_out_of_place"])
             ],
         },
         "error": None,
@@ -5280,6 +5320,7 @@ async def reconcile_embed_portals(
     wanted_id = str(payload.get("user_id") or "").strip()
 
     parcels_by_user = _local_parcels_by_user(db)
+    pedido_concreto = bool(wanted_email or wanted_id)
     candidates = [
         user
         for user in db.get("users") or []
@@ -5287,6 +5328,22 @@ async def reconcile_embed_portals(
         and (not wanted_email or str(user.get("email") or "").strip().lower() == wanted_email)
         and (not wanted_id or str(user.get("id") or "") == wanted_id)
     ]
+    # Las cuentas de servicio y las de demostración quedan fuera del barrido:
+    # crearles portal o subir sus lotes ensuciaría el padrón real de Graniot.
+    excluidos = [
+        {"user_email": user.get("email"), "reason": _reconcile_exclusion(user, db)}
+        for user in candidates
+        if _reconcile_exclusion(user, db)
+    ]
+    candidates = [user for user in candidates if not _reconcile_exclusion(user, db)]
+    if pedido_concreto and not candidates and excluidos:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Ese usuario queda fuera del cuadre ({excluidos[0]['reason']}): "
+                "es una cuenta de servicio o de demostración."
+            ),
+        )
     if (wanted_email or wanted_id) and not candidates:
         raise HTTPException(
             status_code=404,
@@ -5367,6 +5424,7 @@ async def reconcile_embed_portals(
             "users_with_parcels": len(candidates),
             "users_processed": len(informe),
             "users": informe,
+            "excluded": excluidos,
         },
         "error": None,
     }

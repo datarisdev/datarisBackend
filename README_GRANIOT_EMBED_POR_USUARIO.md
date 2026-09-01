@@ -149,6 +149,17 @@ tocar, y los fallos por lote se acumulan en `failed` sin detener a los demás.
 Mover lotes es lo único que borra algo en Graniot, y por eso va tras una opción
 aparte.
 
+Dos cosas que el conteo tiene en cuenta, y que el primer diagnóstico contra
+producción dejó claras:
+
+- **Los lotes se cuentan deduplicados**, como los cuenta el panel: la tabla
+  guarda una fila por subida, así que contarla en crudo multiplicaba el problema
+  (3.321 lotes para un cliente que en su panel ve muchos menos).
+- **Las cuentas de servicio y las de demostración quedan fuera** (campo
+  `excluded`: `service_account`, `demo_user`, `demo_company`). Crearles portal o
+  subir sus lotes de mentira ensuciaría el padrón real de Graniot. Pedir el
+  cuadre de una de ellas responde 400 explicando por qué.
+
 ## Interruptores
 
 | Variable | Valor por defecto | Efecto |
