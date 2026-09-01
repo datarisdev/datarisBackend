@@ -112,6 +112,7 @@ Dataris, listo para reintentar con `POST /api/graniot/embed/links`.
 | `GET` | `/api/graniot/embed` | usuario | Su portal (`source`: `personal` o `service`) |
 | `GET` | `/api/graniot/embed/links` | admin | Quién tiene portal propio y quién no, y por qué |
 | `POST` | `/api/graniot/embed/links` | admin | Crear o reparar el portal de un usuario (idempotente) |
+| `POST` | `/api/graniot/embed/reconcile` | admin | Cuadrar el mapa con los lotes de Dataris (ensayo por defecto) |
 | `DELETE` | `/api/graniot/embed/links/{correo}` | admin | Deshacer el vínculo (`?delete_account=`, `?unlink_farms=`) |
 | `GET` | `/api/graniot/accounts` | admin | Diagnóstico de cuentas embebidas |
 | `GET` | `/api/graniot/parcels/sync-target` | usuario | A qué cuenta van sus lotes |
@@ -120,6 +121,33 @@ Dataris, listo para reintentar con `POST /api/graniot/embed/links`.
 Graniot un correo distinto del que tiene en Dataris, y crea el portal aunque no
 tenga fincas todavía; con `require_farms: true` se recupera la conducta estricta,
 que falla si esa persona no es responsable de ninguna.
+
+### Cuadrar a quien ya tenía lotes
+
+Los clientes cuyos lotes se cargaron **antes** de que existiera su portal siguen
+descuadrados: el listado de lotes dice una cosa y el mapa enseña otra, porque el
+lote nunca salió de Dataris (sin cuenta propia el destino degradaba a la de
+servicio y el autosync se plantaba) o acabó en una cuenta que no es la suya.
+
+`GET /api/graniot/embed/links` lo dice de un vistazo: cada usuario lleva
+`local_parcels`, `synced_parcels`, `parcels_pending_upload`,
+`parcels_in_other_account` y `parcels_out_of_place`, y la respuesta trae la lista
+`needs_reconcile` con quiénes están descuadrados.
+
+`POST /api/graniot/embed/reconcile` los cuadra:
+
+| Campo | Por defecto | Para qué |
+| ----- | ----------- | -------- |
+| `dry_run` | `true` | Solo informa. **Hay que pedir `false` expresamente para que toque algo.** |
+| `user_email` / `user_id` | — | Cuadrar a una sola persona |
+| `limit_users` | `25` | Usuarios por llamada |
+| `max_parcels_per_user` | `50` | Lotes por usuario y llamada; el informe devuelve `remaining` |
+| `move_misplaced` | `false` | Mover los lotes que están en otra cuenta (los borra allí y los recrea) |
+
+Se puede repetir sin miedo: un lote ya subido a la cuenta correcta no se vuelve a
+tocar, y los fallos por lote se acumulan en `failed` sin detener a los demás.
+Mover lotes es lo único que borra algo en Graniot, y por eso va tras una opción
+aparte.
 
 ## Interruptores
 
@@ -139,6 +167,10 @@ que falla si esa persona no es responsable de ninguna.
 idempotencia, el fallo por finca, la concurrencia, el presupuesto de tiempo, la
 reconciliación y el destino de los lotes. `tests/test_graniot_embed.py` mantiene
 el fallback y la renovación del token.
+`tests/test_graniot_cuadre_lotes_portal.py` cubre el diagnóstico del descuadre y
+el cuadre: ensayo que no toca nada, alta del portal más subida de lo que falta,
+lotes en otra cuenta que no se mueven sin pedirlo, el troceado en pasadas y que
+un lote que falla no detiene a los demás.
 `tests/test_graniot_embed_alta_desde_admin.py` cubre el cliente nuevo: alias
 propio y estable, alta al crear el usuario y al cargarle lotes, destino de sus
 lotes, nombre de su finca y que un fallo de Graniot no rompa ninguna de las dos

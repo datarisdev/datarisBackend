@@ -5042,6 +5042,48 @@ async def delete_graniot_account(
     return {"data": {"account_id": account_id, "deleted": True}, "error": None}
 
 
+def _local_parcels_by_user(db: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+    """Lotes de Dataris agrupados por dueño."""
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for row in table(db, "parcels"):
+        grouped.setdefault(str(row.get("user_id") or ""), []).append(row)
+    return grouped
+
+
+def _parcel_status(
+    parcels: List[Dict[str, Any]],
+    account: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Cómo se reflejan en Graniot los lotes que este usuario tiene en Dataris.
+
+    Un lote puede estar en tres situaciones: subido a la cuenta que el usuario
+    ve (bien), sin subir (nunca salió de Dataris, típico de quien no tenía
+    cuenta cuando se cargó) o subido a otra cuenta —la de servicio, casi
+    siempre— y por tanto invisible en su portal. Las dos últimas son el
+    descuadre: el mapa enseña algo distinto de lo que dice el listado de lotes.
+    """
+    account_email = str((account or {}).get("account_email") or "").strip().lower()
+    pending: List[str] = []
+    elsewhere: List[str] = []
+    synced = 0
+    for row in parcels:
+        if not _remote_parcel_ids(row):
+            pending.append(str(row.get("id")))
+            continue
+        stored = str(row.get("graniot_account_email") or "").strip().lower()
+        if account_email and stored and stored != account_email:
+            elsewhere.append(str(row.get("id")))
+            continue
+        synced += 1
+    return {
+        "local_parcels": len(parcels),
+        "synced_parcels": synced,
+        "parcels_pending_upload": len(pending),
+        "parcels_in_other_account": len(elsewhere),
+        "parcels_out_of_place": len(pending) + len(elsewhere),
+    }
+
+
 @router.get("/embed/links")
 async def list_embed_links(
     refresh: bool = Query(default=False),
@@ -5072,6 +5114,8 @@ async def list_embed_links(
         str(account.get("account_email") or "").strip().lower(): account
         for account in _items(accounts)
     }
+
+    parcels_by_user = _local_parcels_by_user(db)
 
     items: List[Dict[str, Any]] = []
     for user in db.get("users") or []:
@@ -5104,6 +5148,10 @@ async def list_embed_links(
             "platform_farms": len((platform_user or {}).get("farms") or []),
             "expected_alias": _embed_alias_for(platform_user, email),
             "link": _public_embed_link(link),
+            # El cruce con los lotes de Dataris es lo que delata un descuadre:
+            # un usuario con lotes cargados aquí y sin portal propio está viendo
+            # un mapa que no es el suyo.
+            **_parcel_status(parcels_by_user.get(str(user.get("id") or "")) or [], account),
         })
     items.sort(key=lambda item: (item["portal"], item["user_email"]))
 
@@ -5126,6 +5174,14 @@ async def list_embed_links(
             "embed_accounts": sorted(accounts_by_email),
             "alias_template": template,
             "autoprovision_enabled": bool(settings.GRANIOT_EMBED_AUTOPROVISION_ENABLED),
+            # Lo que hay que cuadrar: usuarios con lotes en Dataris cuyo mapa no
+            # los está mostrando (sin portal propio, o con lotes sin subir o
+            # subidos a otra cuenta).
+            "needs_reconcile": [
+                item["user_email"]
+                for item in items
+                if item["local_parcels"] and (item["portal"] == "service_fallback" or item["parcels_out_of_place"])
+            ],
         },
         "error": None,
     }
@@ -5186,6 +5242,134 @@ async def provision_embed_link(
     if not result.get("provisioned"):
         raise HTTPException(status_code=502, detail=result.get("error") or "Graniot no permitió crear el portal")
     return {"data": result, "error": None}
+
+
+@router.post("/embed/reconcile")
+async def reconcile_embed_portals(
+    payload: Dict[str, Any] = Body(default_factory=dict),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Cuadra el mapa de un usuario con los lotes que tiene en Dataris (solo admin).
+
+    El descuadre que arregla: hay clientes con lotes cargados en Dataris cuyo
+    módulo Satélite enseña otra cosa. Pasa cuando el lote se cargó antes de que
+    esa persona tuviera cuenta embebida propia: sin cuenta, el destino degradaba
+    a la de servicio y el lote se quedaba en Dataris (o acababa en una cuenta
+    que no es la suya). El listado de lotes y el mapa dejan de contar lo mismo.
+
+    Para cada usuario con lotes: se le asegura su portal y se suben a él los
+    lotes que falten. Los que estén en otra cuenta solo se cuentan, salvo que se
+    pida ``move_misplaced``: mover un lote implica borrarlo donde esté y volver
+    a crearlo, y eso conviene hacerlo a la vista.
+
+    Parámetros: ``user_email``/``user_id`` para uno solo; ``dry_run`` (por
+    defecto **true**, no toca nada y solo informa); ``limit_users`` y
+    ``max_parcels_per_user`` para acotar el trabajo de una llamada —un cliente
+    con cientos de lotes necesita varias pasadas, y el informe dice cuántas
+    quedan pendientes.
+    """
+    db = read_db()
+    require_admin_context(authorization, db)
+
+    dry_run = bool(payload.get("dry_run", True))
+    move_misplaced = bool(payload.get("move_misplaced"))
+    limit_users = max(1, int(payload.get("limit_users") or 25))
+    max_parcels = max(1, int(payload.get("max_parcels_per_user") or 50))
+
+    wanted_email = str(payload.get("user_email") or "").strip().lower()
+    wanted_id = str(payload.get("user_id") or "").strip()
+
+    parcels_by_user = _local_parcels_by_user(db)
+    candidates = [
+        user
+        for user in db.get("users") or []
+        if parcels_by_user.get(str(user.get("id") or ""))
+        and (not wanted_email or str(user.get("email") or "").strip().lower() == wanted_email)
+        and (not wanted_id or str(user.get("id") or "") == wanted_id)
+    ]
+    if (wanted_email or wanted_id) and not candidates:
+        raise HTTPException(
+            status_code=404,
+            detail="No hay ningún usuario con lotes que coincida con lo indicado",
+        )
+
+    informe: List[Dict[str, Any]] = []
+    for user in candidates[:limit_users]:
+        email = str(user.get("email") or "").strip().lower()
+        parcels = parcels_by_user.get(str(user.get("id") or "")) or []
+        entrada: Dict[str, Any] = {
+            "user_id": user.get("id"),
+            "user_email": email,
+            "provisioned": None,
+            "uploaded": [],
+            "moved": [],
+            "failed": [],
+            "skipped_in_other_account": 0,
+        }
+
+        account = None
+        if not dry_run:
+            provision = await ensure_embed_account_for_user(user, provisioned_by="admin-reconcile")
+            entrada["provisioned"] = provision.get("reason") or provision.get("provisioned")
+        try:
+            link = _find_embed_link(read_db(), email)
+            account = await _find_embed_account(email, link=link, refresh=not dry_run)
+        except Exception as exc:  # noqa: BLE001 — el informe vale igual sin cuenta
+            entrada["failed"].append({"error": str(exc)[:300]})
+
+        estado = _parcel_status(parcels, account)
+        entrada.update(estado)
+        entrada["account_email"] = (account or {}).get("account_email")
+
+        if dry_run:
+            informe.append(entrada)
+            continue
+
+        account_email = str((account or {}).get("account_email") or "").strip().lower()
+        pendientes = 0
+        for row in parcels:
+            if len(entrada["uploaded"]) + len(entrada["moved"]) >= max_parcels:
+                pendientes += 1
+                continue
+            remote_ids = _remote_parcel_ids(row)
+            stored = str(row.get("graniot_account_email") or "").strip().lower()
+            en_otra_cuenta = bool(remote_ids) and bool(account_email) and bool(stored) and stored != account_email
+            if remote_ids and not en_otra_cuenta:
+                continue
+            if en_otra_cuenta and not move_misplaced:
+                entrada["skipped_in_other_account"] += 1
+                continue
+            try:
+                if en_otra_cuenta:
+                    # Se retira de donde está antes de recrearlo: dejarlo en las
+                    # dos cuentas duplicaría el lote en los mapas.
+                    await delete_parcel_from_graniot(user, row, clear_local=True)
+                await sync_local_parcel_to_graniot(
+                    user,
+                    str(row.get("id")),
+                    {"metadata": {"origin": "dataris-reconcile"}},
+                    require_account=True,
+                    prefer_update=True,
+                )
+                (entrada["moved"] if en_otra_cuenta else entrada["uploaded"]).append(str(row.get("id")))
+            except HTTPException as exc:
+                entrada["failed"].append({"parcel_id": row.get("id"), "detail": str(exc.detail)[:300]})
+            except Exception as exc:  # noqa: BLE001 — un lote no puede tumbar el resto
+                entrada["failed"].append({"parcel_id": row.get("id"), "error": str(exc)[:300]})
+
+        entrada["remaining"] = pendientes
+        informe.append(entrada)
+
+    return {
+        "data": {
+            "dry_run": dry_run,
+            "move_misplaced": move_misplaced,
+            "users_with_parcels": len(candidates),
+            "users_processed": len(informe),
+            "users": informe,
+        },
+        "error": None,
+    }
 
 
 @router.delete("/embed/links/{user_email}")
