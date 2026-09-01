@@ -312,3 +312,70 @@ def test_solo_entran_los_usuarios_con_lotes(reconciliar):
 
     assert all(fila["local_parcels"] > 0 for fila in informe["users"])
     assert CON_LOTES in {fila["user_email"] for fila in informe["users"]}
+
+
+# --- Lo que NO hay que cuadrar ---------------------------------------------
+
+
+def test_las_versiones_viejas_de_un_lote_no_cuentan_como_lotes_aparte():
+    """La tabla guarda una fila por subida; el panel cuenta la última.
+
+    Contar en crudo multiplicaba el problema: el primer diagnóstico contra
+    producción daba miles de lotes para clientes que en su panel ven muchos
+    menos.
+    """
+    user = {"id": "cuadre-user", "email": CON_LOTES, "is_active": True}
+    with LOCK:
+        db = read_db()
+        db.setdefault("users", []).append(user)
+        filas = table(db, "parcels")
+        for version in range(3):
+            filas.append({
+                "id": f"cuadre-lote-v{version}",
+                "user_id": user["id"],
+                "name": "El Retiro",
+                "created_at": f"2026-0{version + 1}-01",
+                "updated_at": f"2026-0{version + 1}-01",
+            })
+        write_db(db)
+
+    agrupados = graniot._local_parcels_by_user(read_db())
+
+    assert len(agrupados[user["id"]]) == 1
+
+
+def test_la_cuenta_de_servicio_del_embed_queda_fuera_del_cuadre(monkeypatch):
+    monkeypatch.setattr(graniot.settings, "GRANIOT_EMBED_ACCOUNT_EMAIL", "servicio@graniot.test")
+
+    motivo = graniot._reconcile_exclusion({"id": "x", "email": "servicio@graniot.test"}, read_db())
+
+    assert motivo == "service_account"
+
+
+def test_el_usuario_de_demostracion_queda_fuera_del_cuadre():
+    """Sus lotes son de mentira: no deben acabar en el padrón real de Graniot."""
+    motivo = graniot._reconcile_exclusion(
+        {"id": "demo", "email": "demo@dataris.app", "user_metadata": {"demo_profile": "commercial"}},
+        read_db(),
+    )
+
+    assert motivo == "demo_user"
+
+
+def test_un_cliente_normal_no_queda_excluido():
+    assert graniot._reconcile_exclusion({"id": "cuadre-user", "email": CON_LOTES}, read_db()) is None
+
+
+def test_pedir_el_cuadre_de_una_cuenta_excluida_avisa_en_vez_de_actuar(reconciliar, monkeypatch):
+    monkeypatch.setattr(graniot.settings, "GRANIOT_EMBED_ACCOUNT_EMAIL", "servicio@graniot.test")
+    with LOCK:
+        db = read_db()
+        db.setdefault("users", []).append({"id": "srv", "email": "servicio@graniot.test"})
+        table(db, "parcels").append({"id": "cuadre-lote-srv", "user_id": "srv", "name": "Lote"})
+        write_db(db)
+
+    with pytest.raises(graniot.HTTPException) as error:
+        reconciliar(user_email="servicio@graniot.test", dry_run=False)
+
+    assert error.value.status_code == 400
+    assert "service_account" in str(error.value.detail)
