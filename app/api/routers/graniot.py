@@ -3924,6 +3924,43 @@ def _client_for_target(target: Dict[str, Any]) -> GraniotClient:
     return GraniotClient()
 
 
+def _may_use_shared_embed(user: Dict[str, Any]) -> bool:
+    """¿Puede esta persona ver el portal compartido de la cuenta de servicio?
+
+    El portal compartido enseña las fincas y los lotes de OTRA cuenta (la de
+    servicio). A un cliente nuevo, que todavía no tiene su portal enlazado, eso
+    le hacía creer que su mapa ya estaba configurado y que esos lotes eran los
+    suyos. Solo lo siguen viendo quienes existen para eso: las cuentas de
+    servicio del embed y las de demostración —donde el mapa compartido ES el
+    contenido de la demo—. Para el resto, el mapa se declara «por configurar»
+    (``GRANIOT_EMBED_SHARED_FALLBACK_ENABLED`` lo devuelve al comportamiento
+    anterior si hiciera falta).
+    """
+    if settings.GRANIOT_EMBED_SHARED_FALLBACK_ENABLED:
+        return True
+    email = str((user or {}).get("email") or "").strip().lower()
+    if email in _embed_service_account_emails():
+        return True
+    try:
+        return _reconcile_exclusion(user, read_db()) is not None
+    except Exception:  # noqa: BLE001 — sin base de datos, decide solo el email
+        return is_commercial_demo_user(user)
+
+
+def _pending_embed_payload(reason: str) -> Dict[str, Any]:
+    """Respuesta de «tu mapa todavía no está configurado» (200, sin URL)."""
+    return {
+        "data": {
+            "account_email": None,
+            "embedded_url": None,
+            "source": "pending",
+            "status": "pending_setup",
+            "reason": reason,
+        },
+        "error": None,
+    }
+
+
 @router.get("/embed")
 async def get_embed_url(
     response: Response,
@@ -3945,14 +3982,25 @@ async def get_embed_url(
        (may already be expired), then to a statically configured URL.
 
     ``source`` tells the browser whether it is looking at the user's own farms
-    (``personal``) or at the shared demo portal (``service``).
+    (``personal``), at the shared demo portal (``service``, only for service and
+    demo accounts) or at nothing yet because their portal is not linked
+    (``pending``: no URL, and the frontend shows a "pending setup" notice).
     """
     user = _require_user(authorization)
     response.headers["Cache-Control"] = "no-store"
 
     personal = await _embed_account_for_user(user)
     if personal is not None:
-        return {"data": {**personal, "source": "personal"}, "error": None}
+        return {"data": {**personal, "source": "personal", "status": "ready"}, "error": None}
+
+    if not _may_use_shared_embed(user):
+        # Sin portal propio: mejor decirlo que enseñarle el mapa de otra cuenta.
+        log_event({
+            "event": "dataris.graniot.embed.pending_setup",
+            "operation": "resolve-embed-url",
+            "email": str((user or {}).get("email") or "").strip().lower(),
+        })
+        return _pending_embed_payload("no_personal_portal")
 
     if _embed_minting_configured():
         access = await _mint_embed_access_token()
@@ -3963,7 +4011,7 @@ async def get_embed_url(
             }],
             settings.GRANIOT_EMBED_ACCOUNT_EMAIL,
         )
-        return {"data": {**account, "source": "service"}, "error": None}
+        return {"data": {**account, "source": "service", "status": "ready"}, "error": None}
 
     live_error: Optional[Exception] = None
     try:
@@ -3974,13 +4022,13 @@ async def get_embed_url(
             debug_context={"operation": "resolve-embed-url"},
         )
         account = _select_embed_account(raw, settings.GRANIOT_EMBED_ACCOUNT_EMAIL)
-        return {"data": {**account, "source": "service"}, "error": None}
+        return {"data": {**account, "source": "service", "status": "ready"}, "error": None}
     except Exception as exc:  # noqa: BLE001 — fall back to the configured URL below
         live_error = exc
 
     fallback = _configured_embed_account()
     if fallback is not None:
-        return {"data": {**fallback, "source": "service"}, "error": None}
+        return {"data": {**fallback, "source": "service", "status": "ready"}, "error": None}
 
     if isinstance(live_error, HTTPException):
         raise live_error

@@ -59,6 +59,13 @@ class Settings(BaseSettings):
     # still valid). Users without a match keep the dedicated service-account
     # portal above. Kill-switch: set to false to force the service account.
     GRANIOT_EMBED_PER_USER_ENABLED: bool = True
+    # ...but "keep the service-account portal" means showing a client the farms
+    # of another company, which is worse than showing nothing: the map looked
+    # configured when it was not. With this off (the default), a real user whose
+    # portal is not linked yet gets ``source: "pending"`` and no URL, and the
+    # frontend shows a "pending setup" notice instead of somebody else's map.
+    # Service and demo accounts always keep the shared portal.
+    GRANIOT_EMBED_SHARED_FALLBACK_ENABLED: bool = False
     # Graniot keeps platform users (app.graniot.com, the ones that own the farms)
     # and embedded-map users (/api/accounts/, the only ones the iframe accepts)
     # in separate registries, and there is no endpoint listing the former. So a

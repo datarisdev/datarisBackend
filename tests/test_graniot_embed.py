@@ -27,6 +27,10 @@ def _default_embed_settings(monkeypatch):
     monkeypatch.setattr(graniot.settings, "GRANIOT_EMBED_PASSWORD", None)
     monkeypatch.setattr(graniot.settings, "GRANIOT_EMBED_REFRESH_TOKEN", None)
     monkeypatch.setattr(graniot.settings, "GRANIOT_EMBED_PER_USER_ENABLED", True)
+    # Estos casos ejercitan el MECANISMO del portal de servicio (acuñar el token,
+    # caché, fallbacks). Quién tiene derecho a verlo es una política aparte, que
+    # vive en tests/test_graniot_embed_pendiente.py.
+    monkeypatch.setattr(graniot.settings, "GRANIOT_EMBED_SHARED_FALLBACK_ENABLED", True)
     # The accounts listing and farm-owner census caches must never leak.
     graniot._cache_delete_prefix(graniot._EMBED_ACCOUNTS_CACHE_KEY)
     graniot._cache_delete_prefix(graniot._COMPANY_FARMS_CACHE_KEY)
@@ -192,6 +196,7 @@ def test_embed_endpoint_falls_back_to_configured_url_when_live_fails(monkeypatch
         "embedded_url": "https://embed.graniot.com/?auth_id=configured-token",
         # El navegador debe poder distinguir el portal compartido del propio.
         "source": "service",
+        "status": "ready",
     }
     assert response.headers["cache-control"] == "no-store"
 
@@ -343,7 +348,7 @@ def test_embed_endpoint_falls_back_to_mint_when_personal_token_expired(monkeypat
 
 
 def test_embed_endpoint_no_match_mints_service_token(monkeypatch):
-    """Users without a Graniot account keep the dedicated service portal."""
+    """Con el fallback compartido encendido, quien no tiene cuenta usa el portal de servicio."""
     minted = _fake_jwt(int(time.time()) + 3600)
     fake_client = _FakeGraniotClient([
         {
