@@ -185,29 +185,47 @@ def enrich_request(db: Dict[str, Any], row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def extension_enabled_for(db: Dict[str, Any], company_id: Optional[str], user_id: Optional[str], extension_id: str = DIGIFORMS_MODULE["id"]) -> bool:
+    """¿Tiene la empresa o el usuario la extensión?
+
+    Misma regla que el resto de módulos (app/services/module_access.py): una
+    decisión explícita en `false`, de la empresa o de la persona, gana a una
+    solicitud aprobada. Antes bastaba con que existiera cualquier concesión, así
+    que apagar DigiformsApp desde el panel no se lo quitaba a nadie que la
+    hubiera solicitado.
+    """
     extension_id = normalize_extension_id(extension_id)
     if not company_id and not user_id:
         return False
-    company_enabled = bool(
-        company_id
-        and any(
-            cm.get("company_id") == company_id
-            and normalize_extension_id(cm.get("module_id")) == extension_id
-            and cm.get("is_enabled", cm.get("is_active", False)) is not False
-            and cm.get("is_active", cm.get("is_enabled", True)) is not False
-            for cm in table(db, "company_modules")
+
+    def _is_on(row: Dict[str, Any]) -> bool:
+        return (
+            row.get("is_enabled", row.get("is_active", False)) is not False
+            and row.get("is_active", row.get("is_enabled", True)) is not False
         )
-    )
-    user_enabled = bool(
-        user_id
-        and any(
-            um.get("user_id") == user_id
+
+    company_rows = [
+        cm for cm in table(db, "company_modules")
+        if company_id
+        and cm.get("company_id") == company_id
+        and normalize_extension_id(cm.get("module_id")) == extension_id
+    ]
+    company_enabled = any(_is_on(cm) for cm in company_rows)
+    if company_rows and not company_enabled:
+        return False
+
+    user_rows = sorted(
+        (
+            um for um in table(db, "user_modules")
+            if user_id
+            and um.get("user_id") == user_id
             and normalize_extension_id(um.get("module_id")) == extension_id
-            and um.get("is_enabled", um.get("is_active", False)) is not False
-            and um.get("is_active", um.get("is_enabled", True)) is not False
-            for um in table(db, "user_modules")
-        )
+        ),
+        key=lambda row: str(row.get("updated_at") or row.get("created_at") or ""),
     )
+    if user_rows:
+        # Manda la decisión más reciente sobre esta persona.
+        return _is_on(user_rows[-1])
+    user_enabled = False
     approved_request_enabled = bool(
         any(
             normalize_extension_id(r.get("extension_id")) == extension_id

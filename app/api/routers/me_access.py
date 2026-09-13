@@ -153,6 +153,7 @@ def _effective_module_ids(
 ) -> List[str]:
     """Acceso efectivo: la empresa manda y el usuario sobrescribe módulo a módulo."""
     company_enabled = _company_enabled_module_ids(db, company_id)
+    company_disabled = module_access.company_disabled_module_ids(table(db, "company_modules"), company_id)
     overrides = _user_module_overrides(db, user_id, admin_user_id)
     approved_extensions = _approved_extension_ids(db, user_id, company_id)
 
@@ -167,6 +168,7 @@ def _effective_module_ids(
             company_enabled=company_enabled,
             approved_extensions=approved_extensions,
             has_company=bool(company_id),
+            company_disabled=company_disabled,
         ):
             granted.append(module_id)
     return _unique(granted)

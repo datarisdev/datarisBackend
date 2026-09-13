@@ -8,8 +8,9 @@ otro usuario administrador. Además verifica que:
 * un `company_admin` no puede escalar creando otro administrador por el API
   genérico de tablas (la escalada concreta que existía),
 * el auto-registro público NUNCA nace con rol de administrador, y
-* un comercial con `can_onboard_clients` puede dar de alta un cliente (empresa +
-  su administrador) pero jamás un superadministrador.
+* una cuenta del panel (lista blanca) puede dar de alta un cliente (empresa + su
+  administrador) pero jamás un superadministrador, y el permiso por fila
+  `can_onboard_clients` ya no basta por sí solo.
 """
 
 from __future__ import annotations
@@ -203,9 +204,9 @@ def _grant_onboarding(email: str) -> None:
 
 
 def test_comercial_da_de_alta_cliente(client: TestClient, admin_token: str):
+    # Cuenta de la lista blanca sin ningún permiso marcado: le basta con eso.
     comercial_email = f"comercial-{uuid.uuid4().hex[:8]}@dataris-test.com"
     _create_user(client, admin_token, email=comercial_email)
-    _grant_onboarding(comercial_email)
     token = _sign_in(client, comercial_email, "Seguridad2026!")
 
     ctx = client.get("/api/compat/admin/clients/context", headers=_auth(token))
@@ -233,8 +234,10 @@ def test_comercial_da_de_alta_cliente(client: TestClient, admin_token: str):
 
 
 def test_usuario_sin_permiso_no_da_de_alta_cliente(client: TestClient, admin_token: str):
-    email = f"nopuede-{uuid.uuid4().hex[:8]}@dataris-test.com"
+    # Fuera de la lista blanca, ni con el permiso antiguo marcado.
+    email = f"nopuede-{uuid.uuid4().hex[:8]}@cliente-final.com"
     _create_user(client, admin_token, email=email)
+    _grant_onboarding(email)
     token = _sign_in(client, email, "Seguridad2026!")
 
     response = client.post(
