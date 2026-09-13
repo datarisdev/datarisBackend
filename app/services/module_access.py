@@ -40,6 +40,28 @@ def company_enabled_module_ids(rows: List[Dict[str, Any]], company_id: Optional[
     }
 
 
+def company_disabled_module_ids(rows: List[Dict[str, Any]], company_id: Optional[str]) -> Set[str]:
+    """Módulos que la empresa tiene APAGADOS de forma explícita.
+
+    No es lo mismo que «no contratado»: una fila en `false` es la decisión del
+    operador de retirarle el módulo a toda la empresa, y gana a todo lo demás,
+    solicitudes de extensión aprobadas y ajustes en `true` de un usuario
+    incluidos. Sin esta regla, apagar DigiformsApp a una empresa no se lo quitaba
+    a quien tuviera una solicitud aprobada: era uno de los módulos que «no se
+    sincronizaban».
+    """
+    if not company_id:
+        return set()
+    disabled = {
+        module_catalog.canonical_module_id(row.get("module_id"))
+        for row in rows
+        if row.get("company_id") == company_id and not row_is_enabled(row)
+    }
+    # Ante filas duplicadas y contradictorias, basta una encendida (misma
+    # lectura que company_enabled_module_ids).
+    return disabled - company_enabled_module_ids(rows, company_id)
+
+
 def user_module_overrides(
     rows: List[Dict[str, Any]],
     user_id: str,
@@ -102,8 +124,12 @@ def module_is_granted(
     company_enabled: Set[str],
     approved_extensions: Set[str],
     has_company: bool = False,
+    company_disabled: Set[str] = frozenset(),
 ) -> bool:
     """El paquete de la empresa es el techo; el usuario solo puede quedarse corto.
+
+    Lo que la empresa tiene apagado de forma explícita (`company_disabled`) no
+    lo recupera nadie: ni una solicitud de extensión aprobada ni un ajuste propio.
 
     Un `override` en `true` NO concede un módulo del producto que la empresa no
     tiene contratado. Sin este tope, los usuarios dados de alta con el sistema
@@ -118,6 +144,8 @@ def module_is_granted(
     - un usuario sin empresa no hereda nada, así que sus overrides son su única
       fuente de acceso.
     """
+    if module_id in company_disabled:
+        return False
     inherited = module_id in company_enabled or module_id in approved_extensions
     override = overrides.get(module_id)
     if override is False:

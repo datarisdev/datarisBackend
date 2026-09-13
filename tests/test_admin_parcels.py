@@ -4,9 +4,10 @@ Cubre las dos mitades del cambio:
 
 * el cliente ya no puede dar de alta ni borrar sus lotes (ni por los endpoints
   de carga ni por el API genérico de tablas), y
-* el equipo de Dataris —administradores y los comerciales con el permiso
-  `can_manage_parcels`— sí puede hacerlo en nombre de un usuario concreto,
-  siempre dentro de su alcance.
+* las cuentas del panel de Dataris (las de la lista blanca) sí pueden hacerlo en
+  nombre de cualquier usuario de cualquier empresa, sin ningún permiso por fila.
+  Los permisos por fila antiguos (`can_manage_parcels`, `can_manage_all_parcels`)
+  ya no abren nada por sí solos, tampoco las rutas de Graniot.
 """
 
 from __future__ import annotations
@@ -27,6 +28,9 @@ from app.main import app  # noqa: E402
 from app.api.routers import compat  # noqa: E402
 
 SUPERADMIN = {"email": "admin@dataris.local", "password": "admin123456"}
+# Las cuentas del panel son las @dataris-test.com (ver la lista blanca de abajo);
+# los clientes, de un dominio que la lista no cubre.
+CLIENT_DOMAIN = "cliente-final.com"
 
 
 def polygon(offset: float = 0.0) -> dict:
@@ -50,9 +54,9 @@ def client() -> TestClient:
 
 @pytest.fixture(scope="module", autouse=True)
 def _panel_allowlist_para_pruebas():
-    # Estas pruebas validan el alcance de la gestión de lotes con gestores
-    # @dataris-test.com; se amplía la lista blanca del panel para que el candado
-    # por email no las tape. El candado se prueba en test_admin_panel_allowlist.py.
+    # Las cuentas @dataris-test.com hacen de equipo de Dataris: se amplía la
+    # lista blanca del panel para ellas. El candado en sí se prueba en
+    # test_admin_panel_allowlist.py.
     previo = os.environ.get("DATARIS_ADMIN_PANEL_EMAILS")
     os.environ["DATARIS_ADMIN_PANEL_EMAILS"] = "admin@dataris.local,*@dataris-test.com"
     yield
@@ -112,7 +116,7 @@ def _create_company(client: TestClient, admin_token: str, name: str) -> str:
 
 
 def _grant_parcel_permission(admin_user_email: str, *, global_scope: bool) -> None:
-    """Marca el permiso directamente en el almacén, como haría el panel."""
+    """Marca los permisos antiguos directamente en el almacén."""
     with compat.LOCK:
         db = compat.read_db()
         user = next(u for u in db["users"] if u.get("email") == admin_user_email)
@@ -128,11 +132,15 @@ def _parcels_of(client: TestClient, token: str) -> list[dict]:
     return response.json()["data"]
 
 
+def _client_email(prefix: str = "cliente") -> str:
+    return f"{prefix}-{uuid.uuid4().hex[:8]}@{CLIENT_DOMAIN}"
+
+
 # --- El cliente ya no gestiona sus lotes ----------------------------------
 
 
 def test_el_cliente_no_puede_crear_lotes(client: TestClient, admin_token: str):
-    email = f"cliente-{uuid.uuid4().hex[:8]}@dataris-test.com"
+    email = _client_email()
     _create_user(client, admin_token, email=email)
     token = _sign_in(client, email, "Lotes2026!")
 
@@ -153,7 +161,7 @@ def test_el_cliente_no_puede_crear_lotes(client: TestClient, admin_token: str):
 
 
 def test_el_cliente_no_puede_borrar_sus_lotes(client: TestClient, admin_token: str):
-    email = f"cliente-{uuid.uuid4().hex[:8]}@dataris-test.com"
+    email = _client_email()
     user_id = _create_user(client, admin_token, email=email)
     token = _sign_in(client, email, "Lotes2026!")
 
@@ -175,7 +183,7 @@ def test_el_cliente_no_puede_borrar_sus_lotes(client: TestClient, admin_token: s
 
 
 def test_el_cliente_no_puede_concederse_el_permiso(client: TestClient, admin_token: str):
-    email = f"cliente-{uuid.uuid4().hex[:8]}@dataris-test.com"
+    email = _client_email()
     user_id = _create_user(client, admin_token, email=email)
     token = _sign_in(client, email, "Lotes2026!")
 
@@ -198,7 +206,7 @@ def test_el_cliente_no_puede_concederse_el_permiso(client: TestClient, admin_tok
 
 
 def test_el_superadmin_carga_lotes_para_un_usuario(client: TestClient, admin_token: str):
-    email = f"cliente-{uuid.uuid4().hex[:8]}@dataris-test.com"
+    email = _client_email()
     user_id = _create_user(client, admin_token, email=email)
     client_token = _sign_in(client, email, "Lotes2026!")
 
@@ -237,8 +245,7 @@ def test_el_superadmin_carga_lotes_para_un_usuario(client: TestClient, admin_tok
 
 
 def test_el_listado_de_usuarios_incluye_a_los_gestionables(client: TestClient, admin_token: str):
-    email = f"cliente-{uuid.uuid4().hex[:8]}@dataris-test.com"
-    user_id = _create_user(client, admin_token, email=email)
+    user_id = _create_user(client, admin_token, email=_client_email())
 
     response = client.get("/api/compat/admin/parcels/users", headers=_auth(admin_token))
     assert response.status_code == 200, response.text
@@ -247,88 +254,79 @@ def test_el_listado_de_usuarios_incluye_a_los_gestionables(client: TestClient, a
     assert user_id in {user["id"] for user in data["users"]}
 
 
-def test_un_comercial_con_permiso_carga_lotes_de_cualquier_empresa(client: TestClient, admin_token: str):
-    comercial_email = f"comercial-{uuid.uuid4().hex[:8]}@dataris-test.com"
-    _create_user(client, admin_token, email=comercial_email)
-    comercial_token = _sign_in(client, comercial_email, "Lotes2026!")
-
-    cliente_email = f"cliente-{uuid.uuid4().hex[:8]}@dataris-test.com"
-    cliente_id = _create_user(client, admin_token, email=cliente_email)
-
-    # Sin permiso, el comercial no entra.
-    denied = client.post(
-        "/api/compat/admin/parcels/manual",
-        headers=_auth(comercial_token),
-        json={"user_id": cliente_id, "name": "Lote comercial", "geometry": polygon(0.30)},
-    )
-    assert denied.status_code == 403
-
-    _grant_parcel_permission(comercial_email, global_scope=True)
-
-    context = client.get("/api/compat/admin/parcels/context", headers=_auth(comercial_token))
-    assert context.json()["data"] == {
-        "allowed": True,
-        "scope": "all",
-        "admin_role": "company_user",
-        "company_id": context.json()["data"]["company_id"],
-        "company_name": context.json()["data"]["company_name"],
-    }
-
-    created = client.post(
-        "/api/compat/admin/parcels/manual",
-        headers=_auth(comercial_token),
-        json={"user_id": cliente_id, "name": "Lote comercial", "geometry": polygon(0.31)},
-    )
-    assert created.status_code == 200, created.text
-    assert created.json()["data"]["parcel"]["user_id"] == cliente_id
-
-
-def test_un_comercial_sin_alcance_global_solo_ve_su_empresa(client: TestClient, admin_token: str):
+def test_una_cuenta_del_panel_gestiona_lotes_de_cualquier_empresa(client: TestClient, admin_token: str):
+    # Sin ningún permiso marcado y sin ser administradora: basta con estar en la
+    # lista blanca del panel.
     company_a = _create_company(client, admin_token, f"Empresa A {uuid.uuid4().hex[:6]}")
     company_b = _create_company(client, admin_token, f"Empresa B {uuid.uuid4().hex[:6]}")
 
     comercial_email = f"comercial-{uuid.uuid4().hex[:8]}@dataris-test.com"
     _create_user(client, admin_token, email=comercial_email, company_id=company_a)
     comercial_token = _sign_in(client, comercial_email, "Lotes2026!")
-    _grant_parcel_permission(comercial_email, global_scope=False)
 
-    propio_id = _create_user(
-        client,
-        admin_token,
-        email=f"propio-{uuid.uuid4().hex[:8]}@dataris-test.com",
-        company_id=company_a,
-    )
-    ajeno_id = _create_user(
-        client,
-        admin_token,
-        email=f"ajeno-{uuid.uuid4().hex[:8]}@dataris-test.com",
-        company_id=company_b,
-    )
+    ajeno_id = _create_user(client, admin_token, email=_client_email("ajeno"), company_id=company_b)
+
+    context = client.get("/api/compat/admin/parcels/context", headers=_auth(comercial_token))
+    data = context.json()["data"]
+    assert data["allowed"] is True
+    assert data["scope"] == "all"
+    assert data["admin_role"] == "company_user"
 
     users = client.get("/api/compat/admin/parcels/users", headers=_auth(comercial_token))
     assert users.status_code == 200, users.text
-    visible = {user["id"] for user in users.json()["data"]["users"]}
-    assert propio_id in visible
-    assert ajeno_id not in visible
+    assert ajeno_id in {user["id"] for user in users.json()["data"]["users"]}
 
-    permitido = client.post(
+    created = client.post(
         "/api/compat/admin/parcels/manual",
         headers=_auth(comercial_token),
-        json={"user_id": propio_id, "name": "Lote de mi empresa", "geometry": polygon(0.40)},
+        json={"user_id": ajeno_id, "name": "Lote de otra empresa", "geometry": polygon(0.31)},
     )
-    assert permitido.status_code == 200, permitido.text
+    assert created.status_code == 200, created.text
+    assert created.json()["data"]["parcel"]["user_id"] == ajeno_id
 
-    prohibido = client.post(
+
+def test_los_permisos_por_fila_ya_no_abren_la_gestion_de_lotes(client: TestClient, admin_token: str):
+    # Fuera de la lista blanca, los permisos antiguos no sirven por ninguna vía.
+    # Incluye las rutas de Graniot «en nombre de otro usuario», que antes solo
+    # miraban el permiso de la fila (hallazgo C-001).
+    comercial_email = _client_email("comercial")
+    _create_user(client, admin_token, email=comercial_email)
+    _grant_parcel_permission(comercial_email, global_scope=True)
+    token = _sign_in(client, comercial_email, "Lotes2026!")
+
+    cliente_id = _create_user(client, admin_token, email=_client_email())
+
+    context = client.get("/api/compat/admin/parcels/context", headers=_auth(token))
+    assert context.json()["data"]["allowed"] is False
+
+    users = client.get("/api/compat/admin/parcels/users", headers=_auth(token))
+    assert users.status_code == 403
+
+    manual = client.post(
         "/api/compat/admin/parcels/manual",
-        headers=_auth(comercial_token),
-        json={"user_id": ajeno_id, "name": "Lote ajeno", "geometry": polygon(0.41)},
+        headers=_auth(token),
+        json={"user_id": cliente_id, "name": "Lote ajeno", "geometry": polygon(0.40)},
     )
-    assert prohibido.status_code == 403
+    assert manual.status_code == 403
+
+    target = client.get(
+        "/api/graniot/parcels/sync-target",
+        headers=_auth(token),
+        params={"user_id": cliente_id},
+    )
+    assert target.status_code == 403, target.text
+
+    unsync = client.delete(
+        f"/api/graniot/parcels/sync-local/{uuid.uuid4()}",
+        headers=_auth(token),
+        params={"user_id": cliente_id},
+    )
+    assert unsync.status_code == 403, unsync.text
 
 
 def test_no_se_borran_lotes_de_otro_usuario(client: TestClient, admin_token: str):
-    dueno_id = _create_user(client, admin_token, email=f"dueno-{uuid.uuid4().hex[:8]}@dataris-test.com")
-    otro_id = _create_user(client, admin_token, email=f"otro-{uuid.uuid4().hex[:8]}@dataris-test.com")
+    dueno_id = _create_user(client, admin_token, email=_client_email("dueno"))
+    otro_id = _create_user(client, admin_token, email=_client_email("otro"))
 
     created = client.post(
         "/api/compat/admin/parcels/manual",
@@ -352,7 +350,7 @@ def test_no_se_borran_lotes_de_otro_usuario(client: TestClient, admin_token: str
     assert [p["id"] for p in listed.json()["data"]["parcels"]] == [parcel_id]
 
 
-def test_el_alcance_global_solo_lo_concede_un_superadmin(client: TestClient, admin_token: str):
+def test_un_admin_de_empresa_no_asciende_a_nadie(client: TestClient, admin_token: str):
     company_id = _create_company(client, admin_token, f"Empresa C {uuid.uuid4().hex[:6]}")
     company_admin_email = f"admin-empresa-{uuid.uuid4().hex[:8]}@dataris-test.com"
     _create_user(
@@ -364,8 +362,7 @@ def test_el_alcance_global_solo_lo_concede_un_superadmin(client: TestClient, adm
     )
     company_admin_token = _sign_in(client, company_admin_email, "Lotes2026!")
 
-    comercial_email = f"comercial-{uuid.uuid4().hex[:8]}@dataris-test.com"
-    comercial_id = _create_user(client, admin_token, email=comercial_email, company_id=company_id)
+    comercial_id = _create_user(client, admin_token, email=_client_email("comercial"), company_id=company_id)
 
     response = client.post(
         "/api/compat/tables/admin_users/update",
@@ -381,10 +378,46 @@ def test_el_alcance_global_solo_lo_concede_un_superadmin(client: TestClient, adm
     )
     assert response.status_code == 200, response.text
 
-    comercial_token = _sign_in(client, comercial_email, "Lotes2026!")
-    context = client.get("/api/compat/admin/parcels/context", headers=_auth(comercial_token))
-    data = context.json()["data"]
-    assert data["allowed"] is True
-    # El permiso se concedió, pero acotado a la empresa y sin ascender el rol.
-    assert data["scope"] == "company"
-    assert data["admin_role"] == "company_user"
+    db = compat.read_db(force_refresh=True)
+    row = next(r for r in compat.table(db, "admin_users") if r.get("user_id") == comercial_id)
+    # El rol no sube y los permisos marcados no le abren la gestión de lotes.
+    assert row["admin_role"] == "company_user"
+    assert compat.can_manage_parcels(db, comercial_id) is False
+
+
+def test_el_alta_sin_lista_de_modulos_hereda_el_paquete_de_la_empresa(client: TestClient, admin_token: str):
+    # Antes, un alta sin `modules` bloqueaba de forma explícita todo el paquete
+    # de la empresa y el usuario nacía sin módulos.
+    company_id = _create_company(client, admin_token, f"Empresa D {uuid.uuid4().hex[:6]}")
+    paquete = client.put(
+        f"/api/compat/admin/module-access/companies/{company_id}",
+        headers=_auth(admin_token),
+        json={"modules": {"satelite": True, "telemetria": True}},
+    )
+    assert paquete.status_code == 200, paquete.text
+
+    hereda_id = _create_user(client, admin_token, email=_client_email("hereda"), company_id=company_id)
+    detalle = client.get(f"/api/compat/admin/module-access/users/{hereda_id}", headers=_auth(admin_token))
+    modulos = {m["id"]: m for m in detalle.json()["data"]["modules"]}
+    for module_id in ("satelite", "telemetria"):
+        assert modulos[module_id]["override"] is None
+        assert modulos[module_id]["effective"] is True
+
+    # Con lista explícita se respeta: lo que no se marca queda bloqueado.
+    response = client.post(
+        "/api/compat/admin/users/manual",
+        headers=_auth(admin_token),
+        json={
+            "email": _client_email("elige"),
+            "password": "Lotes2026!",
+            "company_id": company_id,
+            "admin_role": "company_user",
+            "modules": ["satelite"],
+        },
+    )
+    assert response.status_code == 200, response.text
+    elige_id = response.json()["data"]["user"]["id"]
+    detalle = client.get(f"/api/compat/admin/module-access/users/{elige_id}", headers=_auth(admin_token))
+    modulos = {m["id"]: m for m in detalle.json()["data"]["modules"]}
+    assert modulos["satelite"]["effective"] is True
+    assert modulos["telemetria"]["effective"] is False

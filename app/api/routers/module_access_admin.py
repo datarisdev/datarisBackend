@@ -79,6 +79,10 @@ def _company_enabled(db: Dict[str, Any], company_id: Optional[str]) -> set:
     return module_access.company_enabled_module_ids(table(db, "company_modules"), company_id)
 
 
+def _company_disabled(db: Dict[str, Any], company_id: Optional[str]) -> set:
+    return module_access.company_disabled_module_ids(table(db, "company_modules"), company_id)
+
+
 def _overrides_for(db: Dict[str, Any], user_id: str, admin_user_id: Optional[str]) -> Dict[str, bool]:
     return module_access.user_module_overrides(table(db, "user_modules"), user_id, admin_user_id)
 
@@ -103,6 +107,11 @@ def _module_card(module_id: str, row: Optional[Dict[str, Any]]) -> Dict[str, Any
         "surface": spec.surface if spec else "menu",
         "surface_hint": spec.surface_hint if spec else "Módulo fuera del catálogo del producto: revísalo con el equipo de Dataris.",
         "routes": list(spec.routes) if spec else [],
+        # Sección del menú lateral, módulo desde el que se abre y pantallas que
+        # trae dentro: el panel los agrupa y anida igual que el menú del cliente.
+        "group": spec.group if spec else module_catalog.GROUP_GENERAL,
+        "parent": spec.parent if spec else None,
+        "includes": list(spec.includes) if spec else [],
         "assignable": bool(spec and spec.assignable),
         "is_system": _is_system_module(module_id),
         "is_internal": module_id in INTERNAL_ONLY_MODULE_IDS or bool(spec and spec.category == module_catalog.CATEGORY_INTERNAL),
@@ -151,6 +160,7 @@ def _user_summary(db: Dict[str, Any], user: Dict[str, Any], companies: Dict[str,
     company_id = _company_for(db, user_id, admin_row)
     overrides = _overrides_for(db, user_id, (admin_row or {}).get("id"))
     company_enabled = _company_enabled(db, company_id)
+    company_disabled = _company_disabled(db, company_id)
     approved = _approved_extensions(db, user_id, company_id)
 
     effective = set()
@@ -166,6 +176,7 @@ def _user_summary(db: Dict[str, Any], user: Dict[str, Any], companies: Dict[str,
             company_enabled=company_enabled,
             approved_extensions=approved,
             has_company=bool(company_id),
+            company_disabled=company_disabled,
         ):
             effective.add(module_id)
 
@@ -234,6 +245,7 @@ def get_catalog(authorization: Optional[str] = Header(default=None)):
             "data": {
                 "modules": modules,
                 "derived": [dict(item, depends_on=list(item["depends_on"])) for item in module_catalog.DERIVED_MODULES],
+                "groups": [{"id": group_id, "name": name} for group_id, name in module_catalog.MODULE_GROUPS],
                 "companies_total": len(table(db, "companies")),
             },
             "error": None,
@@ -421,6 +433,7 @@ def _user_detail(db: Dict[str, Any], user_id: str) -> Dict[str, Any]:
 
     overrides = _overrides_for(db, user_id, (admin_row or {}).get("id"))
     company_enabled = _company_enabled(db, company_id)
+    company_disabled = _company_disabled(db, company_id)
     approved = _approved_extensions(db, user_id, company_id)
     is_superadmin_user = (admin_row or {}).get("admin_role") == "superadmin"
     is_demo_user = is_commercial_demo_user(user)
@@ -444,8 +457,12 @@ def _user_detail(db: Dict[str, Any], user_id: str) -> Dict[str, Any]:
                 company_enabled=company_enabled,
                 approved_extensions=approved,
                 has_company=bool(company_id),
+                company_disabled=company_disabled,
             )
-            if override is False:
+            if module_id in company_disabled:
+                # La empresa lo apagó: gana a solicitudes aprobadas y ajustes propios.
+                source = "company_off"
+            elif override is False:
                 source = "user"
             elif not inherited and company_id:
                 # Un override en `true` sobre algo que la empresa no tiene
@@ -457,6 +474,7 @@ def _user_detail(db: Dict[str, Any], user_id: str) -> Dict[str, Any]:
                 source = "company" if inherited else "none"
         card.update({
             "company_enabled": module_id in company_enabled,
+            "company_disabled": module_id in company_disabled,
             "approved_extension": module_id in approved,
             "override": override,
             "effective": effective,

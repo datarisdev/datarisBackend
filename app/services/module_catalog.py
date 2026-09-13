@@ -9,9 +9,15 @@ arranque.
 
 Este módulo es la única fuente de verdad de qué módulos existen y, sobre todo,
 de **dónde se ven**: el panel necesita poder decirle al operador que "Mapeo" no
-tiene entrada propia en el menú lateral (se abre desde el Centro de control) o
-que "Dashboard" no se puede quitar. Sin ese dato, activar un módulo y no verlo
-en el menú parece un fallo cuando es el comportamiento esperado.
+tiene entrada propia en el menú lateral o que el Centro de control no se puede
+quitar. Sin ese dato, activar un módulo y no verlo en el menú parece un fallo
+cuando es el comportamiento esperado.
+
+Los nombres y las secciones (`group`) son los del menú lateral de la
+plataforma, en el mismo orden: el panel listaba los módulos sueltos, con
+nombres que no coincidían con los del menú ("Dashboard", "Alertas
+inteligentes"), y mezclaba módulos con pantallas que solo se abren desde otro
+(`parent`) o que vienen dentro de uno (`includes`).
 """
 from __future__ import annotations
 
@@ -29,6 +35,26 @@ SURFACE_MENU = "menu"          # tiene su propia entrada en el menú lateral
 SURFACE_EMBEDDED = "embedded"  # sin entrada propia: se abre desde otras pantallas
 SURFACE_INTERNAL = "internal"  # solo para el equipo de Dataris
 
+# Secciones del menú lateral de la plataforma, en su orden. El panel agrupa los
+# módulos igual para que el operador los encuentre donde los ve el cliente.
+GROUP_GENERAL = "general"
+GROUP_CARTOGRAFIA = "cartografia"
+GROUP_MAQUINARIA = "maquinaria"
+GROUP_PRODUCCION = "produccion"
+GROUP_ALERTAS = "alertas"
+GROUP_EXTENSIONES = "extensiones"
+GROUP_INTERNO = "interno"
+
+MODULE_GROUPS: Tuple[Tuple[str, str], ...] = (
+    (GROUP_GENERAL, "Servicios y recursos"),
+    (GROUP_CARTOGRAFIA, "Cartografía"),
+    (GROUP_MAQUINARIA, "Maquinaria"),
+    (GROUP_PRODUCCION, "Producción"),
+    (GROUP_ALERTAS, "Alertas"),
+    (GROUP_EXTENSIONES, "Extensiones"),
+    (GROUP_INTERNO, "Interno de Dataris"),
+)
+
 
 @dataclass(frozen=True)
 class ModuleSpec:
@@ -42,6 +68,13 @@ class ModuleSpec:
     # activar el módulo.
     surface_hint: str
     routes: Tuple[str, ...] = ()
+    # Sección del menú lateral donde vive.
+    group: str = GROUP_GENERAL
+    # Módulo desde el que se abre cuando no tiene entrada propia en el menú:
+    # el panel lo muestra como submódulo suyo.
+    parent: Optional[str] = None
+    # Pantallas que vienen dentro del módulo y no tienen interruptor propio.
+    includes: Tuple[str, ...] = ()
 
     @property
     def assignable(self) -> bool:
@@ -52,23 +85,37 @@ class ModuleSpec:
 MODULE_SPECS: Tuple[ModuleSpec, ...] = (
     ModuleSpec(
         id="dashboard",
-        name="Dashboard",
-        description="Centro de control: portada de la plataforma con el resumen operativo.",
+        name="Centro de control",
+        description="Portada de la plataforma con el resumen operativo.",
         icon="LayoutDashboard",
         category=CATEGORY_CORE,
         surface=SURFACE_SYSTEM,
         surface_hint="Siempre disponible. Es la portada de la plataforma y no se puede retirar a nadie.",
         routes=("/dashboard",),
+        group=GROUP_GENERAL,
     ),
     ModuleSpec(
         id="satelite",
-        name="Monitoreo Satelital",
+        name="Monitoreo satelital",
         description="Análisis satelital de los lotes: capas, índices de vegetación, fechas disponibles, estadísticas y comparativas.",
         icon="Satellite",
         category=CATEGORY_CORE,
         surface=SURFACE_MENU,
         surface_hint="Menú lateral › Cartografía › Monitoreo satelital. Incluye las capas satelitales de la Zona de Análisis.",
         routes=("/satelite",),
+        group=GROUP_CARTOGRAFIA,
+    ),
+    ModuleSpec(
+        id="sig-agricola",
+        name="SIG agrícola",
+        description="Análisis agrícola por lote.",
+        icon="Sprout",
+        category=CATEGORY_CORE,
+        surface=SURFACE_MENU,
+        surface_hint="Menú lateral › Cartografía › SIG agrícola.",
+        routes=("/sig-agricola",),
+        group=GROUP_CARTOGRAFIA,
+        includes=("Cosecha", "Plagas", "Malezas"),
     ),
     ModuleSpec(
         id="mapeo",
@@ -77,8 +124,9 @@ MODULE_SPECS: Tuple[ModuleSpec, ...] = (
         icon="Map",
         category=CATEGORY_CORE,
         surface=SURFACE_EMBEDDED,
-        surface_hint="Sin entrada propia en el menú: se abre desde el Centro de control y habilita la Zona de Análisis.",
+        surface_hint="Sin entrada propia en el menú: habilita la Zona de Análisis y la Bitácora de campo.",
         routes=("/mapeo",),
+        group=GROUP_CARTOGRAFIA,
     ),
     ModuleSpec(
         id="telemetria",
@@ -89,6 +137,20 @@ MODULE_SPECS: Tuple[ModuleSpec, ...] = (
         surface=SURFACE_MENU,
         surface_hint="Menú lateral › Maquinaria › Telemetría.",
         routes=("/telemetria", "/cosecha-mecanica"),
+        group=GROUP_MAQUINARIA,
+        includes=("Cosecha mecánica",),
+    ),
+    ModuleSpec(
+        id="aplicaciones-aereas",
+        name="Aplicaciones aéreas",
+        description="Control de aplicaciones con dron, helicóptero y avioneta.",
+        icon="Plane",
+        category=CATEGORY_CORE,
+        surface=SURFACE_EMBEDDED,
+        surface_hint="Sin entrada propia en el menú: se abre desde Telemetría y habilita la Zona de Análisis.",
+        routes=("/aplicaciones-aereas", "/drones"),
+        group=GROUP_MAQUINARIA,
+        parent="telemetria",
     ),
     ModuleSpec(
         id="ortofoto-analysis",
@@ -99,46 +161,29 @@ MODULE_SPECS: Tuple[ModuleSpec, ...] = (
         surface=SURFACE_MENU,
         surface_hint="Menú lateral › Maquinaria › Análisis de ortofotos.",
         routes=("/ortofoto-analysis",),
-    ),
-    ModuleSpec(
-        id="sig-agricola",
-        name="SIG Agrícola",
-        description="Análisis agrícola: cosecha, plagas y malezas por lote.",
-        icon="Sprout",
-        category=CATEGORY_CORE,
-        surface=SURFACE_MENU,
-        surface_hint="Menú lateral › Cartografía › SIG agrícola.",
-        routes=("/sig-agricola",),
-    ),
-    ModuleSpec(
-        id="aplicaciones-aereas",
-        name="Aplicaciones Aéreas",
-        description="Control de aplicaciones con dron, helicóptero y avioneta.",
-        icon="Plane",
-        category=CATEGORY_CORE,
-        surface=SURFACE_EMBEDDED,
-        surface_hint="Sin entrada propia en el menú: se abre desde Telemetría y habilita la Zona de Análisis.",
-        routes=("/aplicaciones-aereas", "/drones"),
+        group=GROUP_MAQUINARIA,
     ),
     ModuleSpec(
         id="personal",
-        name="Personal de Campo",
+        name="Personal de campo",
         description="Control biométrico y georreferenciado del personal.",
         icon="Users",
         category=CATEGORY_CORE,
         surface=SURFACE_MENU,
         surface_hint="Menú lateral › Producción › Personal de campo.",
         routes=("/personal",),
+        group=GROUP_PRODUCCION,
     ),
     ModuleSpec(
         id="alertas",
-        name="Alertas inteligentes",
+        name="Alertas operativas",
         description="Detección proactiva de riesgos operativos.",
         icon="Bell",
         category=CATEGORY_CORE,
         surface=SURFACE_MENU,
         surface_hint="Menú lateral › Alertas › Alertas operativas.",
         routes=("/alertas",),
+        group=GROUP_ALERTAS,
     ),
     ModuleSpec(
         id="digiforms",
@@ -149,6 +194,7 @@ MODULE_SPECS: Tuple[ModuleSpec, ...] = (
         surface=SURFACE_MENU,
         surface_hint="Extensión: se concede desde Extensiones o aprobando la solicitud del cliente.",
         routes=("/digiforms",),
+        group=GROUP_EXTENSIONES,
     ),
     ModuleSpec(
         id="ml-training",
@@ -159,6 +205,7 @@ MODULE_SPECS: Tuple[ModuleSpec, ...] = (
         surface=SURFACE_INTERNAL,
         surface_hint="Interno de Dataris: nunca se concede a una empresa cliente ni a la cuenta demo.",
         routes=("/laboratorio-ia",),
+        group=GROUP_INTERNO,
     ),
 )
 
@@ -177,8 +224,19 @@ DERIVED_MODULES = (
     {
         "id": "work-area",
         "name": "Zona de Análisis",
+        "group": GROUP_CARTOGRAFIA,
         "depends_on": ("satelite", "aplicaciones-aereas", "mapeo", "telemetria", "ortofoto-analysis"),
         "surface_hint": "Menú lateral › Cartografía › Zona de Análisis. Aparece sola con cualquiera de sus módulos base.",
+    },
+    {
+        "id": "field-log",
+        "name": "Bitácora de campo",
+        "group": GROUP_PRODUCCION,
+        "depends_on": ("mapeo", "satelite", "sig-agricola", "personal"),
+        "surface_hint": (
+            "Menú lateral › Producción › Bitácora de campo. Aparece sola con cualquiera de sus módulos base, "
+            "si la cuenta tiene conectados sus formularios de AgtechApps."
+        ),
     },
 )
 

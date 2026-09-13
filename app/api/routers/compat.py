@@ -1153,14 +1153,37 @@ def active_admin_row(db: Dict[str, Any], user_id: str) -> Optional[Dict[str, Any
     )
 
 
+def user_record(db: Dict[str, Any], user_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    return next((u for u in db.get("users", []) if str(u.get("id") or "") == str(user_id or "")), None)
+
+
+def is_panel_operator(db: Dict[str, Any], user_id: Optional[str]) -> bool:
+    """¿Es una de las cuentas del panel de Dataris?
+
+    Desde el 13 sep 2026 la lista blanca del panel (DATARIS_ADMIN_PANEL_EMAILS)
+    es la única llave de las tareas de operación: entrar al panel, gestionar los
+    lotes de los clientes de CUALQUIER empresa y dar de alta clientes nuevos.
+
+    Los permisos por fila (`can_manage_parcels`, `can_manage_all_parcels`,
+    `can_onboard_clients`) ya no conceden nada. Se daban desde el panel a cuentas
+    que el propio candado dejaba fuera, así que en la interfaz no servían, y en
+    cambio sí abrían por la API rutas que no pasaban por la lista (las de Graniot
+    «en nombre de otro usuario»).
+
+    Además de estar en la lista hace falta una fila activa de `admin_users`: dar
+    de baja la cuenta la saca del panel sin tocar la variable de entorno.
+    """
+    if not user_id or not active_admin_row(db, str(user_id)):
+        return False
+    return panel_email_allowed(user_record(db, user_id))
+
+
 def parcel_manager_permission(db: Dict[str, Any], user_id: Optional[str]) -> Dict[str, Any]:
     """Alcance con el que un usuario puede administrar lotes ajenos.
 
-    - `superadmin`: todos los usuarios de la plataforma.
-    - `company_admin`: los usuarios de su empresa (o todos si se le marcó el
-      permiso global).
-    - cualquier otra fila de admin con `can_manage_parcels`: comerciales a los
-      que el administrador dio el permiso.
+    Solo las cuentas del panel (`is_panel_operator`), y siempre sobre todos los
+    usuarios de la plataforma. Nadie más administra lotes ajenos, tenga el rol
+    que tenga: el cliente ya no carga sus lotes, lo hace el equipo de Dataris.
     """
     result: Dict[str, Any] = {
         "allowed": False,
@@ -1175,17 +1198,13 @@ def parcel_manager_permission(db: Dict[str, Any], user_id: Optional[str]) -> Dic
     if not admin:
         return result
 
-    role = admin.get("admin_role")
-    company_id = admin.get("company_id")
-    global_scope = bool(admin.get(PARCEL_MANAGER_ALL_FIELD))
-    result.update({"admin_role": role, "company_id": company_id, "admin_user_id": admin.get("id")})
-
-    if role == "superadmin":
+    result.update({
+        "admin_role": admin.get("admin_role"),
+        "company_id": admin.get("company_id"),
+        "admin_user_id": admin.get("id"),
+    })
+    if is_panel_operator(db, user_id):
         result.update({"allowed": True, "scope": "all"})
-        return result
-    if role == "company_admin" or admin.get(PARCEL_MANAGER_FIELD):
-        result.update({"allowed": True, "scope": "all" if global_scope else "company"})
-        return result
     return result
 
 
@@ -1196,16 +1215,11 @@ def can_manage_parcels(db: Dict[str, Any], user_id: Optional[str]) -> bool:
 def can_onboard_clients(db: Dict[str, Any], user_id: Optional[str]) -> bool:
     """¿Puede este usuario dar de alta clientes nuevos (empresa + su admin)?
 
-    Lo pueden hacer los superadministradores y los comerciales a los que se les
-    marcó `can_onboard_clients`. Nunca convierte a nadie en superadmin: sólo crea
-    administradores de la empresa recién creada.
+    Lo puede hacer cualquier cuenta del panel (`is_panel_operator`). Nunca
+    convierte a nadie en superadmin: sólo crea administradores de la empresa
+    recién creada.
     """
-    if not user_id:
-        return False
-    admin = active_admin_row(db, str(user_id))
-    if not admin:
-        return False
-    return admin.get("admin_role") == "superadmin" or bool(admin.get(CLIENT_ONBOARDER_FIELD))
+    return is_panel_operator(db, user_id)
 
 
 def parcel_manager_covers_user(
@@ -1794,9 +1808,12 @@ def create_manual_admin_user(
         is_active = bool(payload.get("is_active", True))
         first_name = str(payload.get("first_name") or "").strip() or None
         last_name = str(payload.get("last_name") or "").strip() or None
-        selected_modules = payload.get("modules") or []
-        if not isinstance(selected_modules, list):
-            selected_modules = []
+        # Sin lista de módulos, la persona hereda el paquete completo de su
+        # empresa. Antes una petición sin `modules` se leía como «ninguno» y
+        # dejaba un bloqueo explícito por cada módulo del paquete: el usuario
+        # nacía sin nada y encender el módulo en la empresa no le llegaba.
+        modules_given = isinstance(payload.get("modules"), list)
+        selected_modules = payload.get("modules") if modules_given else []
 
         company = next((c for c in table(db, "companies") if c.get("id") == company_id), None) if company_id else None
         if company_id and not company:
@@ -1894,7 +1911,8 @@ def create_manual_admin_user(
         # Solo se guarda lo que difiere del paquete de la empresa: conceder por
         # usuario lo que ya hereda lo dejaría anclado a la foto de hoy, y quitar
         # algo exige la negativa explícita para que el cálculo no lo herede.
-        for module_id in sorted(chosen | inherited):
+        # Sin lista de módulos no hay nada que difiera: hereda todo.
+        for module_id in sorted(chosen | inherited) if modules_given else []:
             if module_id not in valid_modules:
                 continue
             enabled = module_id in chosen
@@ -2060,20 +2078,11 @@ def admin_panel_access(authorization: Optional[str] = Header(default=None)):
 
     Es la fuente de verdad que consulta el frontend en /admin/login y en el
     layout del panel: exige estar en la lista blanca del panel Y conservar una
-    fila activa de `admin_users` con algún privilegio (rol de administrador,
-    gestión de lotes u onboarding de clientes). No revela nada más.
+    fila activa de `admin_users` (ver `is_panel_operator`). No revela nada más.
     """
     db = read_db()
     user = bearer_user(authorization)
-    allowed = False
-    if user and panel_email_allowed(user):
-        admin = active_admin_row(db, str(user.get("id") or ""))
-        role = (admin or {}).get("admin_role")
-        allowed = bool(admin) and (
-            role in {"superadmin", "company_admin"}
-            or bool((admin or {}).get(PARCEL_MANAGER_FIELD))
-            or bool((admin or {}).get(CLIENT_ONBOARDER_FIELD))
-        )
+    allowed = bool(user) and is_panel_operator(db, str((user or {}).get("id") or ""))
     return {"data": {"allowed": allowed}, "error": None}
 
 
@@ -2090,7 +2099,7 @@ def client_onboarding_context(authorization: Optional[str] = Header(default=None
     admin = active_admin_row(db, str(user.get("id") or ""))
     return {
         "data": {
-            "allowed": panel_email_allowed(user) and can_onboard_clients(db, str(user.get("id") or "")),
+            "allowed": can_onboard_clients(db, str(user.get("id") or "")),
             "is_superadmin": bool(admin and admin.get("admin_role") == "superadmin"),
         },
         "error": None,
