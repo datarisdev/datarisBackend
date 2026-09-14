@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import mimetypes
 import re
 import os
@@ -1676,9 +1677,191 @@ def change_own_password(payload: Dict[str, Any] = Body(default_factory=dict), au
     return {"data": {"user": public_user(db_user), "session": session_for(db_user)}, "error": None}
 
 
+email_logger = logging.getLogger("app.email")
+
+# --- Recuperación de contraseña ------------------------------------------------
+#
+# «Olvidé mi contraseña» respondía «ok» sin hacer nada: nunca salió ningún
+# correo. Ahora se envía un enlace de un solo uso que caduca a los 30 minutos.
+# Del token solo se guarda su hash, y fuera de `tables`, para que el API genérico
+# de tablas no pueda leerlo.
+PASSWORD_RESET_TTL_MINUTES = 30
+PASSWORD_RESETS_KEY = "password_resets"
+# Rutas del frontend a las que puede llevar el enlace. El dominio es siempre
+# FRONTEND_URL: el `redirectTo` que manda el navegador solo elige la ruta, así el
+# correo nunca puede apuntar fuera de Dataris.
+PASSWORD_RESET_PATHS = {"/reset-password", "/admin/reset-password"}
+PASSWORD_RESET_GENERIC_MESSAGE = "Si la cuenta existe, enviamos un enlace para restablecer la contraseña."
+
+
+def frontend_base_url() -> str:
+    return os.getenv("FRONTEND_URL", "https://app.dataris.es").rstrip("/")
+
+
+def send_email(to: str, subject: str, text: str) -> Dict[str, Any]:
+    """Envía un correo transaccional. Nunca lanza: devuelve `{"sent", "reason"}`.
+
+    Prefiere Resend por su API HTTP (`RESEND_API_KEY` + `EMAIL_FROM`) y, si no
+    está configurado, usa el SMTP de siempre (`SMTP_HOST`…). Resend también
+    admite SMTP (smtp.resend.com, usuario "resend", contraseña = la clave), así
+    que sirve cualquiera de las dos configuraciones.
+    """
+    sender_name = os.getenv("SMTP_FROM_NAME", "Dataris").strip()
+    resend_key = os.getenv("RESEND_API_KEY", "").strip()
+
+    if resend_key:
+        sender = (os.getenv("EMAIL_FROM") or os.getenv("SMTP_FROM_EMAIL") or "").strip()
+        if not sender:
+            return {"sent": False, "reason": "EMAIL_FROM no configurado"}
+        from_header = sender if "<" in sender or not sender_name else f"{sender_name} <{sender}>"
+        try:
+            response = httpx.post(
+                "https://api.resend.com/emails",
+                json={"from": from_header, "to": [to], "subject": subject, "text": text},
+                headers={"Authorization": f"Bearer {resend_key}"},
+                timeout=12,
+            )
+        except Exception as exc:
+            email_logger.warning("[email] Resend no respondió: %s", exc)
+            return {"sent": False, "reason": str(exc)}
+        if response.status_code >= 300:
+            email_logger.warning("[email] Resend rechazó el envío (%s): %s", response.status_code, response.text[:300])
+            return {"sent": False, "reason": f"Resend {response.status_code}: {response.text[:300]}"}
+        return {"sent": True, "reason": None}
+
+    host = os.getenv("SMTP_HOST", "").strip()
+    port = int(os.getenv("SMTP_PORT", "587") or "587")
+    username = os.getenv("SMTP_USERNAME", "").strip()
+    smtp_password = os.getenv("SMTP_PASSWORD", "").strip()
+    sender = os.getenv("SMTP_FROM_EMAIL", username or "").strip()
+    use_tls = os.getenv("SMTP_USE_TLS", "true").strip().lower() not in {"0", "false", "no"}
+    if not host or not sender:
+        return {"sent": False, "reason": "SMTP no configurado"}
+
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = f"{sender_name} <{sender}>" if sender_name else sender
+    message["To"] = to
+    message.set_content(text)
+    try:
+        with smtplib.SMTP(host, port, timeout=12) as smtp:
+            if use_tls:
+                smtp.starttls()
+            if username and smtp_password:
+                smtp.login(username, smtp_password)
+            smtp.send_message(message)
+        return {"sent": True, "reason": None}
+    except Exception as exc:
+        email_logger.warning("[email] SMTP falló: %s", exc)
+        return {"sent": False, "reason": str(exc)}
+
+
+def password_reset_token_hash(token: str) -> str:
+    return hashlib.sha256(f"{settings.JWT_SECRET_KEY}:password-reset:{token}".encode("utf-8")).hexdigest()
+
+
+def password_reset_expired(entry: Dict[str, Any], moment: datetime) -> bool:
+    try:
+        return datetime.fromisoformat(str(entry.get("expires_at"))) <= moment
+    except (TypeError, ValueError):
+        return True
+
+
 @router.post("/auth/reset-password")
 def reset_password(payload: Dict[str, Any] = Body(default_factory=dict)):
-    return {"data": {"ok": True, "message": "Password reset accepted by compatibility backend."}, "error": None}
+    """Envía el enlace para elegir una contraseña nueva.
+
+    Responde siempre lo mismo, exista o no la cuenta: si no, serviría para
+    averiguar qué correos están dados de alta.
+    """
+    email = str(nested_value(payload, "email") or "").strip().lower()
+    options = payload.get("options") if isinstance(payload.get("options"), dict) else {}
+    path = urlparse(str(options.get("redirectTo") or options.get("redirect_to") or "")).path or "/reset-password"
+    if path not in PASSWORD_RESET_PATHS:
+        path = "/reset-password"
+
+    token: Optional[str] = None
+    target: Optional[Dict[str, Any]] = None
+    if email:
+        with LOCK:
+            db = read_db()
+            user = next((u for u in db["users"] if str(u.get("email") or "").lower() == email), None)
+            # La cuenta demo comercial se re-siembra en cada acceso: no tiene
+            # contraseña propia que recuperar.
+            if user and user.get("is_active", True) is not False and not is_commercial_demo_user(user):
+                token = secrets.token_urlsafe(32)
+                moment = datetime.now(timezone.utc)
+                # Un enlace nuevo invalida los anteriores de la misma cuenta.
+                pending = [
+                    entry for entry in db.get(PASSWORD_RESETS_KEY, [])
+                    if entry.get("user_id") != user["id"] and not password_reset_expired(entry, moment)
+                ]
+                pending.append({
+                    "user_id": user["id"],
+                    "token_hash": password_reset_token_hash(token),
+                    "created_at": moment.isoformat(),
+                    "expires_at": (moment + timedelta(minutes=PASSWORD_RESET_TTL_MINUTES)).isoformat(),
+                })
+                db[PASSWORD_RESETS_KEY] = pending
+                write_db(db)
+                target = user
+
+    if token and target:
+        first_name = str((target.get("user_metadata") or {}).get("first_name") or "").strip()
+        link = f"{frontend_base_url()}{path}?type=recovery&token={token}"
+        result = send_email(
+            target["email"],
+            "Restablece tu contraseña de Dataris",
+            f"Hola{' ' + first_name if first_name else ''},\n\n"
+            "Recibimos una solicitud para restablecer la contraseña de tu cuenta de Dataris.\n\n"
+            f"Elige una contraseña nueva aquí:\n{link}\n\n"
+            f"El enlace caduca en {PASSWORD_RESET_TTL_MINUTES} minutos y solo se puede usar una vez. "
+            "Si no lo pediste tú, ignora este correo: tu contraseña no cambia.\n\n"
+            "Equipo Dataris",
+        )
+        if not result.get("sent"):
+            email_logger.warning("[email] No salió el enlace de recuperación: %s", result.get("reason"))
+
+    return {"data": {"ok": True, "message": PASSWORD_RESET_GENERIC_MESSAGE}, "error": None}
+
+
+@router.post("/auth/recover")
+def recover_password(payload: Dict[str, Any] = Body(default_factory=dict)):
+    """Fija la contraseña nueva con el token del enlace de recuperación.
+
+    No abre sesión: la persona entra después con su contraseña nueva.
+    """
+    token = str(payload.get("token") or "").strip()
+    new_password = str(payload.get("password") or "")
+    if len(new_password) < MIN_PASSWORD_LENGTH:
+        raise HTTPException(status_code=400, detail=f"La contraseña debe tener al menos {MIN_PASSWORD_LENGTH} caracteres")
+    invalid = HTTPException(status_code=400, detail="El enlace no es válido o ya caducó. Pide uno nuevo.")
+    if not token:
+        raise invalid
+
+    with LOCK:
+        db = read_db()
+        moment = datetime.now(timezone.utc)
+        hashed = password_reset_token_hash(token)
+        pending = db.get(PASSWORD_RESETS_KEY, [])
+        entry = next(
+            (item for item in pending if secrets.compare_digest(str(item.get("token_hash") or ""), hashed)),
+            None,
+        )
+        if not entry or password_reset_expired(entry, moment):
+            raise invalid
+        user = next((u for u in db["users"] if u.get("id") == entry.get("user_id")), None)
+        if not user or user.get("is_active", True) is False:
+            raise invalid
+
+        user["password_hash"] = password_hash(new_password)
+        # Elegir contraseña propia cierra también la exigencia de cambiar la temporal.
+        set_must_change_password(user, False)
+        user["updated_at"] = now()
+        # Un solo uso: se retiran todos los enlaces pendientes de esa cuenta.
+        db[PASSWORD_RESETS_KEY] = [item for item in pending if item.get("user_id") != user["id"]]
+        write_db(db)
+    return {"data": {"ok": True}, "error": None}
 
 
 @router.delete("/auth/admin/users/{user_id}")
@@ -1731,43 +1914,18 @@ def generate_temporary_password(length: int = 12) -> str:
 
 
 def send_temporary_password_email(email: str, password: str, first_name: Optional[str] = None) -> Dict[str, Any]:
-    host = os.getenv("SMTP_HOST", "").strip()
-    port = int(os.getenv("SMTP_PORT", "587") or "587")
-    username = os.getenv("SMTP_USERNAME", "").strip()
-    smtp_password = os.getenv("SMTP_PASSWORD", "").strip()
-    sender = os.getenv("SMTP_FROM_EMAIL", username or "").strip()
-    sender_name = os.getenv("SMTP_FROM_NAME", "Dataris").strip()
-    use_tls = os.getenv("SMTP_USE_TLS", "true").strip().lower() not in {"0", "false", "no"}
-    frontend_url = os.getenv("FRONTEND_URL", "https://app.dataris.es").rstrip("/")
-
-    if not host or not sender:
-        return {"sent": False, "reason": "SMTP no configurado"}
-
     display_name = first_name or "usuario"
-    message = EmailMessage()
-    message["Subject"] = "Acceso temporal a Dataris"
-    message["From"] = f"{sender_name} <{sender}>" if sender_name else sender
-    message["To"] = email
-    message.set_content(
+    return send_email(
+        email,
+        "Acceso temporal a Dataris",
         f"Hola {display_name},\n\n"
         "Se creó tu acceso a Dataris.\n\n"
         f"Correo: {email}\n"
         f"Contraseña temporal: {password}\n\n"
-        f"Ingresa en: {frontend_url}/login\n\n"
+        f"Ingresa en: {frontend_base_url()}/login\n\n"
         "Por seguridad, cambia tu contraseña al ingresar por primera vez.\n\n"
-        "Equipo Dataris"
+        "Equipo Dataris",
     )
-
-    try:
-        with smtplib.SMTP(host, port, timeout=12) as smtp:
-            if use_tls:
-                smtp.starttls()
-            if username and smtp_password:
-                smtp.login(username, smtp_password)
-            smtp.send_message(message)
-        return {"sent": True, "reason": None}
-    except Exception as exc:
-        return {"sent": False, "reason": str(exc)}
 
 
 @router.post("/admin/users/manual")
