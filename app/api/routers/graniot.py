@@ -75,6 +75,9 @@ GRANIOT_CATALOG_CACHE_TTL_SECONDS = int(os.getenv("GRANIOT_CATALOG_CACHE_TTL_SEC
 GRANIOT_DATE_CACHE_TTL_SECONDS = int(os.getenv("GRANIOT_DATE_CACHE_TTL_SECONDS", str(60 * 60 * 12)))
 GRANIOT_STATS_CACHE_TTL_SECONDS = int(os.getenv("GRANIOT_STATS_CACHE_TTL_SECONDS", str(60 * 30)))
 GRANIOT_MAP_LAYER_CACHE_TTL_SECONDS = int(os.getenv("GRANIOT_MAP_LAYER_CACHE_TTL_SECONDS", str(60 * 30)))
+# Variantes de petición WMS que prueba el proxy antes de renovar la clave. La
+# mínima basta (verificado en vivo); el resto es respaldo. Eran 32.
+GRANIOT_WMS_MAX_VARIANTS = int(os.getenv("GRANIOT_WMS_MAX_VARIANTS", "4"))
 GRANIOT_WMS_CACHE_TTL_SECONDS = int(os.getenv("GRANIOT_WMS_CACHE_TTL_SECONDS", str(60 * 60 * 24 * 7)))
 GRANIOT_WMS_CACHE_MAX_MB = int(os.getenv("GRANIOT_WMS_CACHE_MAX_MB", "256"))
 GRANIOT_WMS_PREFETCH_CONCURRENCY = int(os.getenv("GRANIOT_WMS_PREFETCH_CONCURRENCY", "3"))
@@ -635,7 +638,11 @@ def _feature_collection_from_geometry(geometry: Any, parcel_id: str, name: str, 
     polygon_features = []
     for feature in features:
         geom = feature.get("geometry") if isinstance(feature, dict) else None
-        if not geom or geom.get("type") not in {"Polygon", "MultiPolygon"}:
+        # Cualquier forma: una GeometryCollection se desmonta en sus polígonos
+        # y un polígono inválido (borde que se cruza) se repara antes de
+        # enviarlo, que Graniot lo rechazaría sin explicar por qué.
+        geom = _polygonal_geometry(geom)
+        if not geom:
             continue
         props = dict(feature.get("properties") or {})
         props.setdefault("name", name)
@@ -648,6 +655,37 @@ def _feature_collection_from_geometry(geometry: Any, parcel_id: str, name: str, 
         raise HTTPException(status_code=400, detail="El archivo no contiene polígonos válidos para Graniot")
 
     return {"type": "FeatureCollection", "features": polygon_features}
+
+
+def _polygonal_geometry(geom: Any) -> Optional[Dict[str, Any]]:
+    """Polygon o MultiPolygon válido a partir de cualquier geometría GeoJSON.
+
+    Desmonta GeometryCollection, descarta lo que no sea superficie (puntos,
+    líneas) y repara polígonos inválidos con ``buffer(0)``. Devuelve None si
+    no queda ninguna superficie con área.
+    """
+    if not isinstance(geom, dict) or not geom.get("type"):
+        return None
+    try:
+        shp = shapely_shape(geom)
+    except Exception:
+        return None
+    parts = list(getattr(shp, "geoms", [shp])) if shp.geom_type == "GeometryCollection" else [shp]
+    surfaces = []
+    for part in parts:
+        if part.is_empty or part.geom_type not in {"Polygon", "MultiPolygon"}:
+            continue
+        if not part.is_valid:
+            part = part.buffer(0)
+        if part.is_empty or part.area <= 0:
+            continue
+        surfaces.append(part)
+    if not surfaces:
+        return None
+    merged = surfaces[0] if len(surfaces) == 1 else unary_union(surfaces)
+    if merged.is_empty or merged.geom_type not in {"Polygon", "MultiPolygon"}:
+        return None
+    return mapping(merged)
 
 
 def _main_geometry(feature_collection: Dict[str, Any]) -> Dict[str, Any]:
@@ -1259,6 +1297,18 @@ def _bounds_from_wms_template(template: Any) -> Optional[Dict[str, float]]:
         return None
 
 
+_PARCEL_GONE_TTL_SECONDS = 120
+
+
+def _parcel_gone_cache_key(graniot_parcel_id: Any) -> str:
+    return f"graniot-parcel-gone:{_normalized_token(graniot_parcel_id)}"
+
+
+def _parcel_is_gone(graniot_parcel_id: Any) -> bool:
+    """¿Graniot respondió hace poco que esta parcela ya no existe?"""
+    return bool(_normalized_token(graniot_parcel_id)) and _cache_get(_parcel_gone_cache_key(graniot_parcel_id)) is True
+
+
 async def _recover_wms_data_from_graniot(
     client: GraniotClient,
     *,
@@ -1270,14 +1320,57 @@ async def _recover_wms_data_from_graniot(
     This fixes local rows synchronized with earlier versions where Dataris saved
     only the access_key but not properties.image_url. Without Geometry, Graniot's
     WMS often returns JSON/404/500 instead of a raster.
+
+    Con id conocido se pide SOLO esa parcela: una llamada pequeña (~300 ms) que
+    devuelve la clave firmada vigente y sus fechas. Si Graniot responde 404, la
+    parcela ya no existe en esa cuenta: se anota (``_parcel_is_gone``) y no se
+    recorre la cuenta entera, que con 500 parcelas son 8 s para no encontrarla.
+    El listado queda solo para las filas sin id.
     """
-    lookups: List[tuple[str, Optional[Dict[str, Any]]]] = []
     if graniot_parcel_id:
-        lookups.append((f"/api/parcels/{graniot_parcel_id}/", None))
-    lookups.extend([
+        detail_path = f"/api/parcels/{graniot_parcel_id}/"
+        try:
+            payload = await client.get(
+                detail_path,
+                debug_context={
+                    "operation": "recover-wms-data",
+                    "access_key": access_key,
+                    "graniot_parcel_id": graniot_parcel_id,
+                },
+            )
+            recovered = _wms_data_from_payload(payload, access_key=access_key, parcel_id=graniot_parcel_id)
+            if recovered and (recovered.get("graniot_wms_url") or recovered.get("graniot_access_key")):
+                _RUNTIME_CACHE.pop(_parcel_gone_cache_key(graniot_parcel_id), None)
+                return recovered
+        except GraniotAPIError as exc:
+            log_event({
+                "event": "dataris.graniot.recover_wms_data.failed_lookup",
+                "operation": "recover-wms-data",
+                "path": detail_path,
+                "access_key": access_key,
+                "graniot_parcel_id": graniot_parcel_id,
+                "exception_type": type(exc).__name__,
+                "status_code": exc.status_code,
+                "message": str(exc),
+            })
+            if exc.status_code == 404:
+                _cache_set(_parcel_gone_cache_key(graniot_parcel_id), True, _PARCEL_GONE_TTL_SECONDS)
+                return None
+        except Exception as exc:
+            log_event({
+                "event": "dataris.graniot.recover_wms_data.failed_lookup",
+                "operation": "recover-wms-data",
+                "path": detail_path,
+                "access_key": access_key,
+                "graniot_parcel_id": graniot_parcel_id,
+                "exception_type": type(exc).__name__,
+                "message": str(exc),
+            })
+
+    lookups: List[tuple[str, Optional[Dict[str, Any]]]] = [
         ("/api/parcels/", None),
         ("/api/farms/", None),
-    ])
+    ]
 
     for path, params in lookups:
         try:
@@ -1489,6 +1582,180 @@ def _store_recovered_wms_data_in_background(local: Optional[Dict[str, Any]], dat
     thread.start()
 
 
+def _run_in_background_thread(name: str, target: Any, *args: Any) -> None:
+    """Ejecuta una escritura en la base sin retrasar la respuesta.
+
+    ``write_db`` reescribe el JSON completo de la plataforma en Neon (varios
+    segundos medidos en producción). Guardar la instantánea de Graniot y el
+    registro del análisis en el camino de ``map-layer`` era buena parte de los
+    12 s que tardaba la capa. Los hilos se registran en ``_WMS_STORE_THREADS``
+    para que las pruebas puedan esperarlos; los errores se registran y no
+    escapan.
+    """
+
+    def _runner() -> None:
+        try:
+            target(*args)
+        except Exception as exc:  # noqa: BLE001 — nunca debe tumbar el hilo sin rastro
+            log_event({
+                "event": "dataris.graniot.background_write_failed",
+                "operation": name,
+                "exception_type": type(exc).__name__,
+                "message": str(exc),
+            })
+
+    _WMS_STORE_THREADS[:] = [t for t in _WMS_STORE_THREADS if t.is_alive()]
+    thread = threading.Thread(target=_runner, name=name, daemon=False)
+    _WMS_STORE_THREADS.append(thread)
+    thread.start()
+
+
+def _owner_user_for_local(local: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Usuario de Dataris dueño del lote (lee la base: llamar fuera del event loop)."""
+    if not isinstance(local, dict) or not local.get("user_id"):
+        return None
+    db = read_db()
+    return next((u for u in db.get("users", []) if str(u.get("id") or "") == str(local.get("user_id"))), None)
+
+
+async def _client_for_local_row(local: Optional[Dict[str, Any]], *, user: Optional[Dict[str, Any]] = None) -> GraniotClient:
+    """Cliente de Graniot con la cuenta dueña de las parcelas del lote.
+
+    Los lotes sincronizados «en nombre del usuario» viven en su cuenta embebida
+    de Graniot, y la clave de servicio no los ve: pedir la parcela por id daba
+    «No Parcel matches the given query» aunque existiera, la clave caducada no
+    se renovaba nunca y el proxy acababa en 409 pidiendo «resincronizar desde el
+    panel». La fila guarda la cuenta y el modo con los que se creó; se
+    reconstruye ese mismo cliente. Las filas de servicio (o anteriores a que
+    existiera el modo) siguen con la clave de servicio.
+    """
+    if not isinstance(local, dict):
+        return GraniotClient()
+    mode = str(local.get("graniot_sync_mode") or "").strip().lower()
+    if mode in ("", SYNC_MODE_SERVICE):
+        return GraniotClient()
+    owner = user if isinstance(user, dict) and user.get("email") else await run_in_threadpool(_owner_user_for_local, local)
+    if not owner:
+        return GraniotClient()
+    try:
+        target = await _sync_target_for_row(owner, local, operation="graniot-client-for-lot")
+    except Exception as exc:  # noqa: BLE001 — sin cuenta resuelta, la de servicio es mejor que nada
+        log_event({
+            "event": "dataris.graniot.client_for_lot.failed",
+            "local_parcel_id": local.get("id"),
+            "exception_type": type(exc).__name__,
+            "message": str(exc),
+        })
+        return GraniotClient()
+    return _client_for_target(target)
+
+
+_WMS_RESYNC_COOLDOWN_SECONDS = int(os.getenv("GRANIOT_WMS_RESYNC_COOLDOWN_SECONDS", "600"))
+
+
+async def _resync_local_parcel_as_owner(local: Optional[Dict[str, Any]], *, source: str) -> Optional[Dict[str, Any]]:
+    """Vuelve a crear en Graniot la parcela de un lote que la perdió.
+
+    El proxy no lleva sesión (la imagen la carga el navegador sin cabeceras),
+    pero el lote sí tiene dueño: se sincroniza como él, igual que hace
+    ``map-layer`` con su token. Antes se respondía 409 «vuelve a sincronizar el
+    lote desde el panel», cosa que un cliente no puede hacer. Una vez por lote
+    cada 10 minutos, para que una parcela que Graniot borre en bucle no se
+    recree sin parar. Devuelve la fila local ya actualizada, o None.
+    """
+    if not isinstance(local, dict) or not local.get("id"):
+        return None
+    if not settings.GRANIOT_PARCEL_AUTOSYNC_ENABLED:
+        return None
+    cooldown_key = f"wms-resync:{local['id']}"
+    if _cache_get(cooldown_key):
+        return None
+    _cache_set(cooldown_key, True, _WMS_RESYNC_COOLDOWN_SECONDS)
+    owner = await run_in_threadpool(_owner_user_for_local, local)
+    if not owner:
+        return None
+    try:
+        result = await sync_local_parcel_to_graniot(
+            owner,
+            str(local["id"]),
+            {"metadata": {"auto_sync_source": source}},
+        )
+    except Exception as exc:  # noqa: BLE001 — el llamador decide qué responder
+        log_event({
+            "event": "dataris.graniot.resync_as_owner.failed",
+            "operation": source,
+            "local_parcel_id": local.get("id"),
+            "exception_type": type(exc).__name__,
+            "message": str(getattr(exc, "detail", None) or exc),
+        })
+        return None
+    log_event({
+        "event": "dataris.graniot.resync_as_owner.success",
+        "operation": source,
+        "local_parcel_id": local.get("id"),
+        "graniot_parcel_id": (result.get("parcel") or {}).get("graniot_parcel_id") if isinstance(result, dict) else None,
+    })
+    return result.get("parcel") if isinstance(result, dict) else None
+
+
+def _source_signed_key(source: Dict[str, Any]) -> Optional[str]:
+    return (
+        source.get("graniot_wms_access_key")
+        or _signed_wms_access_key(source.get("graniot_wms_url"))
+        or _signed_wms_access_key(source.get("graniot_image_url"))
+        or source.get("graniot_access_key")
+    )
+
+
+async def _refresh_sources_from_graniot(
+    client: GraniotClient,
+    sources: List[Dict[str, Any]],
+    *,
+    force: bool = False,
+) -> tuple[List[Dict[str, Any]], bool]:
+    """Contrasta cada fuente guardada con Graniot por su id, todas a la vez.
+
+    Devuelve las fuentes con la clave firmada vigente y sus fechas, y si TODAS
+    las parcelas con id respondieron 404 (el lote perdió su parcela en Graniot).
+    Antes ``map-layer`` se fiaba de la instantánea del sync —cuya clave caduca—
+    y entregaba al navegador una imagen que el proxy no podía servir. Una fuente
+    sin id se conserva tal cual; una llamada fallida por red conserva la
+    instantánea: peor una clave vieja que ninguna imagen.
+    """
+    if not sources:
+        return [], False
+
+    async def _refresh_one(source: Dict[str, Any]) -> tuple[Optional[Dict[str, Any]], bool]:
+        graniot_id = source.get("graniot_parcel_id")
+        if graniot_id in (None, ""):
+            return source, False
+        data = await _recover_wms_data_shared(
+            client,
+            access_key=_source_signed_key(source),
+            graniot_parcel_id=str(graniot_id),
+            force=force,
+        )
+        if data:
+            merged = dict(source)
+            merged.update({k: v for k, v in data.items() if v not in (None, "")})
+            raw = data.get("raw") if isinstance(data.get("raw"), dict) else {}
+            props = raw.get("properties") if isinstance(raw.get("properties"), dict) else {}
+            resolutions = props.get("parcelresolution_set") or raw.get("parcelresolution_set")
+            if resolutions:
+                merged["parcelresolution_set"] = resolutions
+            return merged, False
+        if _parcel_is_gone(graniot_id):
+            return None, True
+        return source, False
+
+    results = await asyncio.gather(*(_refresh_one(source) for source in sources))
+    refreshed = [item for item, _gone in results if item is not None]
+    checked = sum(1 for source in sources if source.get("graniot_parcel_id") not in (None, ""))
+    gone = sum(1 for _item, is_gone in results if is_gone)
+    all_gone = checked > 0 and gone == checked
+    return ([] if all_gone else refreshed), all_gone
+
+
 def _layer_identifier_candidates(layer: str) -> List[str]:
     """Return a small, safe set of Graniot WMS layer identifiers.
 
@@ -1667,6 +1934,12 @@ def _build_wms_param_variants(
     remain as fallbacks for older Graniot deployments, but they no longer win
     before the official endpoint because a stale template BBOX can return an
     incomplete or shifted raster.
+
+    Verificado en vivo (19 ago 2026): la petición mínima —``access_key`` +
+    ``layers`` + ``response_format`` + ``time`` (+ tamaño)— devuelve exactamente
+    la misma imagen que la plantilla completa, porque el polígono viaja dentro
+    de la clave firmada. Por eso va PRIMERO: cuando la clave es válida, la
+    imagen sale en una sola petición.
     """
     layer_value = str(layer or "").strip()
     template_access_key = template_params.get("access_key") or template_params.get("ACCESS_KEY")
@@ -1682,6 +1955,19 @@ def _build_wms_param_variants(
 
     geometry = template_params.get("Geometry") or template_params.get("geometry")
     bbox_from_template = template_params.get("BBOX") or template_params.get("bbox")
+
+    # 0) Official Graniot request with explicit image size: la forma mínima
+    # que basta. Va la primera para que el caso normal sea una sola petición.
+    official_sized = {
+        "access_key": access_key_value,
+        "layers": layer_value,
+        "response_format": "image/png",
+        "width": width,
+        "height": height,
+    }
+    if time:
+        official_sized["time"] = time
+    variants.append(official_sized)
 
     # 1) Exact Graniot image_url template. This is the most accurate request for
     # fitting the raster to the parcel because Graniot provides Geometry, BBOX,
@@ -1722,22 +2008,10 @@ def _build_wms_param_variants(
 
     # 3) Documented request plus BBOX. Some deployments accept it and it keeps
     # the raster coordinate system aligned with the overlay bounds.
-    official_sized = {
-        "access_key": access_key_value,
-        "layers": layer_value,
-        "response_format": "image/png",
-        "width": width,
-        "height": height,
-    }
-    if time:
-        official_sized["time"] = time
     if bbox_latlon:
         official_bbox = dict(official_sized)
         official_bbox["BBOX"] = bbox_latlon
         variants.append(official_bbox)
-
-    # 4) Official Graniot request with explicit image size.
-    variants.append(official_sized)
 
     # 5) Official minimal request for deployments that choose size server-side.
     official_minimal = {
@@ -6132,7 +6406,8 @@ def _persist_graniot_sources(local_parcel_id: str, user_id: str, raw: Any, sourc
             "graniot_wms_url": first.get("graniot_wms_url") or row.get("graniot_wms_url"),
             "graniot_image_url": first.get("graniot_image_url") or row.get("graniot_image_url"),
             "graniot_parcels": public_sources,
-            "graniot_raw": raw,
+            # Sin listado nuevo (refresco por id) se conserva el volcado anterior.
+            **({"graniot_raw": raw} if raw is not None else {}),
             "graniot_synced_at": now(),
             "graniot_sync_error": None,
             "updated_at": now(),
@@ -6406,6 +6681,7 @@ async def get_local_parcel_ndvi_map_layer(
     maxcc: float = Query(default=100),
     include_statistics: bool = Query(default=True),
     auto_sync: bool = Query(default=True),
+    force_refresh: bool = Query(default=False),
     authorization: Optional[str] = Header(default=None),
 ):
     user = _require_user(authorization)
@@ -6431,7 +6707,9 @@ async def get_local_parcel_ndvi_map_layer(
         include_statistics = bool(payload.get("include_statistics", payload.get("includeStatistics")))
     if "auto_sync" in payload or "autoSync" in payload:
         auto_sync = bool(payload.get("auto_sync", payload.get("autoSync")))
-    force_refresh = bool(payload.get("force_refresh") or payload.get("forceRefresh"))
+    # El frontend lo manda por query (GET): antes solo se leía del cuerpo y el
+    # «reintentar» del navegador no saltaba la caché del servidor.
+    force_refresh = bool(force_refresh or payload.get("force_refresh") or payload.get("forceRefresh"))
 
     with LOCK:
         db = read_db()
@@ -6442,7 +6720,9 @@ async def get_local_parcel_ndvi_map_layer(
         local = dict(local)
         local["geometry"] = payload.get("geometry")
 
-    client = GraniotClient()
+    # Con la cuenta dueña de las parcelas: la clave de servicio no ve las de
+    # las cuentas embebidas y toda renovación fallaba con «No Parcel matches».
+    client = await _client_for_local_row(local, user=user)
     warnings: List[str] = []
 
     map_cache_key = _stable_hash({
@@ -6472,16 +6752,31 @@ async def get_local_parcel_ndvi_map_layer(
     # matching the local polygon against /api/parcels/ FeatureCollection.
     sources: List[Dict[str, Any]] = _drop_sources_far_from_lot(local, _sources_from_local_row(local), warnings)
 
-    # La instantánea guardada durante el sync queda obsoleta con el tiempo: el
-    # access_key firmado ROTA (Graniot responde "Invalid access key" con el
-    # viejo) y su parcelresolution_set puede decir last_image_date nulo aunque
-    # Graniot ya tenga escenas procesadas. Si las fuentes guardadas no reportan
-    # NINGUNA fecha de imagen, se refrescan desde /api/parcels/ igual que
-    # cuando no hay fuentes; si el refresco falla, se conserva la instantánea.
-    snapshot_stale = bool(sources) and _date_from_graniot_sources(sources, resolution_id) is None
+    # La instantánea del sync caduca: la clave firmada rota y Graniot rechaza
+    # la vieja. Con id conocido se contrasta cada parcela en UNA llamada
+    # pequeña (clave vigente + fechas), todas a la vez. Antes se confiaba en la
+    # instantánea o, si no traía fecha, se descargaba la cuenta entera (8 s).
+    parcel_gone = False
+    if sources:
+        sources, parcel_gone = await _refresh_sources_from_graniot(client, sources, force=force_refresh)
+        if parcel_gone:
+            warnings.append("La parcela de este lote ya no existía en Graniot; se volvió a crear con la geometría del lote.")
+        elif sources:
+            # Persistir la clave renovada no puede retrasar la capa.
+            _run_in_background_thread(
+                "map-layer-persist-sources",
+                _persist_graniot_sources,
+                local_parcel_id,
+                user["id"],
+                None,
+                sources,
+                date or _date_from_graniot_sources(sources, resolution_id),
+            )
 
     raw_parcels = None
-    if not sources or snapshot_stale:
+    if not sources and not parcel_gone:
+        # Sin ningún id (fila antigua o nunca sincronizada): buscar por
+        # geometría en el listado de la cuenta.
         try:
             raw_parcels = await client.get("/api/parcels/")
             matches = _find_graniot_matches_for_local(local, raw_parcels)
@@ -6489,18 +6784,25 @@ async def get_local_parcel_ndvi_map_layer(
             fresh_sources = [source for source in fresh_sources if source.get("graniot_wms_url") or source.get("graniot_image_url")]
             if fresh_sources:
                 resolved_date = date or _date_from_graniot_sources(fresh_sources, resolution_id)
-                _persist_graniot_sources(local_parcel_id, user["id"], raw_parcels, fresh_sources, resolved_date)
+                _run_in_background_thread(
+                    "map-layer-persist-sources",
+                    _persist_graniot_sources,
+                    local_parcel_id,
+                    user["id"],
+                    raw_parcels,
+                    fresh_sources,
+                    resolved_date,
+                )
                 date = resolved_date
                 sources = fresh_sources
-            elif not sources:
+            else:
                 warnings.append("No se encontró un lote equivalente en Graniot para esta geometría local.")
         except Exception as exc:
-            if sources:
-                warnings.append(f"No se pudo refrescar el lote desde Graniot; se usa la última instantánea guardada: {exc}")
-            else:
-                warnings.append(f"No se pudo recuperar el lote desde Graniot: {exc}")
+            warnings.append(f"No se pudo recuperar el lote desde Graniot: {exc}")
 
     if not sources and auto_sync:
+        # Sin parcela (o con la parcela perdida) se crea ahora mismo: Graniot
+        # sirve el WMS de una parcela recién creada al instante.
         sources = await _attempt_auto_sync_for_map_layer(
             local_parcel_id=local_parcel_id,
             authorization=authorization,
@@ -6607,18 +6909,22 @@ async def get_local_parcel_ndvi_map_layer(
         warnings.append("Graniot devolvió el lote, pero no hay access_key o bounds válidos para construir la imagen WMS.")
 
     available_resolution_ids = sorted(_available_resolution_ids_with_images(sources))
-    _persist_satellite_analysis_record(
-        user_id=str(user["id"]),
-        local_parcel_id=local_parcel_id,
-        local=local,
-        resolved_date=resolved_date,
-        resolved_layer=resolved_layer,
-        overlays=overlays,
-        statistics=statistics,
-        warnings=warnings,
-        sources=sources,
-        render_sources=render_sources,
-        available_resolution_ids=available_resolution_ids,
+    # El registro del análisis reescribe la base entera: en segundo plano.
+    _run_in_background_thread(
+        "map-layer-persist-analysis",
+        lambda: _persist_satellite_analysis_record(
+            user_id=str(user["id"]),
+            local_parcel_id=local_parcel_id,
+            local=local,
+            resolved_date=resolved_date,
+            resolved_layer=resolved_layer,
+            overlays=overlays,
+            statistics=statistics,
+            warnings=list(warnings),
+            sources=sources,
+            render_sources=render_sources,
+            available_resolution_ids=available_resolution_ids,
+        ),
     )
 
     response_payload = {
@@ -7222,23 +7528,21 @@ async def _choose_clear_scene_date(
     if latest_content is not None and candidates:
         # La más nueva ya se descargó y estaba plana: no se sondea dos veces.
         candidates = candidates[1:]
+    candidates = candidates[:SCENE_PROBE_MAX_DATES]
 
-    chosen: Optional[str] = None
-    probed = 0
-    for scene_date in candidates:
-        if probed >= SCENE_PROBE_MAX_DATES:
-            break
-        probed += 1
-        content = await _probe_scene(
-            client,
-            wms_path=wms_path,
-            access_key=clean_key,
-            layer=clean_layer,
-            scene_date=scene_date,
+    # Los sondeos van todos a la vez (son imágenes de 256 px, ~250 ms cada
+    # una): en serie sumaban hasta 1,5 s a la primera carga de cada lote. Gana
+    # la más nueva que no esté plana.
+    contents = await asyncio.gather(
+        *(
+            _probe_scene(client, wms_path=wms_path, access_key=clean_key, layer=clean_layer, scene_date=scene_date)
+            for scene_date in candidates
         )
-        if content is None:
-            continue
-        if not _scene_looks_flat(content):
+    )
+    chosen: Optional[str] = None
+    probed = len(candidates)
+    for scene_date, content in zip(candidates, contents):
+        if content is not None and not _scene_looks_flat(content):
             chosen = scene_date
             break
 
@@ -7332,7 +7636,9 @@ async def _wms_proxy_impl(
     if not access_key:
         raise HTTPException(status_code=400, detail="access_key requerido")
 
-    client = GraniotClient()
+    # Con la cuenta dueña de la parcela, o la renovación de la clave no la
+    # encuentra (ver _client_for_local_row).
+    client = await _client_for_local_row(local)
 
     local_graniot_parcel_id = _graniot_parcel_id_for_wms_request(local, access_key)
     template = _wms_template_from_local(
@@ -7371,8 +7677,10 @@ async def _wms_proxy_impl(
         recovery_reasons.append("template_signed_key_mismatch")
     if _is_uuid_like(access_key):
         recovery_reasons.append("uuid_like_access_key")
-    if signed_template_access_key and not _is_uuid_like(access_key):
-        recovery_reasons.append("refresh_possible_expired_signed_key")
+    # Una clave firmada con forma válida se prueba directamente: map-layer ya
+    # la entrega renovada, y si aun así Graniot la rechaza, más abajo se pide
+    # una nueva y se reintenta. Renovarla «por si acaso» antes de cada imagen
+    # era una llamada a Graniot de más en el caso normal.
 
     needs_signed_recovery = bool(local) and bool(recovery_reasons) and (bool(access_key) or bool(local_graniot_parcel_id))
     if needs_signed_recovery:
@@ -7432,6 +7740,19 @@ async def _wms_proxy_impl(
         access_key = _choose_wms_access_key(signed_template_access_key, access_key)
     else:
         access_key = _choose_wms_access_key(access_key, signed_template_access_key)
+
+    # Sin ir a Graniot: si otra petición ya renovó la clave de esta parcela
+    # hace poco (memoria de 20 min), se usa esa en vez de gastar un intento
+    # con la que trae el navegador, que puede ser la caducada.
+    remembered = _cache_get(_wms_recovery_cache_key(local_graniot_parcel_id, access_key))
+    if isinstance(remembered, dict) and remembered:
+        remembered_key = str(
+            _signed_wms_access_key(remembered.get("graniot_wms_url"))
+            or _signed_access_key_value(remembered.get("graniot_wms_access_key"))
+            or ""
+        ).strip()
+        if remembered_key and not _is_uuid_like(remembered_key):
+            access_key = remembered_key
     wms_path = _wms_path_from_template(template)
 
     bbox_values = _bbox_values_from_bounds(south, west, north, east)
@@ -7482,7 +7803,9 @@ async def _wms_proxy_impl(
                 bbox_lonlat=bbox_lonlat,
             ))
 
-    variants = _dedupe_wms_variants(variants)[:32]
+    # La forma mínima va primera y basta (el polígono viaja en la clave); las
+    # demás son respaldo. Probar 32 con una clave muerta solo sumaba segundos.
+    variants = _dedupe_wms_variants(variants)[:GRANIOT_WMS_MAX_VARIANTS]
 
     if not variants:
         raise HTTPException(status_code=400, detail="No se pudo construir la solicitud WMS para Graniot")
@@ -7737,32 +8060,19 @@ async def _wms_proxy_impl(
         for item in status_errors
     )
     if all_invalid_key:
-        refreshed = await _recover_wms_data_shared(
-            client,
-            access_key=access_key,
-            graniot_parcel_id=local_graniot_parcel_id,
-            force=True,
-        )
-        fresh_key = ""
-        if refreshed:
-            fresh_key = str(
-                _signed_wms_access_key(refreshed.get("graniot_wms_url"))
-                or _signed_access_key_value(refreshed.get("graniot_wms_access_key"))
-                or _signed_access_key_value(refreshed.get("graniot_access_key"))
-                or ""
-            ).strip()
-            _store_recovered_wms_data_in_background(local, refreshed)
-
-        if fresh_key and _normalized_token(fresh_key) != _normalized_token(access_key):
+        async def _retry_with(fresh_key: str, *, attempt: str) -> Optional[Response]:
+            """Una petición mínima con la clave recién firmada; None si tampoco sirve."""
             retry_params = _clean_wms_params({
                 "access_key": fresh_key,
                 "layers": layer_candidates[0] if layer_candidates else clean_layer,
                 "response_format": "image/png",
                 "time": time,
+                "width": width,
+                "height": height,
             })
             _wms_cloud_log(
                 logging.WARNING,
-                "retry_with_fresh_key",
+                attempt,
                 parcel_id=parcel_id,
                 layer=clean_layer,
                 time=time,
@@ -7776,7 +8086,7 @@ async def _wms_proxy_impl(
                     use_auth=False,
                     include_client_id=False,
                     debug_context={
-                        "operation": "wms-proxy-retry-fresh-key",
+                        "operation": f"wms-proxy-{attempt}",
                         "local_parcel_id": parcel_id,
                         "layer": clean_layer,
                         "time": time,
@@ -7787,7 +8097,7 @@ async def _wms_proxy_impl(
                     _write_wms_disk_cache(stable_wms_cache_key, raw.content, media_type)
                     _wms_cloud_log(
                         logging.WARNING,
-                        "retry_with_fresh_key_success",
+                        f"{attempt}_success",
                         parcel_id=parcel_id,
                         layer=clean_layer,
                         time=time,
@@ -7798,27 +8108,66 @@ async def _wms_proxy_impl(
                         media_type=media_type,
                     ), "MISS")
                 errors.append({
-                    "variant_index": "retry_fresh_key",
+                    "variant_index": attempt,
                     "status_code": getattr(raw, "status_code", None),
                     "message": _response_preview_text(raw),
                 })
             except Exception as exc:
                 errors.append({
-                    "variant_index": "retry_fresh_key",
+                    "variant_index": attempt,
                     "message": str(exc),
                     "exception_type": type(exc).__name__,
                 })
                 _wms_cloud_exception(
-                    "retry_with_fresh_key_failed",
+                    f"{attempt}_failed",
                     exc,
                     parcel_id=parcel_id,
                     layer=clean_layer,
                     time=time,
                 )
+            return None
+
+        def _fresh_key_of(data: Optional[Dict[str, Any]]) -> str:
+            if not data:
+                return ""
+            return str(
+                _signed_wms_access_key(data.get("graniot_wms_url"))
+                or _signed_access_key_value(data.get("graniot_wms_access_key"))
+                or _signed_access_key_value(data.get("graniot_access_key"))
+                or ""
+            ).strip()
+
+        # Primero la renovación compartida (candado + memoria): trece imágenes
+        # de un lote dividido, todas con la clave caducada, le piden la parcela
+        # a Graniot UNA vez. Solo si lo que hay en memoria es la misma clave
+        # que Graniot acaba de rechazar se fuerza una consulta nueva.
+        refreshed = await _recover_wms_data_shared(
+            client,
+            access_key=access_key,
+            graniot_parcel_id=local_graniot_parcel_id,
+        )
+        fresh_key = _fresh_key_of(refreshed)
+        if not fresh_key or _normalized_token(fresh_key) == _normalized_token(access_key):
+            refreshed = await _recover_wms_data_shared(
+                client,
+                access_key=access_key,
+                graniot_parcel_id=local_graniot_parcel_id,
+                force=True,
+            )
+            fresh_key = _fresh_key_of(refreshed)
+        if refreshed:
+            _store_recovered_wms_data_in_background(local, refreshed)
+
+        if fresh_key and _normalized_token(fresh_key) != _normalized_token(access_key):
+            served = await _retry_with(fresh_key, attempt="retry_with_fresh_key")
+            if served is not None:
+                return served
         else:
             # Graniot no devuelve una clave nueva para esta parcela: el problema
-            # ya no es la caducidad, es que el lote perdió su parcela allí. Un
-            # 502 haría pensar en una avería; esto es un lote por resincronizar.
+            # ya no es la caducidad, es que el lote perdió su parcela allí. Se
+            # vuelve a crear como su dueño y se sirve la imagen de la parcela
+            # nueva; solo si eso tampoco puede, se responde 409 en vez de un
+            # 502 que haría pensar en una avería.
             log_event({
                 "event": "dataris.graniot.wms_proxy.parcel_gone",
                 "operation": "wms-proxy",
@@ -7829,11 +8178,19 @@ async def _wms_proxy_impl(
                 "found_local_row": bool(local),
                 "recovered": bool(refreshed),
             })
+            resynced = await _resync_local_parcel_as_owner(local, source="wms-proxy")
+            resynced_key = ""
+            if resynced:
+                resynced_sources = _sources_from_local_row(resynced)
+                resynced_key = str(_source_signed_key(resynced_sources[0]) if resynced_sources else "").strip()
+            if resynced_key and _normalized_token(resynced_key) != _normalized_token(access_key):
+                served = await _retry_with(resynced_key, attempt="retry_after_resync")
+                if served is not None:
+                    return served
             raise HTTPException(status_code=409, detail={
                 "message": (
-                    "Este lote ya no tiene una parcela válida en Graniot: la clave de acceso "
-                    "caducó y Graniot no devuelve una nueva. Vuelve a sincronizar el lote "
-                    "desde el panel de lotes."
+                    "Este lote ya no tiene una parcela válida en Graniot y no se pudo volver a crear "
+                    "automáticamente. Inténtalo de nuevo en unos minutos; si persiste, avisa a Dataris."
                 ),
                 "requires_resync": True,
                 "local_parcel_id": parcel_id,

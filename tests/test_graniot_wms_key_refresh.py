@@ -238,8 +238,12 @@ def test_la_clave_renovada_queda_guardada_para_la_proxima_vez():
     assert EXPIRED_KEY not in str(row.get("graniot_wms_url") or "")
 
 
-def test_si_graniot_ya_no_conoce_la_parcela_se_pide_resincronizar():
-    """Sin clave nueva no es un fallo de red: el lote perdió su parcela."""
+def test_si_graniot_ya_no_conoce_la_parcela_se_pide_resincronizar(monkeypatch):
+    """Sin clave nueva no es un fallo de red: el lote perdió su parcela.
+
+    El proxy intenta recrearla como su dueño; aquí el dueño (user_id 1) no
+    existe, así que no puede, y responde 409 en vez de un 502 opaco.
+    """
     seed_local_parcel(dict(BASE_ROW))
     FakeGraniotClient.reset(recovery=False)
     client = TestClient(app)
@@ -252,4 +256,4 @@ def test_si_graniot_ya_no_conoce_la_parcela_se_pide_resincronizar():
     assert response.status_code == 409, response.text
     detail = response.json()["detail"]
     assert detail["requires_resync"] is True
-    assert "sincronizar" in detail["message"].lower()
+    assert "no se pudo volver a crear" in detail["message"].lower()
