@@ -96,6 +96,36 @@ fastapi_app = FastAPI(title=settings.PROJECT_NAME)
 # GeoJSON puede ser pesado. GZip reduce mucho el tiempo de transferencia al frontend.
 fastapi_app.add_middleware(GZipMiddleware, minimum_size=1000)
 
+
+@fastapi_app.middleware("http")
+async def descartar_estado_compat_de_peticiones_fallidas(request: Request, call_next):
+    """Una petición que falla no deja a medias el estado compartido de compat.
+
+    `compat.read_db()` devuelve el diccionario cacheado en el proceso, no una
+    copia, para no releer y reparsear el estado entero en cada petición. El
+    efecto secundario es que si un endpoint modifica ese diccionario y después
+    falla antes de su `write_db`, el cambio se queda vivo en memoria y la
+    siguiente escritura de CUALQUIER otra petición acaba persistiéndolo: aparecen
+    filas que nadie llegó a guardar.
+
+    Hoy ningún endpoint de compat modifica el estado y lanza un error a
+    propósito (todas las validaciones van antes de tocar nada), pero basta una
+    excepción inesperada o un fallo al persistir para caer en ello. Tirar la
+    caché cuando la petición no termina bien cierra esa puerta: la siguiente
+    lectura reconstruye el estado desde la base. Solo cuesta una lectura extra y
+    únicamente en las peticiones que fallan.
+    """
+    from app.api.routers import compat
+
+    try:
+        response = await call_next(request)
+    except Exception:
+        compat.invalidate_state_cache()
+        raise
+    if response.status_code >= 400:
+        compat.invalidate_state_cache()
+    return response
+
 include_api_routers(fastapi_app)
 
 
