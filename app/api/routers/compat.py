@@ -2274,6 +2274,13 @@ def onboard_client(payload: Dict[str, Any] = Body(default_factory=dict), authori
     superadministradores: el usuario creado es siempre `company_admin` de la
     empresa recién creada, de modo que no hay forma de escalar privilegios por
     esta vía.
+
+    Es la única alta de clientes de la plataforma: la gestión de empresas del
+    panel la usa para su botón «Nueva Empresa». Antes esa pantalla hacía el alta
+    por su cuenta (insert en `companies` + alta pública + insert en
+    `admin_users`), lo que dejaba al administrador del cliente con rol `user`,
+    sin país, sin perfil ligado a su empresa y sin contraseña temporal, y podía
+    quedarse a medias si fallaba una de las tres llamadas.
     """
     with LOCK:
         db = read_db()
@@ -2301,6 +2308,12 @@ def onboard_client(payload: Dict[str, Any] = Body(default_factory=dict), authori
         last_name = str(payload.get("last_name") or "").strip() or None
         max_hectares = float(payload.get("max_hectares") or 0)
         country = normalize_country(payload.get("country"))
+        cif = str(payload.get("cif") or "").strip() or None
+        # Correo de contacto de la empresa. Por defecto el del administrador que
+        # se crea con ella, que es lo que la gestión de empresas muestra en su
+        # tabla; se puede separar mandando `company_email`.
+        company_email = clean_email(payload["company_email"]) if payload.get("company_email") else email
+        is_active = bool(payload.get("is_active", True))
 
         t = now()
 
@@ -2309,9 +2322,11 @@ def onboard_client(payload: Dict[str, Any] = Body(default_factory=dict), authori
         company = {
             "id": company_id,
             "name": company_name,
+            "cif": cif,
+            "email": company_email,
             "max_hectares": max_hectares,
             "used_hectares": 0,
-            "is_active": True,
+            "is_active": is_active,
             "created_at": t,
             "updated_at": t,
         }
@@ -2320,8 +2335,12 @@ def onboard_client(payload: Dict[str, Any] = Body(default_factory=dict), authori
         # 2) Módulos por defecto de la empresa (los que existan en el catálogo).
         valid_modules = {m.get("id") for m in table(db, "platform_modules") if m.get("is_active", True)}
         requested_modules = payload.get("modules")
-        module_ids = [m for m in requested_modules if isinstance(requested_modules, list) and m in valid_modules] if isinstance(requested_modules, list) else []
-        if not module_ids:
+        if isinstance(requested_modules, list):
+            # Quien manda una lista ya eligió el paquete (la gestión de empresas
+            # trae los interruptores marcados), así que se respeta tal cual:
+            # también la lista vacía, que significa "sin módulos".
+            module_ids = [m for m in requested_modules if m in valid_modules]
+        else:
             module_ids = [m for m in CLIENT_DEFAULT_MODULE_IDS if m in valid_modules]
         for module_id in module_ids:
             table(db, "company_modules").append({
