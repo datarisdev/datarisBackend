@@ -343,7 +343,11 @@ def _parcel_unique_key(row: Dict[str, Any]) -> str:
     for key in ("lote", "codigo", "name", "id"):
         value = str(row.get(key) or "").strip().lower()
         if value:
-            return " ".join(value.split())
+            value = " ".join(value.split())
+            # En los lotes de empresa, el mismo nombre en otra finca es otro lote.
+            if row.get("company_id"):
+                return f"{' '.join(str(row.get('finca') or '').strip().lower().split())}|{value}"
+            return value
     return str(id(row))
 
 

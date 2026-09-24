@@ -1057,6 +1057,19 @@ def parcel_lot_key(row: Dict[str, Any]) -> str:
     return normalize_lot_key(row.get("lote"), row.get("codigo"), row.get("name"))
 
 
+def parcel_identity_key(row: Dict[str, Any]) -> str:
+    """Nombre con el que un lote se reconoce como «el mismo» dentro de su dueño.
+
+    En un lote de empresa cuenta también la finca: una empresa junta los lotes
+    de varias personas y fincas, y «Lote 5» de una finca no es «Lote 5» de otra.
+    En los lotes personales se mantiene el nombre solo, como siempre.
+    """
+    lot_key = parcel_lot_key(row)
+    if row.get("company_id") and lot_key:
+        return f"{normalize_lot_key(row.get('finca'))}|{lot_key}"
+    return lot_key
+
+
 def parcel_scope_key(row: Dict[str, Any]) -> str:
     """A quién pertenece un lote.
 
@@ -1384,7 +1397,7 @@ def scoped_table_rows(db: Dict[str, Any], table_name: str, user: Optional[Dict[s
 def dedupe_user_parcels(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     by_key: Dict[str, Dict[str, Any]] = {}
     for row in rows:
-        key = f"{parcel_scope_key(row)}:{parcel_lot_key(row) or row.get('id') or id(row)}"
+        key = f"{parcel_scope_key(row)}:{parcel_identity_key(row) or row.get('id') or id(row)}"
         current = by_key.get(key)
         if current is None or str(row.get("updated_at") or row.get("created_at") or "") >= str(current.get("updated_at") or current.get("created_at") or ""):
             by_key[key] = row
@@ -1476,14 +1489,14 @@ def find_existing_user_parcel(rows: List[Dict[str, Any]], row: Dict[str, Any], u
     si no: un lote de empresa nunca se funde con uno personal ni con el de otra
     empresa.
     """
-    row_key = parcel_lot_key(row)
+    row_key = parcel_identity_key(row)
     scope = parcel_scope_key({**row, "user_id": row.get("user_id") or user_id})
     for existing in rows:
         if parcel_scope_key(existing) != scope:
             continue
         if row.get("id") and str(existing.get("id")) == str(row.get("id")):
             return existing
-        if row_key and parcel_lot_key(existing) == row_key:
+        if row_key and parcel_identity_key(existing) == row_key:
             return existing
     # Sin coincidencia por nombre/id: buscar un duplicado por geometría (mismo
     # lote resubido con otro nombre). Al encontrarlo, upsert_user_parcel lo
