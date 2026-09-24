@@ -519,3 +519,126 @@ def test_el_alta_sin_lista_de_modulos_hereda_el_paquete_de_la_empresa(client: Te
     modulos = {m["id"]: m for m in detalle.json()["data"]["modules"]}
     assert modulos["satelite"]["effective"] is True
     assert modulos["telemetria"]["effective"] is False
+
+
+# --- Migración de los lotes cargados por usuario ------------------------------
+
+
+def _legacy_parcel(user_id: str, name: str, geometry: dict, **extra) -> str:
+    parcel_id = extra.pop("id", None) or str(uuid.uuid4())
+    with compat.LOCK:
+        db = compat.read_db()
+        compat.table(db, "parcels").append(
+            compat.normalize_record_geometries(
+                "parcels",
+                {"id": parcel_id, "user_id": user_id, "name": name, "geometry": geometry, "created_at": compat.now(), **extra},
+            )
+        )
+        compat.write_db(db)
+    return parcel_id
+
+
+def test_la_migracion_funde_los_lotes_repetidos_y_mueve_sus_referencias(client: TestClient, admin_token: str, monkeypatch):
+    from app.api.routers import compat_parcels_admin
+
+    monkeypatch.setattr(compat_parcels_admin, "_sql_mirrored", lambda ids: [])
+    company_id = _create_company(client, admin_token, f"Migra {uuid.uuid4().hex[:6]}")
+    a_email, b_email = _client_email("a"), _client_email("b")
+    a_id = _create_user(client, admin_token, email=a_email, company_id=company_id)
+    b_id = _create_user(client, admin_token, email=b_email, company_id=company_id)
+
+    # El mismo lote en las dos cuentas (b lo tiene en Graniot) y uno propio de cada una.
+    a_copia = _legacy_parcel(a_id, "Lote común", polygon(0.60))
+    b_copia = _legacy_parcel(b_id, "Lote común (b)", polygon(0.60), graniot_parcel_id=99)
+    solo_a = _legacy_parcel(a_id, "Solo de A", polygon(0.62))
+    solo_b = _legacy_parcel(b_id, "Solo de B", polygon(0.64))
+    with compat.LOCK:
+        db = compat.read_db()
+        compat.table(db, "field_notes").append({"id": str(uuid.uuid4()), "user_id": a_id, "parcel_id": a_copia, "note": "x"})
+        compat.write_db(db)
+
+    plan = client.post(
+        "/api/compat/admin/parcels/migrate",
+        headers=_auth(admin_token),
+        json={"company_id": company_id, "owner_user_id": b_id},
+    )
+    assert plan.status_code == 200, plan.text
+    data = plan.json()["data"]
+    assert data["dry_run"] is True
+    assert (data["lots_before"], data["lots_after"], data["dropped"]) == (4, 3, 1)
+    assert data["references_moved"] == {"field_notes": 1}
+    # La simulación no cambia nada.
+    assert {p["id"] for p in _parcels_of(client, _sign_in(client, a_email, "Lotes2026!"))} == {a_copia, solo_a}
+
+    applied = client.post(
+        "/api/compat/admin/parcels/migrate",
+        headers=_auth(admin_token),
+        json={"company_id": company_id, "owner_user_id": b_id, "dry_run": False},
+    )
+    assert applied.status_code == 200, applied.text
+
+    # Los dos ven los mismos 3 lotes: la copia que estaba en Graniot se quedó.
+    for email in (a_email, b_email):
+        assert {p["id"] for p in _parcels_of(client, _sign_in(client, email, "Lotes2026!"))} == {b_copia, solo_a, solo_b}
+    db = compat.read_db(force_refresh=True)
+    rows = {r["id"]: r for r in compat.table(db, "parcels") if r["id"] in {b_copia, solo_a, solo_b}}
+    assert all(r["company_id"] == company_id for r in rows.values())
+    # Lo que ya está en Graniot sigue a nombre de su cuenta; lo demás, del titular.
+    assert rows[b_copia]["user_id"] == b_id and rows[solo_a]["user_id"] == b_id
+    nota = next(n for n in compat.table(db, "field_notes") if n.get("note") == "x" and n.get("user_id") == a_id)
+    assert nota["parcel_id"] == b_copia
+    company = next(c for c in compat.table(db, "companies") if c["id"] == company_id)
+    assert company[compat.COMPANY_PARCEL_OWNER_FIELD] == b_id
+
+    listed = client.get("/api/compat/admin/parcels/company", headers=_auth(admin_token), params={"company_id": company_id})
+    empresa = listed.json()["data"]["company"]
+    assert (empresa["parcel_count"], empresa["legacy_parcel_count"]) == (3, 0)
+    assert empresa["owner"]["id"] == b_id and empresa["owner_pinned"] is True
+
+
+def test_la_migracion_no_borra_copias_que_usa_la_bitacora(client: TestClient, admin_token: str, monkeypatch):
+    from app.api.routers import compat_parcels_admin
+
+    company_id = _create_company(client, admin_token, f"Bitacora {uuid.uuid4().hex[:6]}")
+    a_id = _create_user(client, admin_token, email=_client_email("a"), company_id=company_id)
+    b_id = _create_user(client, admin_token, email=_client_email("b"), company_id=company_id)
+    a_copia = _legacy_parcel(a_id, "Común", polygon(0.70))
+    _legacy_parcel(b_id, "Común", polygon(0.70), graniot_parcel_id=5)
+    monkeypatch.setattr(compat_parcels_admin, "_sql_mirrored", lambda ids: [a_copia] if a_copia in ids else [])
+
+    response = client.post(
+        "/api/compat/admin/parcels/migrate",
+        headers=_auth(admin_token),
+        json={"company_id": company_id, "dry_run": False},
+    )
+    assert response.status_code == 409
+    assert "Bitácora" in response.json()["detail"]
+    db = compat.read_db(force_refresh=True)
+    assert any(r["id"] == a_copia and not r.get("company_id") for r in compat.table(db, "parcels"))
+
+
+def test_el_titular_fijado_manda_sobre_el_correo_de_la_empresa(client: TestClient, admin_token: str):
+    company_id = _create_company(client, admin_token, f"Titular {uuid.uuid4().hex[:6]}")
+    _create_user(client, admin_token, email=_client_email("admin"), company_id=company_id, admin_role="company_admin")
+    otro_id = _create_user(client, admin_token, email=_client_email("otro"), company_id=company_id)
+
+    fijado = client.post(
+        "/api/compat/admin/parcels/owner",
+        headers=_auth(admin_token),
+        json={"company_id": company_id, "user_id": otro_id},
+    )
+    assert fijado.status_code == 200, fijado.text
+    created = client.post(
+        "/api/compat/admin/parcels/manual",
+        headers=_auth(admin_token),
+        json={"company_id": company_id, "name": "Del titular fijado", "geometry": polygon(0.80)},
+    )
+    assert created.json()["data"]["parcel"]["user_id"] == otro_id
+
+    ajeno_id = _create_user(client, admin_token, email=_client_email("ajeno"), company_id=_create_company(client, admin_token, f"X {uuid.uuid4().hex[:6]}"))
+    rechazo = client.post(
+        "/api/compat/admin/parcels/owner",
+        headers=_auth(admin_token),
+        json={"company_id": company_id, "user_id": ajeno_id},
+    )
+    assert rechazo.status_code == 400

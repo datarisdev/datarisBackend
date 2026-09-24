@@ -1098,6 +1098,9 @@ def company_parcels(db: Dict[str, Any], company_id: str) -> List[Dict[str, Any]]
     return [row for row in table(db, "parcels") if company_id and str(row.get("company_id") or "") == str(company_id)]
 
 
+COMPANY_PARCEL_OWNER_FIELD = "parcel_owner_user_id"
+
+
 def company_parcel_owner(db: Dict[str, Any], company_id: str) -> Optional[Dict[str, Any]]:
     """Usuario titular de los lotes de una empresa.
 
@@ -1105,13 +1108,19 @@ def company_parcel_owner(db: Dict[str, Any], company_id: str) -> Optional[Dict[s
     sincronización con Graniot trabaja con una cuenta por usuario: así toda la
     empresa comparte una sola cuenta de Graniot, la del titular. Es el usuario
     del correo de la empresa; si no existe, su primer administrador activo; y si
-    tampoco, cualquier usuario activo de la empresa.
+    tampoco, cualquier usuario activo de la empresa. Si la empresa tiene un
+    titular fijado (`parcel_owner_user_id`) y sigue en ella, manda ese.
     """
     if not company_id:
         return None
     company = next((c for c in table(db, "companies") if str(c.get("id")) == str(company_id)), None)
     users = [u for u in db.get("users", []) if u.get("is_active", True) is not False]
     by_id = {str(u.get("id")): u for u in users}
+    # Titular fijado a mano: la cuenta que ya tiene los lotes de la empresa en
+    # Graniot, aunque no sea la del correo de la empresa.
+    pinned = by_id.get(str((company or {}).get(COMPANY_PARCEL_OWNER_FIELD) or ""))
+    if pinned and str(_company_for_user(db, str(pinned.get("id"))) or "") == str(company_id):
+        return pinned
     company_email = str((company or {}).get("email") or "").strip().lower()
     if company_email:
         titular = next((u for u in users if str(u.get("email") or "").strip().lower() == company_email), None)
