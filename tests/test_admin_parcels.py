@@ -674,3 +674,29 @@ def test_rehome_pasa_a_la_cuenta_del_titular_los_lotes_que_viven_en_otra(client:
     assert row["graniot_previous_account_email"] == "otro@graniot"
     assert subidos == [(titular_id, [ajeno])]
     assert next(r for r in compat.table(db, "parcels") if r["id"] == propio)["graniot_parcel_id"] == 8
+
+
+def test_la_migracion_puede_limitarse_a_algunos_usuarios(client: TestClient, admin_token: str, monkeypatch):
+    from app.api.routers import compat_parcels_admin
+
+    monkeypatch.setattr(compat_parcels_admin, "_sql_mirrored", lambda ids: [])
+    company_id = _create_company(client, admin_token, f"Solo uno {uuid.uuid4().hex[:6]}")
+    equipo_id = _create_user(client, admin_token, email=_client_email("equipo"), company_id=company_id)
+    aparte_email = _client_email("aparte")
+    aparte_id = _create_user(client, admin_token, email=aparte_email, company_id=company_id)
+    del_equipo = _legacy_parcel(equipo_id, "Verificación", polygon(0.95))
+    personal = _legacy_parcel(aparte_id, "Personal", polygon(0.97))
+
+    response = client.post(
+        "/api/compat/admin/parcels/migrate",
+        headers=_auth(admin_token),
+        json={"company_id": company_id, "owner_user_id": equipo_id, "only_user_ids": [equipo_id], "dry_run": False},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["data"]["lots_after"] == 1
+    db = compat.read_db(force_refresh=True)
+    rows = {r["id"]: r for r in compat.table(db, "parcels") if r["id"] in {del_equipo, personal}}
+    assert rows[del_equipo]["company_id"] == company_id
+    assert not rows[personal].get("company_id")
+    # El otro usuario ve los del equipo y conserva los suyos.
+    assert {p["id"] for p in _parcels_of(client, _sign_in(client, aparte_email, "Lotes2026!"))} == {del_equipo, personal}

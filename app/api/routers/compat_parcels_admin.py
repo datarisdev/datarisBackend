@@ -542,7 +542,8 @@ def migrate_company_parcels(
     plan. Parámetros: `company_id`; `owner_user_id` fija el titular;
     `keep_from_user_id` indica de quién es la copia que se queda en los
     repetidos; `delete_dropped_in_graniot` borra también de Graniot las copias
-    descartadas (por defecto no).
+    descartadas (por defecto no); `only_user_ids` limita la migración a los
+    lotes de esos usuarios (los demás siguen siendo personales).
     """
     ctx = _require_manager(authorization)
     dry_run = payload.get("dry_run", True) is not False
@@ -558,6 +559,10 @@ def migrate_company_parcels(
             for u in db.get("users", [])
             if u.get("id") and str(_company_for_user(db, str(u.get("id"))) or "") == company_id
         }
+        only_ids = {str(v) for v in (payload.get("only_user_ids") or []) if v}
+        if only_ids - member_ids:
+            raise HTTPException(status_code=400, detail="Alguno de los usuarios indicados no pertenece a la empresa")
+        source_ids = only_ids or member_ids
         owner_id = str(payload.get("owner_user_id") or "").strip()
         if owner_id and owner_id not in member_ids:
             raise HTTPException(status_code=400, detail="El titular indicado no pertenece a la empresa")
@@ -567,7 +572,7 @@ def migrate_company_parcels(
         legacy_all = [
             row
             for row in table(db, "parcels")
-            if not row.get("company_id") and str(row.get("user_id") or "") in member_ids
+            if not row.get("company_id") and str(row.get("user_id") or "") in source_ids
         ]
         # Cada usuario puede tener versiones viejas del mismo lote que la
         # pantalla ya ocultaba: se funden en su versión vigente.
