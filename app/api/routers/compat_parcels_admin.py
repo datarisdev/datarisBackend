@@ -323,18 +323,20 @@ async def upload_parcel_for_company(
     ctx = _require_manager(authorization)
     dest = _resolve_destination(ctx, company_id, user_id)
     owner = dest["owner"]
+    summary: Dict[str, int] = {}
     created_rows = await store_parcel_file_for_user(
         owner,
         file,
         name,
         company_id=str(dest["company"].get("id")),
         uploaded_by=str(ctx["user"].get("id") or ""),
+        summary=summary,
     )
     # El titular puede no tener todavía cuenta en Graniot (cliente recién dado
     # de alta): se le crea su portal antes de subir, para que los lotes acaben
     # en la cuenta de la empresa y no se queden solo en Dataris.
     schedule_graniot_parcel_sync(background_tasks, owner, created_rows, ensure_account=True)
-    return {"data": {"parcel": created_rows[0], "parcels": created_rows}, "error": None}
+    return {"data": {"parcel": created_rows[0], "parcels": created_rows, "summary": summary}, "error": None}
 
 
 @router.post("/manual")
