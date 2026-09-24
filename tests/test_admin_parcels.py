@@ -642,3 +642,35 @@ def test_el_titular_fijado_manda_sobre_el_correo_de_la_empresa(client: TestClien
         json={"company_id": company_id, "user_id": ajeno_id},
     )
     assert rechazo.status_code == 400
+
+
+def test_rehome_pasa_a_la_cuenta_del_titular_los_lotes_que_viven_en_otra(client: TestClient, admin_token: str, monkeypatch):
+    from app.api.routers import compat_parcels_admin
+
+    subidos = []
+    monkeypatch.setattr(
+        compat_parcels_admin,
+        "schedule_graniot_parcel_sync",
+        lambda bg, user, rows, **kw: subidos.append((user["id"], [r["id"] for r in rows])),
+    )
+    company_id = _create_company(client, admin_token, f"Rehome {uuid.uuid4().hex[:6]}")
+    titular_id = _create_user(client, admin_token, email=_client_email("titular"), company_id=company_id, admin_role="company_admin")
+    otro_id = _create_user(client, admin_token, email=_client_email("otro"), company_id=company_id)
+    ajeno = _legacy_parcel(otro_id, "En otra cuenta", polygon(0.90), company_id=company_id,
+                           graniot_parcel_id=7, graniot_account_email="otro@graniot")
+    propio = _legacy_parcel(titular_id, "Ya del titular", polygon(0.92), company_id=company_id, graniot_parcel_id=8)
+
+    plan = client.post("/api/compat/admin/parcels/rehome", headers=_auth(admin_token), json={"company_id": company_id})
+    assert plan.status_code == 200, plan.text
+    assert [p["id"] for p in plan.json()["data"]["parcels"]] == [ajeno]
+    assert subidos == []
+
+    hecho = client.post("/api/compat/admin/parcels/rehome", headers=_auth(admin_token), json={"company_id": company_id, "dry_run": False})
+    assert hecho.status_code == 200, hecho.text
+    db = compat.read_db(force_refresh=True)
+    row = next(r for r in compat.table(db, "parcels") if r["id"] == ajeno)
+    assert row["user_id"] == titular_id
+    assert not row.get("graniot_parcel_id")
+    assert row["graniot_previous_account_email"] == "otro@graniot"
+    assert subidos == [(titular_id, [ajeno])]
+    assert next(r for r in compat.table(db, "parcels") if r["id"] == propio)["graniot_parcel_id"] == 8

@@ -704,3 +704,72 @@ def _count_by_user(rows: List[Dict[str, Any]]) -> Dict[str, int]:
         uid = str(row.get("user_id") or "")
         counts[uid] = counts.get(uid, 0) + 1
     return counts
+
+
+@router.post("/rehome")
+def rehome_company_parcels(
+    background_tasks: BackgroundTasks,
+    payload: Dict[str, Any] = Body(default_factory=dict),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Pasa a la cuenta de Graniot del titular los lotes de empresa que viven en otra.
+
+    Con el portal de Graniot por empresa, el equipo ve la cuenta del titular:
+    un lote que quedó en la cuenta de otra persona (p. ej. la copia que se
+    conservó al fundir repetidos) no aparece ahí. Se pone a nombre del titular y
+    se vuelve a subir con su cuenta. La copia vieja NO se borra de la otra
+    cuenta: puede ser la cuenta personal de alguien.
+
+    Por defecto SIMULA (`dry_run`). `ids` acota los lotes; sin él, todos los de
+    la empresa que no están a nombre del titular.
+    """
+    ctx = _require_manager(authorization)
+    dry_run = payload.get("dry_run", True) is not False
+    wanted = {str(v) for v in (payload.get("ids") or []) if v}
+
+    with LOCK:
+        db = read_db()
+        company = _target_company(db, ctx["permission"], payload.get("company_id"))
+        company_id = str(company.get("id"))
+        owner = _company_owner(db, company)
+        owner_id = str(owner.get("id"))
+        users_by_id = {str(u.get("id")): u for u in db.get("users", [])}
+        rows = [
+            row
+            for row in company_parcels(db, company_id)
+            if str(row.get("user_id") or "") != owner_id and (not wanted or str(row.get("id")) in wanted)
+        ]
+        plan = {
+            "company": {"id": company_id, "name": company.get("name")},
+            "owner": {"id": owner_id, "email": owner.get("email")},
+            "count": len(rows),
+            "parcels": [
+                {
+                    "id": row.get("id"),
+                    "name": row.get("name"),
+                    "area": row.get("area"),
+                    "from_user": (users_by_id.get(str(row.get("user_id"))) or {}).get("email") or row.get("user_id"),
+                    "from_graniot_account": row.get("graniot_account_email"),
+                }
+                for row in rows
+            ],
+            "dry_run": dry_run,
+        }
+        if dry_run or not rows:
+            return {"data": plan, "error": None}
+
+        from app.api.routers.graniot import GRANIOT_LOCAL_SYNC_FIELDS
+
+        stamp = now()
+        for row in rows:
+            if row.get("graniot_account_email"):
+                row["graniot_previous_account_email"] = row.get("graniot_account_email")
+            for field in GRANIOT_LOCAL_SYNC_FIELDS:
+                row.pop(field, None)
+            row["user_id"] = owner_id
+            row["updated_at"] = stamp
+        moved = [dict(row) for row in rows]
+        write_db(db)
+
+    schedule_graniot_parcel_sync(background_tasks, owner, moved, ensure_account=True)
+    return {"data": plan, "error": None}
