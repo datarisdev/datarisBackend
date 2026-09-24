@@ -155,3 +155,62 @@ def test_los_lotes_personales_siguen_deduplicando_por_nombre():
         {"id": "b", "user_id": "u", "name": "Lote 5", "finca": "San José", "updated_at": "2026-09-24"},
     ]
     assert _ids(compat.dedupe_user_parcels(rows)) == {"b"}
+
+
+# --- Portal de Graniot por empresa --------------------------------------------
+
+
+def test_el_equipo_de_una_empresa_con_lotes_de_empresa_comparte_el_portal_del_titular():
+    db = _state()
+    assert compat.company_portal_user(db, {"id": "colega"})["id"] == "titular"
+    assert compat.company_portal_user(db, {"id": "titular"})["id"] == "titular"
+
+
+def test_sin_lotes_de_empresa_cada_uno_conserva_su_portal():
+    db = _state()
+    db["tables"]["parcels"] = [p for p in db["tables"]["parcels"] if p.get("company_id") != "A"]
+    assert compat.company_portal_user(db, {"id": "colega"})["id"] == "colega"
+    # Sin empresa, tampoco cambia nada.
+    assert compat.company_portal_user(db, {"id": "suelto"})["id"] == "suelto"
+
+
+def test_con_titular_fijado_se_comparte_aunque_aun_no_haya_lotes():
+    db = _state()
+    db["tables"]["parcels"] = []
+    db["tables"]["companies"][0][compat.COMPANY_PARCEL_OWNER_FIELD] = "colega"
+    assert compat.company_portal_user(db, {"id": "titular"})["id"] == "colega"
+
+
+def test_el_portal_se_busca_con_el_correo_del_titular(monkeypatch):
+    db = _state()
+    monkeypatch.setattr(graniot, "read_db", lambda *a, **k: db)
+    monkeypatch.setattr(graniot.settings, "GRANIOT_EMBED_PER_USER_ENABLED", True)
+    monkeypatch.setattr(graniot, "_embed_service_account_emails", lambda: set())
+    buscados = []
+
+    async def fake_platform_user(email):
+        buscados.append(email)
+        return None
+
+    async def fake_find(email, **kwargs):
+        return None
+
+    monkeypatch.setattr(graniot, "_platform_user_for_email", fake_platform_user)
+    monkeypatch.setattr(graniot, "_find_embed_account", fake_find)
+    asyncio.run(graniot._embed_account_for_user({"id": "colega", "email": "colega@a.com"}))
+    assert buscados == ["titular@a.com"]
+
+
+def test_al_dar_de_alta_a_un_colega_no_se_le_crea_cuenta_en_graniot(monkeypatch):
+    db = _state()
+    monkeypatch.setattr(compat, "read_db", lambda *a, **k: db)
+    llamadas = []
+
+    async def fake_ensure(user, provisioned_by=None):
+        llamadas.append(user["id"])
+        return {"provisioned": True}
+
+    monkeypatch.setattr(graniot, "ensure_embed_account_for_user", fake_ensure)
+    asyncio.run(compat._graniot_ensure_embed_account_task({"id": "colega", "email": "colega@a.com"}))
+    asyncio.run(compat._graniot_ensure_embed_account_task({"id": "titular", "email": "titular@a.com"}))
+    assert llamadas == ["titular"]

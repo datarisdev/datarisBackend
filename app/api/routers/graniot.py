@@ -33,6 +33,7 @@ from app.api.routers.compat import (
     LOCK,
     _company_for_user,
     bearer_user,
+    company_portal_user,
     dedupe_user_parcels,
     now,
     parcel_manager_covers_user,
@@ -3913,11 +3914,23 @@ async def _embed_account_for_user(user: Dict[str, Any]) -> Optional[Dict[str, st
     """
     if not settings.GRANIOT_EMBED_PER_USER_ENABLED:
         return None
+    if str((user or {}).get("email") or "").strip().lower() in _embed_service_account_emails():
+        # The service account is better served by the minted token (always fresh).
+        return None
+    # Portal por empresa: si su empresa comparte el portal del titular, se abre
+    # ese (misma cuenta donde viven los lotes de la empresa).
+    try:
+        user = await run_in_threadpool(lambda: company_portal_user(read_db(), user)) or user
+    except Exception as exc:  # noqa: BLE001 — sin empresa resuelta, su portal de siempre
+        log_event({
+            "event": "dataris.graniot.embed_company_portal.lookup_failed",
+            "exception_type": type(exc).__name__,
+            "message": str(exc),
+        })
     email = str((user or {}).get("email") or "").strip().lower()
     if not email or "@" not in email:
         return None
     if email in _embed_service_account_emails():
-        # The service account is better served by the minted token (always fresh).
         return None
 
     try:

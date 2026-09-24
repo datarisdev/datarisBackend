@@ -1404,6 +1404,28 @@ def dedupe_user_parcels(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return list(by_key.values())
 
 
+def company_portal_user(db: Dict[str, Any], user: Dict[str, Any]) -> Dict[str, Any]:
+    """Usuario cuyo portal de Graniot ve `user`.
+
+    Las empresas que ya trabajan con lotes de empresa (o con titular fijado)
+    comparten un solo portal: el de su titular, que es la cuenta donde viven sus
+    lotes. Así todo el equipo ve lo mismo y no se gasta una licencia de Graniot
+    por persona. Las demás empresas (y los usuarios sin empresa) siguen con su
+    portal personal.
+    """
+    user_id = str((user or {}).get("id") or "")
+    company_id = _company_for_user(db, user_id) if user_id else None
+    if not company_id:
+        return user
+    company = next((c for c in table(db, "companies") if str(c.get("id")) == str(company_id)), None) or {}
+    if not company.get(COMPANY_PARCEL_OWNER_FIELD) and not any(
+        str(row.get("company_id") or "") == str(company_id) for row in table(db, "parcels")
+    ):
+        return user
+    owner = company_parcel_owner(db, str(company_id))
+    return owner or user
+
+
 def _parcel_bbox(row: Dict[str, Any]) -> Optional[List[float]]:
     box = row.get("bbox")
     if isinstance(box, (list, tuple)) and len(box) >= 4:
@@ -3016,6 +3038,18 @@ async def _graniot_ensure_embed_account_task(
     """
     from app.api.routers.graniot import ensure_embed_account_for_user
 
+    portal_user = company_portal_user(read_db(), user)
+    if str(portal_user.get("id") or "") != str(user.get("id") or ""):
+        # Su empresa comparte el portal del titular: crearle uno propio gastaría
+        # una licencia de Graniot para ver lo mismo.
+        _graniot_log(
+            "dataris.compat.embed_provision.skipped",
+            operation="ensure-embed-account",
+            email=user.get("email"),
+            reason="company_portal",
+            portal_email=portal_user.get("email"),
+        )
+        return
     result = await ensure_embed_account_for_user(user, provisioned_by=provisioned_by)
     _graniot_log(
         "dataris.compat.embed_provision.ok" if result.get("provisioned") else "dataris.compat.embed_provision.skipped",
