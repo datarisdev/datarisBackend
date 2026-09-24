@@ -72,8 +72,7 @@ def _get_owned_parcel(db: Session, parcel_id: UUID | str, current_user: dict[str
         (
             row
             for row in parcels
-            if str(row.get("id")) == wanted_id
-            and (not row.get("user_id") or str(row.get("user_id")) == user_id)
+            if str(row.get("id")) == wanted_id and compat_store.parcel_accessible(compat_db, row, user_id)
         ),
         None,
     )
@@ -710,11 +709,12 @@ def _collect_prefetch_parcels(payload: dict[str, Any], current_user: dict[str, A
     try:
         compat_db = compat_store.read_db()
         all_parcels = compat_store.table(compat_db, "parcels")
+        own_company = compat_store._company_for_user(compat_db, user_id)
         for row in all_parcels:
             parcel_id = str(row.get("id") or "")
             if not parcel_id or parcel_id in seen:
                 continue
-            if row.get("user_id") and str(row.get("user_id")) != user_id:
+            if (row.get("user_id") or row.get("company_id")) and not compat_store.parcel_visible_to(row, user_id, own_company):
                 continue
             if requested_ids and parcel_id not in requested_ids:
                 continue

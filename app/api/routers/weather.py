@@ -33,7 +33,8 @@ def _owned_parcel(parcel_id: uuid.UUID | str, current_user: dict[str, Any]) -> d
     wanted_id = str(parcel_id)
     user_id = _user_id(current_user)
     try:
-        rows = compat_store.table(compat_store.read_db(), "parcels")
+        state = compat_store.read_db()
+        rows = compat_store.table(state, "parcels")
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"No se pudieron leer los lotes guardados: {exc}") from exc
 
@@ -41,8 +42,7 @@ def _owned_parcel(parcel_id: uuid.UUID | str, current_user: dict[str, Any]) -> d
         (
             row
             for row in rows
-            if str(row.get("id")) == wanted_id
-            and (not row.get("user_id") or str(row.get("user_id")) == user_id)
+            if str(row.get("id")) == wanted_id and compat_store.parcel_accessible(state, row, user_id)
         ),
         None,
     )
