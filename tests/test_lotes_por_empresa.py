@@ -135,3 +135,23 @@ def test_sentinel_y_clima_abren_los_lotes_de_la_empresa(monkeypatch):
         sentinel2._get_owned_parcel(None, "empresa", {"id": "ajeno"})
     with pytest.raises(HTTPException):
         weather._owned_parcel("viejo", {"id": "titular"})
+
+
+def test_el_mismo_nombre_en_otra_finca_de_la_empresa_es_otro_lote():
+    rows = [
+        {"id": "isla", "company_id": "A", "user_id": "titular", "name": "Lote 5", "finca": "La Isla"},
+        {"id": "jose", "company_id": "A", "user_id": "titular", "name": "Lote 5", "finca": "San José"},
+        # Re-subida en la misma finca: sí es el mismo lote (gana la más reciente).
+        {"id": "isla-v2", "company_id": "A", "user_id": "titular", "name": "lote 5", "finca": "La Isla", "updated_at": "2026-09-24"},
+    ]
+    assert _ids(compat.dedupe_user_parcels(rows)) == {"jose", "isla-v2"}
+    entrante = {"company_id": "A", "user_id": "titular", "name": "Lote 5", "finca": "San José"}
+    assert compat.find_existing_user_parcel(rows, entrante, "titular")["id"] == "jose"
+
+
+def test_los_lotes_personales_siguen_deduplicando_por_nombre():
+    rows = [
+        {"id": "a", "user_id": "u", "name": "Lote 5", "finca": "La Isla"},
+        {"id": "b", "user_id": "u", "name": "Lote 5", "finca": "San José", "updated_at": "2026-09-24"},
+    ]
+    assert _ids(compat.dedupe_user_parcels(rows)) == {"b"}
