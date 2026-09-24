@@ -23,6 +23,7 @@ from app.api.routers.compat import (
     _parcel_bbox,
     _parcel_geometry_shape,
     bearer_user,
+    company_hectare_limit,
     company_parcel_owner,
     company_parcels,
     create_manual_parcel_for_user,
@@ -190,6 +191,10 @@ def _company_summary(db: Dict[str, Any], company: Dict[str, Any], legacy_by_user
         "name": company.get("name"),
         "is_active": company.get("is_active", True),
         "max_hectares": company.get("max_hectares"),
+        # Límite efectivo (None = sin límite definido) y si ya lo supera.
+        "hectare_limit": company_hectare_limit(company),
+        "over_limit": bool(company_hectare_limit(company))
+        and round(sum(float(p.get("area") or 0) for p in parcels), 2) > float(company_hectare_limit(company) or 0),
         "member_count": len(member_ids),
         "parcel_count": len(parcels),
         "total_area": round(sum(float(p.get("area") or 0) for p in parcels), 2),

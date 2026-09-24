@@ -1,4 +1,4 @@
-"""Hallazgos H5, H6 y H8 de la revisión del 14 sep 2026.
+"""Hallazgos H5, H6, H8 y H10 de la revisión del 14 sep 2026.
 
 * H6: dar de baja una empresa se llevaba solo su fila; sus usuarios, módulos y
   lotes quedaban colgados.
@@ -6,6 +6,8 @@
   varias réplicas, una podía pisar lo que otra acababa de guardar.
 * H8: dos polígonos de un mismo archivo con el mismo nombre (o la misma forma)
   se fundían y el archivo perdía un lote sin avisar.
+* H10: lo usado se medía con hectáreas escritas a mano por usuario y nada
+  impedía cargar lotes por encima del límite de la empresa.
 """
 
 from __future__ import annotations
@@ -216,3 +218,99 @@ def test_un_archivo_no_pierde_polígonos_con_el_mismo_nombre(client, admin):
     assert segunda.json()["data"]["summary"]["created"] == 0
     listado = client.get("/api/compat/admin/parcels/company", headers=_auth(admin), params={"company_id": company_id})
     assert len(listado.json()["data"]["parcels"]) == 3
+
+
+# --- H10 ----------------------------------------------------------------------
+
+
+def _limited_company(client, admin, limit):
+    alta = client.post(
+        "/api/compat/admin/clients/onboard",
+        headers=_auth(admin),
+        json={
+            "company_name": f"Limite {uuid.uuid4().hex[:6]}",
+            "email": f"l-{uuid.uuid4().hex[:6]}@cliente.com",
+            "password": PASSWORD,
+            "country": "MX",
+            "max_hectares": limit,
+            "modules": ["satelite"],
+        },
+    )
+    assert alta.status_code == 200, alta.text
+    return alta.json()["data"]["company"]["id"]
+
+
+def _manual(client, admin, company_id, name, offset):
+    return client.post(
+        "/api/compat/admin/parcels/manual",
+        headers=_auth(admin),
+        json={"company_id": company_id, "name": name, "geometry": _square(offset)},
+    )
+
+
+def test_lo_usado_es_el_area_real_de_los_lotes(client, admin):
+    company_id = _limited_company(client, admin, 1000)
+    lote = _manual(client, admin, company_id, "Uno", 0.10)
+    assert lote.status_code == 200, lote.text
+    area = lote.json()["data"]["parcel"]["area"]
+    fila = client.post(
+        "/api/compat/tables/companies/query",
+        headers=_auth(admin),
+        json={"filters": [{"column": "id", "op": "eq", "value": company_id}]},
+    ).json()["data"][0]
+    assert fila["used_hectares"] == pytest.approx(area, abs=0.01)
+
+
+def test_una_carga_que_pasa_del_limite_se_rechaza_y_no_se_guarda(client, admin):
+    # Cada cuadrado de 0,01° mide ~119 ha: con 150 ha cabe uno y no dos.
+    company_id = _limited_company(client, admin, 150)
+    assert _manual(client, admin, company_id, "Cabe", 0.20).status_code == 200
+    rechazo = _manual(client, admin, company_id, "No cabe", 0.22)
+    assert rechazo.status_code == 400
+    assert "límite de hectáreas" in rechazo.json()["detail"]
+    listado = client.get("/api/compat/admin/parcels/company", headers=_auth(admin), params={"company_id": company_id})
+    assert [p["name"] for p in listado.json()["data"]["parcels"]] == ["Cabe"]
+    assert listado.json()["data"]["company"]["over_limit"] is False
+    # Tampoco por archivo.
+    archivo = client.post(
+        "/api/compat/admin/parcels/upload",
+        headers=_auth(admin),
+        data={"name": "Finca", "company_id": company_id},
+        files={"file": ("lotes.kml", KML_DOS_IGUALES.encode(), "application/vnd.google-earth.kml+xml")},
+    )
+    assert archivo.status_code == 400
+    listado = client.get("/api/compat/admin/parcels/company", headers=_auth(admin), params={"company_id": company_id})
+    assert len(listado.json()["data"]["parcels"]) == 1
+
+
+def test_sin_limite_definido_no_se_bloquea(client, admin):
+    company_id = _limited_company(client, admin, 0)
+    assert _manual(client, admin, company_id, "A", 0.30).status_code == 200
+    assert _manual(client, admin, company_id, "B", 0.32).status_code == 200
+
+
+def test_una_empresa_ya_excedida_puede_actualizar_sin_crecer(client, admin):
+    company_id = _limited_company(client, admin, 150)
+    assert _manual(client, admin, company_id, "Uno", 0.40).status_code == 200
+    with compat.LOCK:
+        db = compat.read_db()
+        next(c for c in compat.table(db, "companies") if c["id"] == company_id)["max_hectares"] = 10
+        compat.write_db(db)
+    # Re-subir el mismo lote no aumenta lo usado: se permite.
+    assert _manual(client, admin, company_id, "Uno", 0.40).status_code == 200
+    assert _manual(client, admin, company_id, "Dos", 0.42).status_code == 400
+
+
+def test_las_hectareas_por_usuario_ya_no_limitan_el_alta(client, admin):
+    company_id = _limited_company(client, admin, 1)
+    response = client.post(
+        "/api/compat/admin/users/manual",
+        headers=_auth(admin),
+        json={
+            "email": f"u-{uuid.uuid4().hex[:6]}@cliente.com",
+            "password": PASSWORD,
+            "company_id": company_id,
+            "assigned_hectares": 5000,
+        },
+    )
+    assert response.status_code == 200, response.text

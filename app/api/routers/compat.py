@@ -1171,6 +1171,86 @@ def company_parcels(db: Dict[str, Any], company_id: str) -> List[Dict[str, Any]]
     return [row for row in table(db, "parcels") if company_id and str(row.get("company_id") or "") == str(company_id)]
 
 
+_COMPANY_AREAS_CACHE: Dict[str, Any] = {"key": None, "areas": {}}
+
+
+def company_areas(db: Dict[str, Any]) -> Dict[str, float]:
+    """Hectáreas reales de cada empresa: el área de sus lotes (una vez cada lote).
+
+    Es lo que se descuenta de su límite (`max_hectares`). Antes se descontaba
+    la suma de las «hectáreas asignadas» escritas a mano a cada usuario, que no
+    tenía nada que ver con lo cargado (hallazgo H10: Summagro usaba 20.000 ha
+    con un límite de 1.000 y nada lo impedía).
+    """
+    key = (id(db), STATE_CACHE_VERSION, len(table(db, "parcels")))
+    if _COMPANY_AREAS_CACHE["key"] == key:
+        return _COMPANY_AREAS_CACHE["areas"]
+    areas: Dict[str, float] = {}
+    for row in dedupe_user_parcels(r for r in table(db, "parcels") if r.get("company_id")):
+        try:
+            area = float(row.get("area") or 0)
+        except (TypeError, ValueError):
+            area = 0.0
+        cid = str(row.get("company_id"))
+        areas[cid] = areas.get(cid, 0.0) + area
+    areas = {cid: round(value, 2) for cid, value in areas.items()}
+    _COMPANY_AREAS_CACHE.update(key=key, areas=areas)
+    return areas
+
+
+def company_used_hectares(db: Dict[str, Any], company_id: str) -> float:
+    return company_areas(db).get(str(company_id), 0.0)
+
+
+def company_hectare_limit(company: Optional[Dict[str, Any]]) -> Optional[float]:
+    """Límite de la empresa; 0 o vacío es «sin límite definido»."""
+    try:
+        value = float((company or {}).get("max_hectares") or 0)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _fresh_company_used_hectares(db: Dict[str, Any], company_id: str) -> float:
+    total = 0.0
+    for row in dedupe_user_parcels(company_parcels(db, company_id)):
+        try:
+            total += float(row.get("area") or 0)
+        except (TypeError, ValueError):
+            continue
+    return round(total, 2)
+
+
+def enforce_company_hectare_limit(db: Dict[str, Any], company_id: Optional[str], used_before: float) -> None:
+    """Rechaza una carga que deja a la empresa por encima de su límite.
+
+    Se llama con los lotes ya aplicados en memoria y antes de `write_db`: si se
+    pasa, se descarta la caché (nada llega a guardarse) y se explica cuánto
+    queda libre. Solo bloquea si la carga AUMENTA lo usado: una empresa que ya
+    estaba por encima puede seguir actualizando o reduciendo sus lotes.
+    """
+    if not company_id:
+        return
+    company = next((c for c in table(db, "companies") if str(c.get("id")) == str(company_id)), None)
+    limit = company_hectare_limit(company)
+    if limit is None:
+        return
+    used_after = _fresh_company_used_hectares(db, company_id)
+    if used_after <= limit + 1e-6 or used_after <= used_before + 1e-6:
+        return
+    invalidate_state_cache()
+    free = max(0.0, limit - used_before)
+    added = used_after - used_before
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"La carga supera el límite de hectáreas de {(company or {}).get('name') or 'la empresa'}: "
+            f"añade {added:,.2f} ha y solo quedan {free:,.2f} ha libres "
+            f"(usa {used_before:,.2f} de {limit:,.2f} ha). Sube el límite en Empresas si el contrato lo permite."
+        ),
+    )
+
+
 COMPANY_PARCEL_OWNER_FIELD = "parcel_owner_user_id"
 
 
@@ -1652,6 +1732,9 @@ def enrich(db: Dict[str, Any], table_name: str, row: Dict[str, Any]) -> Dict[str
     tables = db.get("tables", {})
     if table_name == "company_modules":
         r["platform_modules"] = next((m for m in tables.get("platform_modules", []) if m.get("id") == r.get("module_id")), None)
+    if table_name == "companies":
+        # Lo usado es el área real de sus lotes, no un contador escrito a mano.
+        r["used_hectares"] = company_used_hectares(db, str(r.get("id")))
     if table_name == "field_notes" and r.get("parcel_id"):
         parcel = next((p for p in tables.get("parcels", []) if p.get("id") == r.get("parcel_id")), None)
         if parcel:
@@ -1669,7 +1752,7 @@ def enrich(db: Dict[str, Any], table_name: str, row: Dict[str, Any]) -> Dict[str
             r.setdefault("companies", {
                 "name": company.get("name"),
                 "max_hectares": company.get("max_hectares"),
-                "used_hectares": company.get("used_hectares"),
+                "used_hectares": company_used_hectares(db, str(company.get("id"))),
             })
     if table_name == "extension_requests":
         module = next((m for m in tables.get("platform_modules", []) if m.get("id") == r.get("extension_id")), None)
@@ -2162,7 +2245,9 @@ def create_manual_admin_user(
         if not is_super_admin and admin_role in {"superadmin", "company_admin"}:
             admin_role = "company_user"
 
-        assigned_hectares = float(payload.get("assigned_hectares") or 0)
+        # Las hectáreas ya no se reparten por usuario: el límite es de la
+        # empresa y se mide con el área real de sus lotes (hallazgo H10).
+        assigned_hectares = 0.0
         is_active = bool(payload.get("is_active", True))
         first_name = str(payload.get("first_name") or "").strip() or None
         last_name = str(payload.get("last_name") or "").strip() or None
@@ -2181,12 +2266,6 @@ def create_manual_admin_user(
                 status_code=400,
                 detail="No se pueden crear usuarios reales en la empresa de demostración comercial",
             )
-
-        if company:
-            used = float(company.get("used_hectares") or 0)
-            max_hectares = float(company.get("max_hectares") or 0)
-            if assigned_hectares > max(0, max_hectares - used):
-                raise HTTPException(status_code=400, detail="Las hectáreas asignadas superan el disponible de la empresa")
 
         if company_id:
             # El paquete de la empresa es el techo, también para el superadmin:
@@ -2287,9 +2366,6 @@ def create_manual_admin_user(
                 "updated_at": t,
             })
 
-        if company:
-            company["used_hectares"] = float(company.get("used_hectares") or 0) + assigned_hectares
-            company["updated_at"] = t
 
         write_db(db)
 
@@ -3332,6 +3408,7 @@ async def store_parcel_file_for_user(
         upload_summary = {"created": 0, "updated": 0, "renamed": 0}
         with LOCK:
             db = read_db()
+            used_before = _fresh_company_used_hectares(db, company_id) if company_id else 0.0
             for item in parcels_data:
                 row = normalize_record_geometries("parcels", {
                     "id": str(uuid.uuid4()),
@@ -3378,6 +3455,7 @@ async def store_parcel_file_for_user(
                 this_upload.add(str(saved.get("id")))
                 upload_summary[outcome] += 1
                 created_rows.append(saved)
+            enforce_company_hectare_limit(db, company_id, used_before)
             write_db(db)
         if summary is not None:
             summary.update(upload_summary)
@@ -3468,7 +3546,9 @@ def create_manual_parcel_for_user(
         raise HTTPException(status_code=400, detail="El polígono dibujado no es válido. Revisa los puntos e intenta nuevamente.")
     with LOCK:
         db = read_db()
+        used_before = _fresh_company_used_hectares(db, company_id) if company_id else 0.0
         row = upsert_user_parcel(db, owner["id"], row)
+        enforce_company_hectare_limit(db, company_id, used_before)
         write_db(db)
     return row
 
