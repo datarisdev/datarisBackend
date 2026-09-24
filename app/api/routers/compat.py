@@ -1057,8 +1057,81 @@ def parcel_lot_key(row: Dict[str, Any]) -> str:
     return normalize_lot_key(row.get("lote"), row.get("codigo"), row.get("name"))
 
 
+def parcel_scope_key(row: Dict[str, Any]) -> str:
+    """A quién pertenece un lote.
+
+    Los lotes son de la EMPRESA: los que llevan `company_id` los ven todos los
+    usuarios de esa empresa. Los que se cargaron antes del cambio no lo llevan y
+    siguen siendo de su usuario (`user_id`) hasta que se migren.
+    """
+    company_id = str(row.get("company_id") or "")
+    if company_id:
+        return f"company:{company_id}"
+    return f"user:{row.get('user_id') or ''}"
+
+
+def parcel_visible_to(row: Dict[str, Any], user_id: str, company_id: Optional[str]) -> bool:
+    row_company = str(row.get("company_id") or "")
+    if row_company:
+        return bool(company_id) and row_company == str(company_id)
+    return str(row.get("user_id") or "") == str(user_id)
+
+
+def visible_parcels(db: Dict[str, Any], user_id: str) -> List[Dict[str, Any]]:
+    """Lotes que ve un usuario: los de su empresa más los suyos sin migrar."""
+    company_id = _company_for_user(db, user_id)
+    return [row for row in table(db, "parcels") if parcel_visible_to(row, user_id, company_id)]
+
+
+def parcel_accessible(db: Dict[str, Any], row: Dict[str, Any], user_id: str) -> bool:
+    """Acceso de un usuario a un lote concreto (los lotes sin dueño quedan abiertos, como antes)."""
+    if not row.get("user_id") and not row.get("company_id"):
+        return True
+    return parcel_visible_to(row, user_id, _company_for_user(db, user_id))
+
+
 def user_parcel_ids(db: Dict[str, Any], user_id: str) -> set[str]:
-    return {str(row.get("id")) for row in table(db, "parcels") if str(row.get("user_id") or "") == user_id and row.get("id")}
+    return {str(row.get("id")) for row in visible_parcels(db, user_id) if row.get("id")}
+
+
+def company_parcels(db: Dict[str, Any], company_id: str) -> List[Dict[str, Any]]:
+    return [row for row in table(db, "parcels") if company_id and str(row.get("company_id") or "") == str(company_id)]
+
+
+def company_parcel_owner(db: Dict[str, Any], company_id: str) -> Optional[Dict[str, Any]]:
+    """Usuario titular de los lotes de una empresa.
+
+    Los lotes de empresa se guardan a su nombre (`user_id`) porque la
+    sincronización con Graniot trabaja con una cuenta por usuario: así toda la
+    empresa comparte una sola cuenta de Graniot, la del titular. Es el usuario
+    del correo de la empresa; si no existe, su primer administrador activo; y si
+    tampoco, cualquier usuario activo de la empresa.
+    """
+    if not company_id:
+        return None
+    company = next((c for c in table(db, "companies") if str(c.get("id")) == str(company_id)), None)
+    users = [u for u in db.get("users", []) if u.get("is_active", True) is not False]
+    by_id = {str(u.get("id")): u for u in users}
+    company_email = str((company or {}).get("email") or "").strip().lower()
+    if company_email:
+        titular = next((u for u in users if str(u.get("email") or "").strip().lower() == company_email), None)
+        if titular and str(_company_for_user(db, str(titular.get("id"))) or "") == str(company_id):
+            return titular
+    admins = sorted(
+        (
+            a
+            for a in table(db, "admin_users")
+            if str(a.get("company_id") or "") == str(company_id) and a.get("is_active", True) and str(a.get("user_id")) in by_id
+        ),
+        key=lambda a: (a.get("admin_role") != "company_admin", str(a.get("created_at") or "")),
+    )
+    if admins:
+        return by_id[str(admins[0].get("user_id"))]
+    members = sorted(
+        (u for u in users if str(_company_for_user(db, str(u.get("id"))) or "") == str(company_id)),
+        key=lambda u: str(u.get("created_at") or ""),
+    )
+    return members[0] if members else None
 
 
 def _company_for_user(db: Dict[str, Any], user_id: str) -> Optional[str]:
@@ -1250,6 +1323,9 @@ def scoped_table_rows(db: Dict[str, Any], table_name: str, user: Optional[Dict[s
 
     if table_name == "admin_users":
         return [row for row in rows if str(row.get("user_id") or "") == user_id]
+    if table_name == "parcels":
+        company_id = _company_for_user(db, user_id)
+        return [row for row in rows if parcel_visible_to(row, user_id, company_id)]
     if table_name in PARCEL_CHILD_TABLES:
         allowed_parcels = user_parcel_ids(db, user_id)
         return [
@@ -1299,7 +1375,7 @@ def scoped_table_rows(db: Dict[str, Any], table_name: str, user: Optional[Dict[s
 def dedupe_user_parcels(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     by_key: Dict[str, Dict[str, Any]] = {}
     for row in rows:
-        key = f"{row.get('user_id') or ''}:{parcel_lot_key(row) or row.get('id') or id(row)}"
+        key = f"{parcel_scope_key(row)}:{parcel_lot_key(row) or row.get('id') or id(row)}"
         current = by_key.get(key)
         if current is None or str(row.get("updated_at") or row.get("created_at") or "") >= str(current.get("updated_at") or current.get("created_at") or ""):
             by_key[key] = row
@@ -1344,7 +1420,7 @@ def _parcel_geometry_shape(row: Dict[str, Any]):
 
 
 def _find_geometric_duplicate(
-    rows: List[Dict[str, Any]], row: Dict[str, Any], user_id: str, iou_threshold: float = 0.95
+    rows: List[Dict[str, Any]], row: Dict[str, Any], scope: str, iou_threshold: float = 0.95
 ) -> Optional[Dict[str, Any]]:
     """Lote del usuario con geometría casi idéntica al entrante (re-subida).
 
@@ -1359,7 +1435,7 @@ def _find_geometric_duplicate(
         return None
     incoming_shape = None
     for existing in rows:
-        if str(existing.get("user_id") or "") != user_id:
+        if parcel_scope_key(existing) != scope:
             continue
         existing_box = _parcel_bbox(existing)
         if existing_box is None:
@@ -1385,9 +1461,16 @@ def _find_geometric_duplicate(
 
 
 def find_existing_user_parcel(rows: List[Dict[str, Any]], row: Dict[str, Any], user_id: str) -> Optional[Dict[str, Any]]:
+    """Lote ya guardado que corresponde al entrante, dentro del mismo dueño.
+
+    El dueño es la empresa si el lote entrante lleva `company_id` y el usuario
+    si no: un lote de empresa nunca se funde con uno personal ni con el de otra
+    empresa.
+    """
     row_key = parcel_lot_key(row)
+    scope = parcel_scope_key({**row, "user_id": row.get("user_id") or user_id})
     for existing in rows:
-        if str(existing.get("user_id") or "") != user_id:
+        if parcel_scope_key(existing) != scope:
             continue
         if row.get("id") and str(existing.get("id")) == str(row.get("id")):
             return existing
@@ -1397,7 +1480,7 @@ def find_existing_user_parcel(rows: List[Dict[str, Any]], row: Dict[str, Any], u
     # lote resubido con otro nombre). Al encontrarlo, upsert_user_parcel lo
     # actualiza en sitio y conserva su vínculo con Graniot, en vez de crear otra
     # parcela que dejaría la anterior huérfana en el portal.
-    return _find_geometric_duplicate(rows, row, user_id)
+    return _find_geometric_duplicate(rows, row, scope)
 
 
 def upsert_user_parcel(db: Dict[str, Any], user_id: str, row: Dict[str, Any]) -> Dict[str, Any]:
@@ -1876,7 +1959,20 @@ def delete_auth_user(user_id: str, authorization: Optional[str] = Header(default
             raise HTTPException(status_code=403, detail="Solo un superadministrador puede eliminar usuarios")
         db["users"] = [u for u in db["users"] if u.get("id") != user_id]
         for name, rows in db["tables"].items():
-            db["tables"][name] = [r for r in rows if r.get("user_id") != user_id and r.get("id") != user_id]
+            # Los lotes de empresa no se van con el usuario: son de toda la
+            # empresa aunque estén a nombre de su titular.
+            db["tables"][name] = [
+                r
+                for r in rows
+                if (r.get("user_id") != user_id and r.get("id") != user_id)
+                or (name == "parcels" and r.get("company_id"))
+            ]
+        # Si era el titular de su empresa, sus lotes pasan al nuevo titular para
+        # que sigan teniendo una cuenta con la que operar en Graniot.
+        for row in table(db, "parcels"):
+            if row.get("company_id") and row.get("user_id") == user_id:
+                heir = company_parcel_owner(db, str(row.get("company_id")))
+                row["user_id"] = heir.get("id") if heir else None
         write_db(db)
     return {"data": {"ok": True}, "error": None}
 
@@ -2744,7 +2840,10 @@ def update(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict)
         targets = admin_users_rows_in_scope(db, table_name, actor, targets)
         for row in targets:
             row.update(normalize_record_geometries(table_name, payload.get("data") or {}))
-            if table_name in USER_SCOPED_TABLES and user and "user_id" in row:
+            # Un lote de empresa sigue a nombre de su titular: editarlo no lo pasa
+            # a quien lo edita (cambiaría la cuenta de Graniot en la que vive).
+            company_parcel = table_name == "parcels" and row.get("company_id")
+            if table_name in USER_SCOPED_TABLES and user and "user_id" in row and not company_parcel:
                 row["user_id"] = user["id"]
             row["updated_at"] = now()
             row.update(normalize_record_geometries(table_name, row))
@@ -3069,8 +3168,14 @@ async def store_parcel_file_for_user(
     owner: Dict[str, Any],
     file: UploadFile,
     name: str,
+    company_id: Optional[str] = None,
+    uploaded_by: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Guarda el archivo geográfico y registra sus lotes a nombre de `owner`."""
+    """Guarda el archivo geográfico y registra sus lotes a nombre de `owner`.
+
+    Con `company_id` los lotes son de la empresa (los ve todo su equipo) y
+    `owner` es su titular, la cuenta con la que se sincronizan en Graniot.
+    """
     if not name.strip():
         raise HTTPException(status_code=400, detail="Nombre de parcela requerido")
     if not file.filename:
@@ -3078,7 +3183,8 @@ async def store_parcel_file_for_user(
 
     ensure_storage()
     clean_original = Path(file.filename.replace("..", "_")).name
-    storage_path = Path(owner["id"]) / f"{int(datetime.now(timezone.utc).timestamp())}-{clean_original}"
+    storage_owner = f"company-{company_id}" if company_id else owner["id"]
+    storage_path = Path(storage_owner) / f"{int(datetime.now(timezone.utc).timestamp())}-{clean_original}"
     dest = FILES / "parcels" / storage_path
     dest.parent.mkdir(parents=True, exist_ok=True)
 
@@ -3120,6 +3226,7 @@ async def store_parcel_file_for_user(
                     "file_url": public_url,
                     "created_at": t,
                     "updated_at": t,
+                    **_parcel_ownership(company_id, uploaded_by),
                 })
                 created_rows.append(upsert_user_parcel(db, owner["id"], row))
             write_db(db)
@@ -3154,8 +3261,23 @@ async def store_parcel_file_for_user(
         raise HTTPException(status_code=500, detail=f"Error subiendo parcela: {raw_message}")
 
 
-def create_manual_parcel_for_user(owner: Dict[str, Any], name: str, geometry: Any) -> Dict[str, Any]:
-    """Registra a nombre de `owner` un lote dibujado sobre el mapa."""
+def _parcel_ownership(company_id: Optional[str], uploaded_by: Optional[str]) -> Dict[str, Any]:
+    extra: Dict[str, Any] = {}
+    if company_id:
+        extra["company_id"] = str(company_id)
+    if uploaded_by:
+        extra["uploaded_by"] = str(uploaded_by)
+    return extra
+
+
+def create_manual_parcel_for_user(
+    owner: Dict[str, Any],
+    name: str,
+    geometry: Any,
+    company_id: Optional[str] = None,
+    uploaded_by: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Registra a nombre de `owner` un lote dibujado sobre el mapa (de su empresa si llega `company_id`)."""
     clean_name = str(name or "").strip()
     if not clean_name:
         raise HTTPException(status_code=400, detail="Nombre de lote requerido")
@@ -3172,6 +3294,7 @@ def create_manual_parcel_for_user(owner: Dict[str, Any], name: str, geometry: An
         "source": "manual_map",
         "created_at": t,
         "updated_at": t,
+        **_parcel_ownership(company_id, uploaded_by),
     })
     if not row.get("geometry_geojson") or not row.get("area"):
         raise HTTPException(status_code=400, detail="El polígono dibujado no es válido. Revisa los puntos e intenta nuevamente.")

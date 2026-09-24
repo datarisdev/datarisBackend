@@ -58,8 +58,18 @@ def assert_parcel_access(db: Session, parcel_id: UUID, current_user: dict[str, A
     if not parcel:
         raise HTTPException(status_code=404, detail="Parcela no encontrada")
     if str(parcel.user_id) != str(current_user["id"]) and not _is_admin(current_user):
-        raise HTTPException(status_code=403, detail="Sin acceso a esta parcela")
+        if not _company_shares_parcel(parcel_id, current_user):
+            raise HTTPException(status_code=403, detail="Sin acceso a esta parcela")
     return parcel
+
+
+def _company_shares_parcel(parcel_id: UUID, current_user: dict[str, Any]) -> bool:
+    """Los lotes de empresa (compat) los trabaja cualquier usuario de esa empresa."""
+    from app.api.routers import compat as compat_store
+
+    state = compat_store.read_db()
+    row = next((p for p in compat_store.table(state, "parcels") if str(p.get("id")) == str(parcel_id)), None)
+    return bool(row and row.get("company_id")) and compat_store.parcel_accessible(state, row, str(current_user["id"]))
 
 
 def assert_cycle_access(db: Session, cycle_id: UUID, current_user: dict[str, Any]) -> CropCycle:

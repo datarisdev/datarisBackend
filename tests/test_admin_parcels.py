@@ -4,8 +4,9 @@ Cubre las dos mitades del cambio:
 
 * el cliente ya no puede dar de alta ni borrar sus lotes (ni por los endpoints
   de carga ni por el API genérico de tablas), y
-* las cuentas del panel de Dataris (las de la lista blanca) sí pueden hacerlo en
-  nombre de cualquier usuario de cualquier empresa, sin ningún permiso por fila.
+* las cuentas del panel de Dataris (las de la lista blanca) sí pueden hacerlo
+  para cualquier empresa, sin ningún permiso por fila. Los lotes son de la
+  empresa: los ve todo su equipo.
   Los permisos por fila antiguos (`can_manage_parcels`, `can_manage_all_parcels`)
   ya no abren nada por sí solos, tampoco las rutas de Graniot.
 """
@@ -205,43 +206,138 @@ def test_el_cliente_no_puede_concederse_el_permiso(client: TestClient, admin_tok
 # --- El equipo de Dataris sí ----------------------------------------------
 
 
-def test_el_superadmin_carga_lotes_para_un_usuario(client: TestClient, admin_token: str):
-    email = _client_email()
-    user_id = _create_user(client, admin_token, email=email)
-    client_token = _sign_in(client, email, "Lotes2026!")
+def test_el_superadmin_carga_lotes_para_una_empresa(client: TestClient, admin_token: str):
+    company_id = _create_company(client, admin_token, f"Empresa Lotes {uuid.uuid4().hex[:6]}")
+    titular_email = _client_email("titular")
+    titular_id = _create_user(client, admin_token, email=titular_email, company_id=company_id, admin_role="company_admin")
+    colega_email = _client_email("colega")
+    _create_user(client, admin_token, email=colega_email, company_id=company_id)
+    ajeno_email = _client_email("ajeno")
+    _create_user(client, admin_token, email=ajeno_email, company_id=_create_company(client, admin_token, f"Otra {uuid.uuid4().hex[:6]}"))
 
     created = client.post(
         "/api/compat/admin/parcels/manual",
         headers=_auth(admin_token),
-        json={"user_id": user_id, "name": "Lote administrado", "geometry": polygon(0.20)},
+        json={"company_id": company_id, "name": "Lote administrado", "geometry": polygon(0.20)},
     )
     assert created.status_code == 200, created.text
     parcel = created.json()["data"]["parcel"]
-    assert parcel["user_id"] == user_id
+    assert parcel["company_id"] == company_id
+    # A nombre del titular: es la cuenta con la que la empresa vive en Graniot.
+    assert parcel["user_id"] == titular_id
     assert parcel["area"] > 0
 
-    # El dueño lo ve como propio aunque no lo haya cargado él.
-    assert [p["id"] for p in _parcels_of(client, client_token)] == [parcel["id"]]
+    # Lo ve toda la empresa, aunque ninguno lo haya cargado, y nadie de fuera.
+    for email in (titular_email, colega_email):
+        assert [p["id"] for p in _parcels_of(client, _sign_in(client, email, "Lotes2026!"))] == [parcel["id"]]
+    assert _parcels_of(client, _sign_in(client, ajeno_email, "Lotes2026!")) == []
 
     listed = client.get(
-        "/api/compat/admin/parcels/list",
+        "/api/compat/admin/parcels/company",
         headers=_auth(admin_token),
-        params={"user_id": user_id},
+        params={"company_id": company_id},
     )
     assert listed.status_code == 200, listed.text
     body = listed.json()["data"]
-    assert body["user"]["email"] == email
-    assert body["user"]["parcel_count"] == 1
+    assert body["company"]["parcel_count"] == 1
+    assert body["company"]["member_count"] == 2
+    assert body["company"]["owner"]["id"] == titular_id
     assert [p["id"] for p in body["parcels"]] == [parcel["id"]]
+
+    companies = client.get("/api/compat/admin/parcels/companies", headers=_auth(admin_token))
+    assert companies.status_code == 200, companies.text
+    resumen = next(c for c in companies.json()["data"]["companies"] if c["id"] == company_id)
+    assert resumen["parcel_count"] == 1 and resumen["total_area"] > 0
 
     removed = client.post(
         "/api/compat/admin/parcels/delete",
         headers=_auth(admin_token),
-        json={"user_id": user_id, "ids": [parcel["id"]]},
+        json={"company_id": company_id, "ids": [parcel["id"]]},
     )
     assert removed.status_code == 200, removed.text
     assert removed.json()["data"]["count"] == 1
-    assert _parcels_of(client, client_token) == []
+    assert _parcels_of(client, _sign_in(client, colega_email, "Lotes2026!")) == []
+
+
+def test_cargar_indicando_un_usuario_lo_guarda_en_su_empresa(client: TestClient, admin_token: str):
+    # Compatibilidad con el panel anterior: si solo llega `user_id`, el lote
+    # va a la empresa de ese usuario.
+    company_id = _create_company(client, admin_token, f"Empresa U {uuid.uuid4().hex[:6]}")
+    user_id = _create_user(client, admin_token, email=_client_email(), company_id=company_id)
+
+    created = client.post(
+        "/api/compat/admin/parcels/manual",
+        headers=_auth(admin_token),
+        json={"user_id": user_id, "name": "Lote por usuario", "geometry": polygon(0.21)},
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["data"]["parcel"]["company_id"] == company_id
+
+
+def test_una_empresa_sin_usuarios_no_admite_lotes(client: TestClient, admin_token: str):
+    company_id = _create_company(client, admin_token, f"Vacia {uuid.uuid4().hex[:6]}")
+    response = client.post(
+        "/api/compat/admin/parcels/manual",
+        headers=_auth(admin_token),
+        json={"company_id": company_id, "name": "Sin dueño", "geometry": polygon(0.22)},
+    )
+    assert response.status_code == 409
+    assert "ningún usuario activo" in response.json()["detail"]
+
+
+def test_los_lotes_anteriores_siguen_siendo_de_su_usuario(client: TestClient, admin_token: str):
+    # Los lotes cargados antes del cambio no llevan company_id: hasta migrarlos,
+    # solo los ve su usuario y el panel los cuenta aparte.
+    company_id = _create_company(client, admin_token, f"Empresa L {uuid.uuid4().hex[:6]}")
+    dueno_email = _client_email("dueno")
+    dueno_id = _create_user(client, admin_token, email=dueno_email, company_id=company_id)
+    colega_email = _client_email("colega")
+    _create_user(client, admin_token, email=colega_email, company_id=company_id)
+
+    legacy_id = str(uuid.uuid4())
+    with compat.LOCK:
+        db = compat.read_db()
+        compat.table(db, "parcels").append(
+            compat.normalize_record_geometries(
+                "parcels",
+                {"id": legacy_id, "user_id": dueno_id, "name": "Lote viejo", "geometry": polygon(0.23), "created_at": compat.now()},
+            )
+        )
+        compat.write_db(db)
+
+    assert [p["id"] for p in _parcels_of(client, _sign_in(client, dueno_email, "Lotes2026!"))] == [legacy_id]
+    assert _parcels_of(client, _sign_in(client, colega_email, "Lotes2026!")) == []
+
+    listed = client.get("/api/compat/admin/parcels/list", headers=_auth(admin_token), params={"user_id": dueno_id})
+    assert [p["id"] for p in listed.json()["data"]["parcels"]] == [legacy_id]
+
+    detalle = client.get("/api/compat/admin/parcels/company", headers=_auth(admin_token), params={"company_id": company_id})
+    empresa = detalle.json()["data"]["company"]
+    assert empresa["parcel_count"] == 0
+    assert empresa["legacy_parcel_count"] == 1
+    assert empresa["legacy_user_count"] == 1
+
+
+def test_borrar_un_usuario_no_se_lleva_los_lotes_de_la_empresa(client: TestClient, admin_token: str):
+    company_id = _create_company(client, admin_token, f"Empresa B {uuid.uuid4().hex[:6]}")
+    titular_id = _create_user(client, admin_token, email=_client_email("titular"), company_id=company_id, admin_role="company_admin")
+    colega_email = _client_email("colega")
+    colega_id = _create_user(client, admin_token, email=colega_email, company_id=company_id)
+
+    created = client.post(
+        "/api/compat/admin/parcels/manual",
+        headers=_auth(admin_token),
+        json={"company_id": company_id, "name": "Lote compartido", "geometry": polygon(0.24)},
+    )
+    parcel_id = created.json()["data"]["parcel"]["id"]
+
+    removed = client.delete(f"/api/compat/auth/admin/users/{titular_id}", headers=_auth(admin_token))
+    assert removed.status_code == 200, removed.text
+    assert [p["id"] for p in _parcels_of(client, _sign_in(client, colega_email, "Lotes2026!"))] == [parcel_id]
+    # El lote pasa al nuevo titular, para seguir teniendo cuenta en Graniot.
+    db = compat.read_db(force_refresh=True)
+    row = next(r for r in compat.table(db, "parcels") if r.get("id") == parcel_id)
+    assert row["user_id"] == colega_id
 
 
 def test_el_listado_de_usuarios_incluye_a_los_gestionables(client: TestClient, admin_token: str):
@@ -324,28 +420,30 @@ def test_los_permisos_por_fila_ya_no_abren_la_gestion_de_lotes(client: TestClien
     assert unsync.status_code == 403, unsync.text
 
 
-def test_no_se_borran_lotes_de_otro_usuario(client: TestClient, admin_token: str):
-    dueno_id = _create_user(client, admin_token, email=_client_email("dueno"))
-    otro_id = _create_user(client, admin_token, email=_client_email("otro"))
+def test_no_se_borran_lotes_de_otra_empresa(client: TestClient, admin_token: str):
+    company_a = _create_company(client, admin_token, f"Empresa A {uuid.uuid4().hex[:6]}")
+    company_b = _create_company(client, admin_token, f"Empresa B {uuid.uuid4().hex[:6]}")
+    _create_user(client, admin_token, email=_client_email("a"), company_id=company_a)
+    _create_user(client, admin_token, email=_client_email("b"), company_id=company_b)
 
     created = client.post(
         "/api/compat/admin/parcels/manual",
         headers=_auth(admin_token),
-        json={"user_id": dueno_id, "name": "Lote intacto", "geometry": polygon(0.50)},
+        json={"company_id": company_a, "name": "Lote intacto", "geometry": polygon(0.50)},
     )
     parcel_id = created.json()["data"]["parcel"]["id"]
 
     response = client.post(
         "/api/compat/admin/parcels/delete",
         headers=_auth(admin_token),
-        json={"user_id": otro_id, "ids": [parcel_id]},
+        json={"company_id": company_b, "ids": [parcel_id]},
     )
     assert response.status_code == 404
 
     listed = client.get(
-        "/api/compat/admin/parcels/list",
+        "/api/compat/admin/parcels/company",
         headers=_auth(admin_token),
-        params={"user_id": dueno_id},
+        params={"company_id": company_a},
     )
     assert [p["id"] for p in listed.json()["data"]["parcels"]] == [parcel_id]
 

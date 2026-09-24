@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
-from app.api.routers.compat import read_db, table
+from app.api.routers.compat import read_db, table, visible_parcels
 from app.services.sentinel2.history import representative_satellite_comparison_side, satellite_comparison_sides
 from app.utils.geojson_normalizer import geometry_bounds as _geojson_bounds
 from app.api.routers.dashboard import (
@@ -324,7 +324,8 @@ def build_work_area_layers_response(
     # con rol "admin" en el JSON-db vean datos del tenant demo u otros usuarios.
     wanted = {s.strip().lower() for s in sources.split(",")} if sources else {"aerial", "mapeo", "satellite"}
 
-    parcels = _scoped_rows(db, "parcels", user_id, False)
+    # Los análisis son personales, pero los lotes son de la empresa.
+    parcels = [dict(row) for row in visible_parcels(db, user_id)]
     parcel_by_id = _parcel_lookup(parcels)
 
     layers: List[Dict[str, Any]] = []

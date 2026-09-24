@@ -11,7 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from fastapi import APIRouter, Depends
 
 from app.api.deps import get_current_user
-from app.api.routers.compat import get_state_cache_version, read_db, table
+from app.api.routers.compat import get_state_cache_version, read_db, table, visible_parcels
 from app.services.sentinel2.history import representative_satellite_comparison_side, satellite_comparison_sides
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
@@ -597,7 +597,9 @@ def dashboard_summary(force_refresh: bool = False, current_user: Any = Depends(g
     # autenticado. Las vistas administrativas globales se mantienen separadas.
     admin_mode = False
 
-    parcels = _dedupe_parcels(_scoped_rows(db, "parcels", user_id, admin_mode))
+    # Los lotes son de la empresa: el resumen cuenta los que ve el usuario
+    # (los de su empresa más los suyos aún sin migrar).
+    parcels = _dedupe_parcels(dict(row) for row in visible_parcels(db, user_id))
     parcel_ids = {str(row.get("id")) for row in parcels if row.get("id")}
     satellite_comparisons = _scoped_rows(db, "satellite_comparisons", user_id, admin_mode)
     satellite_jobs = _scoped_rows(db, "satellite_jobs", user_id, admin_mode)

@@ -31,10 +31,12 @@ from PIL import Image, ImageDraw
 
 from app.api.routers.compat import (
     LOCK,
+    _company_for_user,
     bearer_user,
     dedupe_user_parcels,
     now,
     parcel_manager_covers_user,
+    parcel_visible_to,
     parcel_manager_permission,
     read_db,
     require_admin_context,
@@ -1608,6 +1610,42 @@ def _run_in_background_thread(name: str, target: Any, *args: Any) -> None:
     thread = threading.Thread(target=_runner, name=name, daemon=False)
     _WMS_STORE_THREADS.append(thread)
     thread.start()
+
+
+def _visible_local_parcel(db: Dict[str, Any], parcel_id: Any, user: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Lote local que el usuario puede ver: suyo o de su empresa."""
+    user_id = str((user or {}).get("id") or "")
+    company_id = _company_for_user(db, user_id) if user_id else None
+    return next(
+        (p for p in table(db, "parcels") if p.get("id") == parcel_id and parcel_visible_to(p, user_id, company_id)),
+        None,
+    )
+
+
+def _lot_owner_in(db: Dict[str, Any], local: Dict[str, Any], user: Dict[str, Any]) -> Dict[str, Any]:
+    """Persona a cuyo nombre está el lote: la cuenta de Graniot en la que vive.
+
+    Un lote de empresa está a nombre de su titular; quien lo consulta puede ser
+    cualquier otro usuario de la empresa, pero sincronizar o borrar en Graniot
+    se hace siempre con la cuenta del titular.
+    """
+    owner_id = str((local or {}).get("user_id") or "")
+    if not owner_id or owner_id == str((user or {}).get("id") or ""):
+        return user
+    return next((u for u in db.get("users", []) if str(u.get("id") or "") == owner_id), None) or user
+
+
+def _lot_row_for_owner(db: Dict[str, Any], parcel_id: Any, user_id: Any) -> Optional[Dict[str, Any]]:
+    """Fila del lote para escrituras internas, tras validar el acceso: la del
+    usuario o, si es un lote de empresa, la de la empresa."""
+    return next(
+        (
+            p
+            for p in table(db, "parcels")
+            if p.get("id") == parcel_id and (p.get("user_id") == user_id or p.get("company_id"))
+        ),
+        None,
+    )
 
 
 def _owner_user_for_local(local: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -4531,7 +4569,11 @@ async def sync_local_parcel_to_graniot(
 
     with LOCK:
         db = read_db()
-        local = next((p for p in table(db, "parcels") if p.get("id") == parcel_id and p.get("user_id") == user["id"]), None)
+        local = _visible_local_parcel(db, parcel_id, user)
+        # Un lote de empresa se sincroniza con la cuenta de su titular, no con
+        # la de quien lo abre.
+        if local:
+            user = _lot_owner_in(db, local, user)
     if not local:
         raise HTTPException(status_code=404, detail="Lote local no encontrado")
 
@@ -4701,7 +4743,7 @@ async def sync_local_parcel_to_graniot(
         t = now()
         with LOCK:
             db = read_db()
-            row = next((p for p in table(db, "parcels") if p.get("id") == parcel_id and p.get("user_id") == user["id"]), None)
+            row = _lot_row_for_owner(db, parcel_id, user["id"])
             if not row:
                 raise HTTPException(status_code=404, detail="Lote local no encontrado")
             row.update({
@@ -4739,7 +4781,7 @@ async def sync_local_parcel_to_graniot(
         })
         with LOCK:
             db = read_db()
-            row = next((p for p in table(db, "parcels") if p.get("id") == parcel_id and p.get("user_id") == user["id"]), None)
+            row = _lot_row_for_owner(db, parcel_id, user["id"])
             if row:
                 row["graniot_sync_error"] = error_message
                 row["updated_at"] = now()
@@ -4809,10 +4851,7 @@ def _remote_parcel_ids(local: Dict[str, Any]) -> List[str]:
 def _clear_local_graniot_fields(parcel_id: str, user_id: Any) -> Optional[Dict[str, Any]]:
     with LOCK:
         db = read_db()
-        row = next(
-            (p for p in table(db, "parcels") if p.get("id") == parcel_id and p.get("user_id") == user_id),
-            None,
-        )
+        row = _lot_row_for_owner(db, parcel_id, user_id)
         if not row:
             return None
         for field in GRANIOT_LOCAL_SYNC_FIELDS:
@@ -5067,11 +5106,10 @@ async def unsync_local_parcel(
     user = _acting_user(authorization, user_id)
     with LOCK:
         db = read_db()
-        local = next(
-            (p for p in table(db, "parcels") if p.get("id") == parcel_id and p.get("user_id") == user["id"]),
-            None,
-        )
+        local = _visible_local_parcel(db, parcel_id, user)
         snapshot = dict(local) if local else None
+        if local:
+            user = _lot_owner_in(db, local, user)
     if not snapshot:
         raise HTTPException(status_code=404, detail="Lote local no encontrado")
 
@@ -6395,7 +6433,7 @@ def _persist_graniot_sources(local_parcel_id: str, user_id: str, raw: Any, sourc
     first = public_sources[0]
     with LOCK:
         db = read_db()
-        row = next((p for p in table(db, "parcels") if p.get("id") == local_parcel_id and p.get("user_id") == user_id), None)
+        row = _lot_row_for_owner(db, local_parcel_id, user_id)
         if not row:
             return
         row.update({
@@ -6713,7 +6751,8 @@ async def get_local_parcel_ndvi_map_layer(
 
     with LOCK:
         db = read_db()
-        local = next((p for p in table(db, "parcels") if p.get("id") == local_parcel_id and p.get("user_id") == user["id"]), None)
+        local = _visible_local_parcel(db, local_parcel_id, user)
+        lot_owner = _lot_owner_in(db, local, user) if local else user
     if not local:
         raise HTTPException(status_code=404, detail="Lote local no encontrado")
     if payload.get("geometry"):
@@ -6722,7 +6761,7 @@ async def get_local_parcel_ndvi_map_layer(
 
     # Con la cuenta dueña de las parcelas: la clave de servicio no ve las de
     # las cuentas embebidas y toda renovación fallaba con «No Parcel matches».
-    client = await _client_for_local_row(local, user=user)
+    client = await _client_for_local_row(local, user=lot_owner)
     warnings: List[str] = []
 
     map_cache_key = _stable_hash({
@@ -7091,7 +7130,8 @@ async def prefetch_satellite_cache(
 
     with LOCK:
         db = read_db()
-        user_parcels = [p for p in table(db, "parcels") if p.get("user_id") == user["id"]]
+        prefetch_company = _company_for_user(db, str(user["id"]))
+        user_parcels = [p for p in table(db, "parcels") if parcel_visible_to(p, str(user["id"]), prefetch_company)]
 
     if requested_ids:
         selected = [p for p in user_parcels if str(p.get("id")) in set(requested_ids)]
@@ -7173,7 +7213,7 @@ def build_wms_proxy_url(
     user = _require_user(authorization)
     if not access_key and parcel_id:
         db = read_db()
-        local = next((p for p in table(db, "parcels") if p.get("id") == parcel_id and p.get("user_id") == user["id"]), None)
+        local = _visible_local_parcel(db, parcel_id, user)
         if local:
             template = _wms_template_from_local(local)
             access_key = _signed_wms_access_key(template) or local.get("graniot_wms_access_key") or local.get("graniot_access_key") or local.get("graniot_parcel_key")
