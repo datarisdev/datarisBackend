@@ -61,6 +61,14 @@ STATE_TABLE_READY = False
 STATE_CACHE: Optional[Dict[str, Any]] = None
 STATE_CACHE_LOADED_AT = 0.0
 STATE_CACHE_VERSION = 0
+# Revisión de la fila de estado en Postgres que corresponde a la caché. Cada
+# guardado exige que la base siga en esa revisión: con varias réplicas, una que
+# tenga el estado viejo no puede pisar lo que otra acaba de guardar.
+STATE_REVISION: Optional[int] = None
+
+
+class StateWriteConflict(Exception):
+    """Otra instancia guardó el estado después de que esta lo leyera."""
 
 
 def _float_env(name: str, default: float) -> float:
@@ -356,10 +364,12 @@ def postgres_connection():
     return psycopg2.connect(postgres_dsn())
 
 
-def _cache_state(db: Dict[str, Any], *, changed: bool = False) -> Dict[str, Any]:
-    global STATE_CACHE, STATE_CACHE_LOADED_AT, STATE_CACHE_VERSION
+def _cache_state(db: Dict[str, Any], *, changed: bool = False, revision: Optional[int] = None) -> Dict[str, Any]:
+    global STATE_CACHE, STATE_CACHE_LOADED_AT, STATE_CACHE_VERSION, STATE_REVISION
     STATE_CACHE = db
     STATE_CACHE_LOADED_AT = monotonic()
+    if revision is not None:
+        STATE_REVISION = revision
     if changed:
         STATE_CACHE_VERSION += 1
     return db
@@ -371,10 +381,11 @@ def get_state_cache_version() -> int:
 
 
 def invalidate_state_cache() -> None:
-    global STATE_CACHE, STATE_CACHE_LOADED_AT
+    global STATE_CACHE, STATE_CACHE_LOADED_AT, STATE_REVISION
     with LOCK:
         STATE_CACHE = None
         STATE_CACHE_LOADED_AT = 0.0
+        STATE_REVISION = None
 
 
 def _state_cache_is_fresh() -> bool:
@@ -403,6 +414,7 @@ def ensure_state_table() -> None:
         with postgres_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(ddl)
+                cur.execute(f"ALTER TABLE {STATE_TABLE} ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 0")
         STATE_TABLE_READY = True
 
 
@@ -427,38 +439,69 @@ def _write_db_to_file(db: Dict[str, Any]) -> None:
 
 
 def read_db_from_postgres() -> Optional[Dict[str, Any]]:
+    """Estado guardado en Postgres; deja su revisión en `LAST_READ_REVISION`."""
+    global LAST_READ_REVISION
     ensure_state_table()
     with postgres_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(f"SELECT payload FROM {STATE_TABLE} WHERE id = %s", (STATE_KEY,))
+            cur.execute(f"SELECT payload, revision FROM {STATE_TABLE} WHERE id = %s", (STATE_KEY,))
             row = cur.fetchone()
             if not row:
+                LAST_READ_REVISION = None
                 return None
-            payload = row[0]
+            payload, LAST_READ_REVISION = row[0], int(row[1] or 0)
             if isinstance(payload, str):
                 return json.loads(payload)
             return payload
 
 
-def write_db_to_postgres(db: Dict[str, Any]) -> None:
+LAST_READ_REVISION: Optional[int] = None
+
+
+def write_db_to_postgres(db: Dict[str, Any], expected_revision: Optional[int] = None) -> int:
+    """Guarda el estado y devuelve la revisión nueva.
+
+    Con `expected_revision` solo guarda si la fila sigue en esa revisión; si
+    otra instancia guardó entre medias lanza `StateWriteConflict` en vez de
+    pisar su cambio (el estado se guarda entero: el último en escribir borraba
+    lo del otro sin que nadie se enterara).
+    """
     ensure_state_table()
     payload = json.dumps(db, ensure_ascii=False, default=str)
-    sql = f"""
-        INSERT INTO {STATE_TABLE} (id, payload, updated_at)
-        VALUES (%s, %s::jsonb, NOW())
-        ON CONFLICT (id)
-        DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()
-    """
     with postgres_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, (STATE_KEY, payload))
+            cur.execute(
+                f"""
+                UPDATE {STATE_TABLE}
+                   SET payload = %s::jsonb, revision = revision + 1, updated_at = NOW()
+                 WHERE id = %s AND (%s::bigint IS NULL OR revision = %s::bigint)
+             RETURNING revision
+                """,
+                (payload, STATE_KEY, expected_revision, expected_revision),
+            )
+            row = cur.fetchone()
+            if row:
+                return int(row[0])
+            cur.execute(
+                f"""
+                INSERT INTO {STATE_TABLE} (id, payload, revision, updated_at)
+                VALUES (%s, %s::jsonb, 1, NOW())
+                ON CONFLICT (id) DO NOTHING
+                RETURNING revision
+                """,
+                (STATE_KEY, payload),
+            )
+            row = cur.fetchone()
+            if row:
+                return int(row[0])
+    raise StateWriteConflict("El estado cambió en otra instancia")
 
 
-def _persist_db(db: Dict[str, Any]) -> None:
+def _persist_db(db: Dict[str, Any], expected_revision: Optional[int] = None) -> Optional[int]:
     if use_postgres_state():
-        write_db_to_postgres(db)
-    else:
-        _write_db_to_file(db)
+        return write_db_to_postgres(db, expected_revision)
+    _write_db_to_file(db)
+    return None
 
 
 def read_db(*, force_refresh: bool = False) -> Dict[str, Any]:
@@ -467,11 +510,13 @@ def read_db(*, force_refresh: bool = False) -> Dict[str, Any]:
         if not force_refresh and _state_cache_is_fresh() and STATE_CACHE is not None:
             return STATE_CACHE
 
+        revision: Optional[int] = None
         if use_postgres_state():
             data = read_db_from_postgres()
+            revision = LAST_READ_REVISION
             if data is None:
                 data = default_db()
-                _persist_db(data)
+                revision = _persist_db(data)
         else:
             try:
                 data = read_db_from_file()
@@ -480,7 +525,7 @@ def read_db(*, force_refresh: bool = False) -> Dict[str, Any]:
                 _persist_db(data)
 
         normalized = normalize_db(data)
-        return _cache_state(normalized)
+        return _cache_state(normalized, revision=revision)
 
 
 def write_db(db: Dict[str, Any]) -> None:
@@ -493,8 +538,15 @@ def write_db(db: Dict[str, Any]) -> None:
     ensure_storage()
     with LOCK:
         normalized = normalize_db(db)
-        _persist_db(normalized)
-        _cache_state(normalized, changed=True)
+        try:
+            revision = _persist_db(normalized, STATE_REVISION)
+        except StateWriteConflict:
+            invalidate_state_cache()
+            raise HTTPException(
+                status_code=409,
+                detail="Otro cambio se guardó al mismo tiempo. Vuelve a intentarlo.",
+            )
+        _cache_state(normalized, changed=True, revision=revision)
 
 
 def ensure_storage() -> None:
@@ -513,6 +565,7 @@ def ensure_storage() -> None:
             if use_postgres_state():
                 ensure_state_table()
                 db = read_db_from_postgres()
+                read_revision = LAST_READ_REVISION
                 if db is None:
                     if DB_FILE.exists():
                         try:
@@ -522,14 +575,21 @@ def ensure_storage() -> None:
                     else:
                         db = default_db()
                     normalized = normalize_db(db)
-                    _persist_db(normalized)
+                    read_revision = _persist_db(normalized)
                 else:
                     before = json.dumps(db, sort_keys=True, default=str)
                     normalized = normalize_db(db)
                     after = json.dumps(normalized, sort_keys=True, default=str)
                     if after != before:
-                        _persist_db(normalized)
+                        try:
+                            read_revision = _persist_db(normalized, read_revision)
+                        except StateWriteConflict:
+                            # Otra instancia arrancó y normalizó a la vez: se
+                            # toma su versión.
+                            normalized = normalize_db(read_db_from_postgres() or default_db())
+                            read_revision = LAST_READ_REVISION
             else:
+                read_revision = None
                 if not DB_FILE.exists():
                     normalized = normalize_db(default_db())
                     _persist_db(normalized)
@@ -544,7 +604,7 @@ def ensure_storage() -> None:
                     if after != before or not DB_FILE.exists():
                         _persist_db(normalized)
 
-            _cache_state(normalized)
+            _cache_state(normalized, revision=read_revision)
             STORAGE_READY = True
         finally:
             ENSURING_STORAGE = False
@@ -2431,6 +2491,10 @@ def onboard_client(payload: Dict[str, Any] = Body(default_factory=dict), authori
         company_name = str(payload.get("company_name") or "").strip()
         if not company_name:
             raise HTTPException(status_code=400, detail="El nombre de la empresa es obligatorio")
+        # Un segundo clic o una segunda pestaña creaba otra empresa igual (los
+        # «Limones Cordoba» duplicados de la prueba del 14 sep).
+        if any(normalize_lot_key(c.get("name")) == normalize_lot_key(company_name) for c in table(db, "companies")):
+            raise HTTPException(status_code=409, detail=f"Ya existe una empresa llamada «{company_name}»")
 
         email = clean_email(payload.get("email"))
         if not email:
@@ -3226,8 +3290,13 @@ async def store_parcel_file_for_user(
     name: str,
     company_id: Optional[str] = None,
     uploaded_by: Optional[str] = None,
+    summary: Optional[Dict[str, int]] = None,
 ) -> List[Dict[str, Any]]:
     """Guarda el archivo geográfico y registra sus lotes a nombre de `owner`.
+
+    Si llega `summary`, se rellena con cuántos lotes son nuevos (`created`),
+    cuántos actualizaron uno que ya existía (`updated`) y cuántos se
+    renombraron por chocar con otro polígono del mismo archivo (`renamed`).
 
     Con `company_id` los lotes son de la empresa (los ve todo su equipo) y
     `owner` es su titular, la cuenta con la que se sincronizan en Graniot.
@@ -3259,6 +3328,8 @@ async def store_parcel_file_for_user(
         public_url = f"/api/compat/storage/public/parcels/{str(storage_path).replace(os.sep, '/') }"
         single = len(parcels_data) == 1
         created_rows: List[Dict[str, Any]] = []
+        this_upload: set = set()
+        upload_summary = {"created": 0, "updated": 0, "renamed": 0}
         with LOCK:
             db = read_db()
             for item in parcels_data:
@@ -3284,8 +3355,32 @@ async def store_parcel_file_for_user(
                     "updated_at": t,
                     **_parcel_ownership(company_id, uploaded_by),
                 })
-                created_rows.append(upsert_user_parcel(db, owner["id"], row))
+                existing = find_existing_user_parcel(table(db, "parcels"), row, owner["id"])
+                if existing is not None and str(existing.get("id")) in this_upload:
+                    # Otro polígono de ESTE archivo con el mismo nombre o la misma
+                    # forma: antes lo reemplazaba y el archivo perdía un lote sin
+                    # avisar. Si ya hay un lote con su forma (una subida
+                    # anterior) se actualiza ese; si no, se guarda aparte con un
+                    # nombre que no choque.
+                    scope = parcel_scope_key({**row, "user_id": owner["id"]})
+                    earlier = [r for r in table(db, "parcels") if str(r.get("id")) not in this_upload]
+                    same_shape = _find_geometric_duplicate(earlier, row, scope)
+                    if same_shape is not None:
+                        row["id"], row["name"] = same_shape.get("id"), same_shape.get("name")
+                        saved, outcome = upsert_user_parcel(db, owner["id"], row), "updated"
+                    else:
+                        row["name"] = _unique_lot_name(db, row, owner["id"])
+                        table(db, "parcels").append(row)
+                        saved, outcome = row, "renamed"
+                else:
+                    saved = upsert_user_parcel(db, owner["id"], row)
+                    outcome = "updated" if existing is not None else "created"
+                this_upload.add(str(saved.get("id")))
+                upload_summary[outcome] += 1
+                created_rows.append(saved)
             write_db(db)
+        if summary is not None:
+            summary.update(upload_summary)
         return created_rows
     except ValueError as exc:
         try:
@@ -3315,6 +3410,23 @@ async def store_parcel_file_for_user(
                 ),
             )
         raise HTTPException(status_code=500, detail=f"Error subiendo parcela: {raw_message}")
+
+
+def _unique_lot_name(db: Dict[str, Any], row: Dict[str, Any], owner_id: str) -> str:
+    """Nombre libre dentro del dueño del lote: «Lote 1 (2)», «Lote 1 (3)»…"""
+    scope = parcel_scope_key({**row, "user_id": row.get("user_id") or owner_id})
+    taken = {
+        parcel_identity_key(existing)
+        for existing in table(db, "parcels")
+        if parcel_scope_key(existing) == scope
+    }
+    base = str(row.get("name") or "Lote").strip()
+    for n in range(2, 1000):
+        candidate = f"{base} ({n})"
+        probe = {**row, "name": candidate, "lote": None, "codigo": None}
+        if parcel_identity_key(probe) not in taken:
+            return candidate
+    return f"{base} ({uuid.uuid4().hex[:6]})"
 
 
 def _parcel_ownership(company_id: Optional[str], uploaded_by: Optional[str]) -> Dict[str, Any]:
