@@ -6,7 +6,7 @@ bcrypt==4.0.1
 pydantic>=2.7
 pydantic-settings>=2.3
 email-validator>=2.1
-sqlalchemy>=2.0
+sqlalchemy>=2.0,<2.1  # 2.1 usa psycopg (v3) por defecto con postgresql:// y solo tenemos psycopg2
 psycopg2-binary>=2.9
 python-multipart>=0.0.9
 azure-identity>=1.17
