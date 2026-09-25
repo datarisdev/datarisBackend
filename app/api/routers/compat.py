@@ -38,7 +38,7 @@ from app.core.config import settings
 from app.services.telemetry.helicopter_processor import process_helicopter_zip
 from app.services.telemetry.aerial_copilot import process_aerial_copilot
 from app.utils.geojson_normalizer import normalize_record_geometries
-from app.services import module_access, module_catalog
+from app.services import admin_roles, module_access, module_catalog
 from app.services.commercial_demo_seed import ensure_commercial_demo, is_commercial_demo_user
 from app.services.parcel_split_migration import split_multi_feature_parcels
 from app.utils.azure_blob import azure_blob_storage_disabled
@@ -2239,11 +2239,9 @@ def create_manual_admin_user(
         if not is_super_admin and company_id != current_admin.get("company_id"):
             raise HTTPException(status_code=403, detail="No puedes crear usuarios para otra empresa")
 
-        admin_role = str(payload.get("admin_role") or "company_user")
-        if admin_role not in {"superadmin", "company_admin", "company_user"}:
-            admin_role = "company_user"
-        if not is_super_admin and admin_role in {"superadmin", "company_admin"}:
-            admin_role = "company_user"
+        requested_role = str(payload.get("admin_role") or "company_user")
+        if not is_super_admin:
+            requested_role = "company_user"
 
         # Las hectáreas ya no se reparten por usuario: el límite es de la
         # empresa y se mide con el área real de sus lotes (hallazgo H10).
@@ -2266,6 +2264,12 @@ def create_manual_admin_user(
                 status_code=400,
                 detail="No se pueden crear usuarios reales en la empresa de demostración comercial",
             )
+
+        # Un solo rol de administrador (H9): superadmin en la empresa de
+        # Dataris, administrador de empresa en la de un cliente.
+        if admin_roles.is_admin_role(requested_role) and not company:
+            raise HTTPException(status_code=400, detail="Elige la empresa del administrador")
+        admin_role = admin_roles.role_for_company(db, company_id, requested_role)
 
         if company_id:
             # El paquete de la empresa es el techo, también para el superadmin:
@@ -2818,6 +2822,24 @@ def admin_users_rows_in_scope(
     return [row for row in rows if str(row.get("company_id") or "") == str(company_id or "")]
 
 
+def align_admin_role(db: Dict[str, Any], table_name: str, row: Optional[Dict[str, Any]]) -> None:
+    """Ajusta el rol de una fila de `admin_users` a su empresa (hallazgo H9).
+
+    Hay un solo rol de administrador: `superadmin` en la empresa de Dataris y
+    `company_admin` en la de un cliente. Se aplica también a lo que llega por el
+    API genérico (la edición de usuarios del panel guarda por ahí), para que un
+    cliente no pueda quedar como superadmin de la plataforma. Un administrador
+    sin empresa baja a usuario operativo: no hay nada que administrar.
+    """
+    if table_name != "admin_users" or not isinstance(row, dict):
+        return
+    role = row.get("admin_role")
+    if admin_roles.is_admin_role(role) and not admin_roles.find_company(db, row.get("company_id")):
+        row["admin_role"] = admin_roles.USER_ROLE
+        return
+    row["admin_role"] = admin_roles.role_for_company(db, row.get("company_id"), role)
+
+
 def guard_parcel_table_write(db: Dict[str, Any], table_name: str, user: Optional[Dict[str, Any]]) -> None:
     """Escribir en `parcels` desde el API genérico exige permiso de gestión.
 
@@ -2944,6 +2966,7 @@ def insert(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict)
                     target["updated_at"] = now()
                     inserted.append(enrich(db, table_name, target))
                     continue
+            align_admin_role(db, table_name, row)
             rows.append(row)
             inserted.append(enrich(db, table_name, row))
         write_db(db)
@@ -3002,8 +3025,10 @@ def upsert(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict)
             if target:
                 target.update(row)
                 target["updated_at"] = now()
+                align_admin_role(db, table_name, target)
                 changed.append(enrich(db, table_name, target))
             else:
+                align_admin_role(db, table_name, row)
                 rows.append(row)
                 changed.append(enrich(db, table_name, row))
         write_db(db)
@@ -3031,6 +3056,8 @@ def update(table_name: str, payload: Dict[str, Any] = Body(default_factory=dict)
                 row["user_id"] = user["id"]
             row["updated_at"] = now()
             row.update(normalize_record_geometries(table_name, row))
+            if {"admin_role", "company_id"} & set((payload.get("data") or {}).keys()):
+                align_admin_role(db, table_name, row)
         result = [enrich(db, table_name, r) for r in targets]
         write_db(db)
     return {"data": result, "error": None, "count": len(result)}
