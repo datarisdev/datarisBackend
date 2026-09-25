@@ -32,7 +32,7 @@ from app.api.routers.compat import (
     table,
     write_db,
 )
-from app.services import module_access, module_catalog
+from app.services import admin_roles, module_access, module_catalog
 from app.services.commercial_demo_seed import is_commercial_demo_user
 from app.services.module_catalog import INTERNAL_ONLY_MODULE_IDS
 
@@ -305,6 +305,9 @@ def list_companies(authorization: Optional[str] = Header(default=None)):
                 "id": company.get("id"),
                 "name": company.get("name"),
                 "is_active": company.get("is_active", True) is not False,
+                # Sus administradores son superadmins de la plataforma (H9): el
+                # panel lo usa para rotular el rol «Super admin» en vez de «Admin».
+                "is_dataris_team": admin_roles.is_dataris_team_company(company),
                 "modules": {module_id: module_id in enabled for module_id in assignable},
                 "users_count": len([
                     row for row in table(db, "admin_users")
