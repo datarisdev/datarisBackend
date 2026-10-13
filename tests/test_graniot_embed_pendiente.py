@@ -178,3 +178,15 @@ def test_quien_tiene_su_portal_no_se_ve_afectado(monkeypatch):
     assert result["data"]["status"] == "ready"
     assert result["data"]["embedded_url"].endswith(f"auth_id={personal}")
     assert recorder == []
+
+
+def test_cuenta_interna_ve_el_portal_de_dataris(monkeypatch):
+    """admin@dataris.local ve el portal de Dataris del embed, no «por configurar»."""
+    from app.api.routers import graniot
+
+    monkeypatch.setattr(graniot.settings, "GRANIOT_EMBED_SHARED_FALLBACK_ENABLED", False)
+    monkeypatch.setattr(graniot.settings, "GRANIOT_EMBED_SHARED_PORTAL_EMAILS", "admin@dataris.local, otra@dataris.es")
+    assert graniot._may_use_shared_embed({"id": "x", "email": "Admin@Dataris.local"})
+    import asyncio
+
+    assert asyncio.run(graniot._embed_account_for_user({"id": "x", "email": "admin@dataris.local"})) is None
