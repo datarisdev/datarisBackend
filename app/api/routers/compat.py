@@ -134,7 +134,14 @@ USER_SCOPED_TABLES = {
     "field_log_records",
     "field_log_cycle_sheets",
     "field_log_phenology_records",
+    # SIG › Formularios de campo (Bitácoras Sustenta): solo administradores de
+    # la empresa (ver compat_sig_field_forms.py).
+    "sig_field_form_parcels",
+    "sig_field_form_records",
+    "sig_field_form_products",
 }
+
+SIG_FIELD_FORM_TABLES = {"sig_field_form_parcels", "sig_field_form_records", "sig_field_form_products"}
 
 PARCEL_CHILD_TABLES = {
     "satellite_images",
@@ -1498,6 +1505,18 @@ def scoped_table_rows(db: Dict[str, Any], table_name: str, user: Optional[Dict[s
         ]
     if table_name == "extension_requests":
         return [row for row in rows if str(row.get("requested_by_user_id") or row.get("user_id") or "") == user_id]
+    if table_name in SIG_FIELD_FORM_TABLES:
+        # Solo administradores, y solo lo de su empresa.
+        admin = active_admin_row(db, user_id)
+        if not admin or admin.get("admin_role") not in {"superadmin", "company_admin"}:
+            return []
+        cid = str(_company_for_user(db, user_id) or "")
+        return [
+            row
+            for row in rows
+            if (cid and str(row.get("company_id") or "") == cid)
+            or (not row.get("company_id") and str(row.get("user_id") or "") == user_id)
+        ]
     if table_name == "report_templates":
         # Plantillas del sistema (sin company_id) visibles para todos; las de una
         # empresa, solo para esa empresa.
@@ -2884,6 +2903,11 @@ def guard_privileged_table_write(db: Dict[str, Any], table_name: str, user: Opti
     `parcels` el suyo (guard_parcel_table_write); `profiles` se deja para que cada
     usuario edite el suyo desde su perfil.
     """
+    if table_name in SIG_FIELD_FORM_TABLES:
+        actor = active_admin_row(db, str((user or {}).get("id") or "")) if user else None
+        if not actor or actor.get("admin_role") not in {"superadmin", "company_admin"}:
+            raise HTTPException(status_code=403, detail="Formularios de campo es solo para administradores")
+        return
     if table_name not in SUPERADMIN_WRITE_TABLES and table_name not in ADMIN_WRITE_TABLES:
         return
     actor = active_admin_row(db, str((user or {}).get("id") or "")) if user else None
