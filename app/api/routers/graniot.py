@@ -3914,8 +3914,9 @@ async def _embed_account_for_user(user: Dict[str, Any]) -> Optional[Dict[str, st
     """
     if not settings.GRANIOT_EMBED_PER_USER_ENABLED:
         return None
-    if str((user or {}).get("email") or "").strip().lower() in _embed_service_account_emails():
-        # The service account is better served by the minted token (always fresh).
+    if str((user or {}).get("email") or "").strip().lower() in _embed_service_account_emails() | _shared_portal_emails():
+        # The service account is better served by the minted token (always fresh),
+        # and so are the internal accounts that share its portal.
         return None
     # Portal por empresa: si su empresa comparte el portal del titular, se abre
     # ese (misma cuenta donde viven los lotes de la empresa).
@@ -4249,6 +4250,12 @@ def _client_for_target(target: Dict[str, Any]) -> GraniotClient:
     return GraniotClient()
 
 
+def _shared_portal_emails() -> set[str]:
+    """Cuentas internas que ven el portal de Dataris del embed (no uno propio)."""
+    raw = str(settings.GRANIOT_EMBED_SHARED_PORTAL_EMAILS or "")
+    return {email.strip().lower() for email in raw.split(",") if email.strip()}
+
+
 def _may_use_shared_embed(user: Dict[str, Any]) -> bool:
     """¿Puede esta persona ver el portal compartido de la cuenta de servicio?
 
@@ -4264,7 +4271,7 @@ def _may_use_shared_embed(user: Dict[str, Any]) -> bool:
     if settings.GRANIOT_EMBED_SHARED_FALLBACK_ENABLED:
         return True
     email = str((user or {}).get("email") or "").strip().lower()
-    if email in _embed_service_account_emails():
+    if email in _embed_service_account_emails() or email in _shared_portal_emails():
         return True
     try:
         return _reconcile_exclusion(user, read_db()) is not None

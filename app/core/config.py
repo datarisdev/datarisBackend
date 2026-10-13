@@ -66,6 +66,9 @@ class Settings(BaseSettings):
     # frontend shows a "pending setup" notice instead of somebody else's map.
     # Service and demo accounts always keep the shared portal.
     GRANIOT_EMBED_SHARED_FALLBACK_ENABLED: bool = False
+    # Cuentas internas de Dataris que ven el portal de Dataris del embed (el de
+    # la cuenta de servicio) en lugar de un portal propio. Separadas por comas.
+    GRANIOT_EMBED_SHARED_PORTAL_EMAILS: str = "admin@dataris.local"
     # Graniot keeps platform users (app.graniot.com, the ones that own the farms)
     # and embedded-map users (/api/accounts/, the only ones the iframe accepts)
     # in separate registries, and there is no endpoint listing the former. So a
