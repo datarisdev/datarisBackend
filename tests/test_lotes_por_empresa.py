@@ -201,6 +201,27 @@ def test_el_portal_se_busca_con_el_correo_del_titular(monkeypatch):
     assert buscados == ["titular@a.com"]
 
 
+def test_si_el_titular_es_cuenta_de_servicio_cada_uno_ve_su_portal(monkeypatch):
+    """Empresa de Dataris: el titular es la cuenta de servicio, cuyo mapa no se enseña."""
+    db = _state()
+    monkeypatch.setattr(graniot, "read_db", lambda *a, **k: db)
+    monkeypatch.setattr(graniot.settings, "GRANIOT_EMBED_PER_USER_ENABLED", True)
+    monkeypatch.setattr(graniot, "_embed_service_account_emails", lambda: {"titular@a.com"})
+    buscados = []
+
+    async def fake_platform_user(email):
+        buscados.append(email)
+        return None
+
+    async def fake_find(email, **kwargs):
+        return None
+
+    monkeypatch.setattr(graniot, "_platform_user_for_email", fake_platform_user)
+    monkeypatch.setattr(graniot, "_find_embed_account", fake_find)
+    asyncio.run(graniot._embed_account_for_user({"id": "colega", "email": "colega@a.com"}))
+    assert buscados == ["colega@a.com"]
+
+
 def test_al_dar_de_alta_a_un_colega_no_se_le_crea_cuenta_en_graniot(monkeypatch):
     db = _state()
     monkeypatch.setattr(compat, "read_db", lambda *a, **k: db)

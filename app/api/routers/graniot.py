@@ -3920,7 +3920,12 @@ async def _embed_account_for_user(user: Dict[str, Any]) -> Optional[Dict[str, st
     # Portal por empresa: si su empresa comparte el portal del titular, se abre
     # ese (misma cuenta donde viven los lotes de la empresa).
     try:
-        user = await run_in_threadpool(lambda: company_portal_user(read_db(), user)) or user
+        titular = await run_in_threadpool(lambda: company_portal_user(read_db(), user)) or user
+        # Si el titular de la empresa es una cuenta de servicio (la empresa de
+        # Dataris), su portal no se enseña a nadie: cada quien ve el suyo. Sin
+        # esto admin@dataris.local veía «por configurar» teniendo portal propio.
+        if str(titular.get("email") or "").strip().lower() not in _embed_service_account_emails():
+            user = titular
     except Exception as exc:  # noqa: BLE001 — sin empresa resuelta, su portal de siempre
         log_event({
             "event": "dataris.graniot.embed_company_portal.lookup_failed",
